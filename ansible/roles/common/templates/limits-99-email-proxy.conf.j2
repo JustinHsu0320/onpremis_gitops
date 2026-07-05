@@ -1,0 +1,16 @@
+# =============================================================================
+# /etc/security/limits.d/99-email-proxy.conf — 由 Ansible（common role）管理
+#
+# 為什麼調 nofile：HAProxy / PgBouncer / KeyDB / RabbitMQ 都是
+# 「每條連線佔一個檔案描述子」的模型，發行版預設 1024 在生產流量下必然爆
+# （症狀：accept: too many open files，且通常在尖峰時段才炸）。
+# 1048576 的記憶體代價可忽略，一次拉滿避免日後逐服務救火。
+#
+# 注意：limits.d 只影響「經 PAM 登入」的 session；systemd 服務另由各 role
+# 的 unit（LimitNOFILE=）設定——這裡是給互動除錯與非 systemd 工具的保底。
+# =============================================================================
+# «*» 不涵蓋 root，root 要另外列，兩者都寫才算真的全域生效
+*     soft  nofile  {{ nofile_limit }}
+*     hard  nofile  {{ nofile_limit }}
+root  soft  nofile  {{ nofile_limit }}
+root  hard  nofile  {{ nofile_limit }}

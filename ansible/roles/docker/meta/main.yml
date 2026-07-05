@@ -1,0 +1,19 @@
+---
+galaxy_info:
+  role_name: docker
+  namespace: email_proxy
+  author: justin.sc.hsu
+  description: Docker Engine（官方 repo）＋日誌輪替/live-restore/egress proxy（app、monitoring、gitlab_runner 專用）
+  company: PTC-NEC
+  license: MIT
+  min_ansible_version: "2.16"
+  platforms:
+    - name: Ubuntu
+      versions: ["all"]
+  galaxy_tags:
+    - docker
+    - containers
+
+# 不宣告對 common 的 meta 依賴：順序由 00-bootstrap.yml 保證，
+# meta 依賴會讓 common 在同一次 play 內被隱式重跑，拖慢全站部署
+dependencies: []

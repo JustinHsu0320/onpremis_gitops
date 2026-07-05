@@ -1,0 +1,15 @@
+---
+# =============================================================================
+# ansible-lint 設定 — production profile 為基準，豁免項都要有理由
+# =============================================================================
+profile: production
+
+exclude_paths:
+  - collections/          # galaxy 安裝的第三方 collection，不是我們的程式碼
+  - lab/                  # docker 實驗室工具（compose/shell），非 ansible 內容
+
+skip_list:
+  # run_once 的行為警告只在 strategy: free 下才成立；本專案所有 playbook
+  # 都使用預設 linear strategy（叢集 bootstrap 的跨主機順序正依賴它），
+  # 且 CONVENTIONS.md §8 明文禁止改用 free —— 此警告對本 repo 不適用
+  - run-once[task]

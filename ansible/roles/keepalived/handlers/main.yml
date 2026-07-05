@@ -1,0 +1,14 @@
+---
+# =============================================================================
+# roles/keepalived/handlers/main.yml
+# =============================================================================
+
+# reload = SIGHUP：keepalived 重讀設定並「增量」套用到 VRRP instance，
+# 既有 MASTER 不會退位、VIP 不會釋放——restart 則會先 release VIP 再重新選主，
+# 造成數秒的入口瞬斷。搭配 playbook 層 serial: 1（CONVENTIONS.md §8-7），
+# 全叢集滾動變更期間 VIP 永遠有人持有。
+- name: Reload keepalived
+  ansible.builtin.systemd_service:
+    name: keepalived
+    state: reloaded
+  listen: reload keepalived

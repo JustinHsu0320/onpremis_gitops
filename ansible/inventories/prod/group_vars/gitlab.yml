@@ -1,0 +1,28 @@
+---
+# =============================================================================
+# group_vars/gitlab.yml — GitLab CE + Container Registry（VLAN 50）
+#
+# 注意：GitLab（含 Registry）記憶體需求 ≥8GB，lab 實驗室不部署（lab inventory 無此群組成員）。
+# =============================================================================
+
+gitlab_external_url: "https://gitlab.{{ domain }}"
+gitlab_registry_external_url: "https://registry.{{ domain }}:5050"
+
+# ---------- 資料碟（block_storage role；lab 不部署 gitlab 群組） ----------
+# 對應 terraform 的 gitlab disk1-gitlab-data（200G）。GitLab omnibus 的 repo /
+# registry blob / CI artifacts 全在 /var/opt/gitlab，量會長很快，必須獨立碟。
+# owner 由 gitlab-ctl reconfigure 自行收斂（掛載點根 root:root 即可）
+storage_volumes:
+  - { mountpoint: /var/opt/gitlab, size_gb: 200 }
+
+# ---------- PKI：GitLab 與 Registry 的 HTTPS 憑證 ----------
+pki_certificates:
+  - name: gitlab-server
+    profile: server
+    owner: root
+    group: root
+    key_mode: "0600"
+    cn: "gitlab.{{ domain }}"
+    extra_sans:
+      - "DNS:gitlab.{{ domain }}"
+      - "DNS:registry.{{ domain }}"

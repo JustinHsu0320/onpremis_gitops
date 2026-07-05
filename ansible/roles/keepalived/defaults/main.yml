@@ -1,0 +1,35 @@
+---
+# =============================================================================
+# roles/keepalived/defaults/main.yml — Keepalived 可調參數（單一服務的 knob）
+#
+# 跨 role 契約變數（CONVENTIONS.md §7 / group_vars 定義，本檔不重複給預設值）：
+#   keepalived_instances —— 本 role 的驅動變數（list of dict），
+#     欄位：name / vrid / vip / state / priority / auth_pass / peers_group /
+#           track_haproxy / track_squid（flags 可省略，省略視為 false）
+#   keepalived_state、keepalived_priority —— host_vars 決定誰是 MASTER
+# =============================================================================
+
+# VRRP 綁定的網卡名。空字串 = 由 tasks 自動偵測「IPv4 位址 == ansible_host」
+# 的那張網卡（CONVENTIONS.md §8-8：不可寫死 ens160——vSphere 是 ens160、
+# Docker 實驗室是 eth0、其他虛擬化平台又不同，寫死等於綁死平台）。
+# 特殊佈局（bond / VLAN 子介面 / 多網卡同 IP 網段）偵測不準時，
+# 在 host_vars 明確指定即可跳過偵測（例：keepalived_interface: bond0.10）
+keepalived_interface: ""
+
+# VRRP 通告間隔（秒）：MASTER 每 advert_int 發一次心跳，
+# BACKUP 約 3*advert_int + skew 沒收到就接手 → 1 秒 ≈ 3-4 秒完成漂移
+keepalived_advert_int: 1
+
+# ---------- vrrp_script（行程健檢）共用參數 ----------
+# 每 2 秒 pgrep 一次；fall/rise 2 = 連續 2 次失敗才扣分、連續 2 次成功才復權
+# （單次抖動不會觸發 VIP 漂移，狀態轉換最快 4 秒）
+keepalived_check_interval: 2
+keepalived_check_fall: 2
+keepalived_check_rise: 2
+
+# 為什麼是 -60 而不是 -50：主備 priority 差 50（150/100）。
+# 若 weight=-50，MASTER 健檢失敗後有效 priority = 150-50 = 100，與 BACKUP「平手」
+# ——VRRP 平手時比 IP 大小決定 MASTER，VIP 是否漂移變成看 IP 分配的運氣。
+# 原則：要「保證」漂移，|weight| 必須嚴格大於主備 priority 差（本專案最大差 50）
+# → 取 -60 留安全邊際。完整推導見 templates/keepalived.conf.j2 註解。
+keepalived_check_weight: -60

@@ -1,0 +1,16 @@
+---
+# =============================================================================
+# 00-bootstrap.yml — 系統基線（規劃書 §7.1）
+#
+# 所有主機的共同起點：時區 / NTP / sysctl / limits / swap / /etc/hosts /
+# proxy 環境 / 基線套件。任何新機器納管的第一步。
+#
+# 注意：Docker 的安裝拆到 08-docker.yml（排在 05-block-storage 之後），
+# 這樣 mgmt-01 的 /var/lib/docker 能先掛到獨立資料碟，Docker 再裝上去，
+# 監控 TSDB 等 named volume 就自動落在大碟而非 OS 碟（見 05/08 註解）。
+# =============================================================================
+- name: 全主機系統基線
+  hosts: all
+  tags: [bootstrap, common]
+  roles:
+    - role: common

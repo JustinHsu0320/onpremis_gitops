@@ -1,0 +1,14 @@
+# =============================================================================
+# /etc/apt/sources.list.d/gitlab-ce.list — 由 Ansible（gitlab_server role）管理
+# 手改必被覆蓋；變更流程：改 template → PR → ansible-playbook
+#
+# 為什麼長這樣（給 junior）：
+#   - signed-by 指名專屬金鑰：這把金鑰「只」為 packages.gitlab.com 的
+#     gitlab-ce repo 背書，不進全域 trusted.gpg（信任範圍最小化）
+#   - codename 用變數（預設 noble）：上游對最新 Ubuntu LTS 的支援通常晚幾個月，
+#     26.04（resolute）頻道開通前先裝 noble 的包——Omnibus 自帶所有相依，
+#     跨版本安裝安全；開通後改 gitlab_apt_codename 即可切換
+#   - 出網路徑：apt 的 egress proxy 由 common role 的 apt 設定檔統一處理，
+#     這裡不用（也不能）寫 proxy
+# =============================================================================
+deb [signed-by={{ gitlab_server_keyring_path }}] {{ gitlab_server_apt_repo_base }} {{ gitlab_apt_codename | default('noble') }} main

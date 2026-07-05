@@ -1,0 +1,54 @@
+---
+# =============================================================================
+# roles/node_exporter/tasks/main.yml — 全主機硬體/OS 指標匯出器（規劃書 §9）
+#
+# 佈署對象是 groups['all'] 全部主機（見 60-monitoring.yml 第一個 play）：
+# Prometheus（mgmt-01）之後會逐台抓 <ansible_host>:9100 的 node 指標。
+# node_exporter 只讀 /proc /sys，不碰 kernel 參數，容器實驗室
+# （is_container=true）也能原樣運作，本 role 不需要任何 is_container 分支。
+# =============================================================================
+
+# 為什麼用 distro 套件而非上游 binary：Ubuntu 26.04 archive 的版本已足夠
+# （node 指標格式多年穩定），套件自帶 systemd unit 與專用使用者，
+# 且安全更新跟著 distro 走——不加第三方 repo 是全專案原則（縮小供應鏈攻擊面）。
+# install_recommends=false：Recommends 的 prometheus-node-exporter-collectors
+# 會拖進 cron/smartmontools 的 textfile collector（apt 更新數、SMART 健康等），
+# 本案監控範圍用不到，少裝一包＝少一份噪音與攻擊面。
+- name: 安裝 prometheus-node-exporter（Ubuntu 官方 archive）
+  ansible.builtin.apt:
+    name: "{{ node_exporter_package }}"
+    state: present
+    install_recommends: false
+    update_cache: true
+    cache_valid_time: 3600
+
+# Ubuntu 套件的 systemd unit 以 EnvironmentFile 讀 /etc/default/<unit>，
+# ARGS 原樣附加到執行參數；監聽位址不寫死在 unit 檔（改 unit 會被套件更新蓋掉）。
+- name: 設定啟動參數（/etc/default/prometheus-node-exporter）
+  ansible.builtin.template:
+    src: prometheus-node-exporter.default.j2
+    dest: /etc/default/prometheus-node-exporter
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart node_exporter
+
+- name: 啟用並啟動 prometheus-node-exporter
+  ansible.builtin.systemd_service:
+    name: "{{ node_exporter_service }}"
+    enabled: true
+    state: started
+
+# 把排隊中的 restart 立刻執行掉再驗埠——否則參數已變但服務還跑舊行程，
+# 下面的 wait_for 會在「舊監聽」上假通過。
+- name: 立即套用尚未生效的參數變更
+  ansible.builtin.meta: flush_handlers
+
+# 部署自驗：wait_for 驗 TCP 可達即可（指標內容由 99-verify 的
+# 「Prometheus 目標健康比例」斷言把關）。監聽是 wildcard（:9100），
+# 本機迴環一定涵蓋，用 127.0.0.1 驗最不受網路環境影響。
+- name: 等待 node_exporter 監聽埠就緒
+  ansible.builtin.wait_for:
+    host: 127.0.0.1
+    port: "{{ node_exporter_port | int }}"
+    timeout: "{{ node_exporter_wait_timeout }}"

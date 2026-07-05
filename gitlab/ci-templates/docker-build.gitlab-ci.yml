@@ -1,0 +1,113 @@
+---
+# =============================================================================
+# gitlab/ci-templates/docker-build.gitlab-ci.yml — 通用容器映像建置模板（kaniko）
+#
+# ── 為什麼是 kaniko，而不是 docker build（DinD）？──────────────────────────
+# docker executor 上跑 DinD 有兩種姿勢，都不能接受：
+#   a) privileged = true：等於把 runner-01 的 root 交給「任何一條 pipeline」
+#      ——任何人開個 MR 就能逃逸到 runner 主機；地端只有一台 runner，
+#      被打穿 = 整條軟體供應鏈（含 registry 憑證）淪陷。
+#   b) 掛 /var/run/docker.sock：同樣是把宿主 docker（≈root）交出去。
+# kaniko 在「無特權的普通容器」內於使用者空間解析 Dockerfile、逐層組裝、
+# 直接推上 registry——不需要 daemon、不需要 privileged、不掛 socket。
+# 這是地端自建 CI 建映像的安全底線，不是偏好問題。
+#
+# ── 用法（app repo 的 .gitlab-ci.yml）─────────────────────────────────────
+#   include:
+#     - project: "infra/email-proxy-infra"     # 本 infra monorepo
+#       ref: main
+#       file: "gitlab/ci-templates/docker-build.gitlab-ci.yml"
+#   stages: [test, build, image, deploy]       # 必須含 image stage
+# 之後即獲得現成的 build-image job（單 image 專案直接可用）；
+# 多 image 專案（如 email_proxy 的 api/worker/smtp）：
+#   1. 設全域變數 SKIP_DEFAULT_BUILD_IMAGE: "true" 關掉預設 job
+#   2. 每個 image 開一個 job extends .kaniko-build，覆寫 KANIKO_IMAGE 與
+#      KANIKO_DOCKERFILE（範例見 email-proxy-app.gitlab-ci.yml）
+#
+# ── 產出 tag 策略 ──────────────────────────────────────────────────────────
+#   每次建置必打：<image>:$CI_COMMIT_SHORT_SHA   （不可變、可回溯到 commit）
+#   tag pipeline 加打：<image>:$CI_COMMIT_TAG + :latest （semver 發版，
+#   git tag 請遵守 vX.Y.Z；latest 僅供人工 debug 拉圖方便，部署一律用 SHA/semver）
+# =============================================================================
+
+.kaniko-build:
+  stage: image
+  tags: [onprem-docker]
+  image:
+    # :debug 變體是官方唯一內含 busybox shell 的 tag——GitLab CI 的 script
+    # 需要 shell 才能執行；這不是「拿 debug 版上生產」，是 kaniko 與 GitLab
+    # 整合的標準作法（官方文件同款）
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [""]
+  variables:
+    # 建置 context 與 Dockerfile 位置；monorepo 子目錄建置時覆寫
+    KANIKO_CONTEXT: "${CI_PROJECT_DIR}"
+    KANIKO_DOCKERFILE: "${CI_PROJECT_DIR}/Dockerfile"
+    # 目的地 image repo（不含 tag）。預設 = 專案自己的 registry 路徑；
+    # 多 image 專案覆寫成 ${CI_REGISTRY}/<group>/<name>
+    KANIKO_IMAGE: "${CI_REGISTRY_IMAGE}"
+    # layer cache 存放位置：registry 裡的獨立 cache repo（見下方 --cache 註解）
+    KANIKO_CACHE_REPO: "${CI_REGISTRY_IMAGE}/cache"
+    # cache 有效期：7 天後強制重建，避免 base image 安全更新永遠吃不到
+    KANIKO_CACHE_TTL: "168h"
+    # 額外參數出口（--build-arg VERSION=... 之類），extends 的 job 覆寫
+    KANIKO_EXTRA_ARGS: ""
+  script:
+    # --- registry 認證 ---------------------------------------------------
+    # CI_REGISTRY / CI_REGISTRY_USER / CI_REGISTRY_PASSWORD 由 GitLab 自動
+    # 注入（= gitlab-ci-token + 一次性 CI_JOB_TOKEN，job 結束即失效），
+    # kaniko 推圖時讀 /kaniko/.docker/config.json——不需要任何長期憑證
+    - mkdir -p /kaniko/.docker
+    - |
+      cat > /kaniko/.docker/config.json <<EOF
+      {"auths": {"${CI_REGISTRY}": {"username": "${CI_REGISTRY_USER}", "password": "${CI_REGISTRY_PASSWORD}"}}}
+      EOF
+    # --- 內部 CA 信任注入 --------------------------------------------------
+    # registry.ptc-nec.com.tw:5050 的 TLS 憑證由內部 Issuing CA 簽發
+    # （CONVENTIONS.md §5 的 gitlab-server 憑證），kaniko 推圖要驗 TLS，
+    # 必須把內部 CA chain「附加」到 kaniko 自帶的信任檔（不是覆蓋——
+    # base image 若來自外部 mirror 仍需公有 CA）。CA 來源二選一：
+    #   a) 本模板實作：instance/group 層級 file variable `INTERNAL_CA_PEM`
+    #      （type=File），內容 = mgmt-01 簽發的 ca.crt chain——集中管理、
+    #      所有專案自動繼承，CA 輪替只改一個變數
+    #   b) runner 側一勞永逸：runner-01 的 config.toml 掛
+    #      volumes = ["/usr/local/share/ca-certificates/email-proxy-internal-ca.crt:/kaniko/ssl/certs/internal-ca.crt:ro"]
+    #      再於此 cat 進信任檔；適合不想在 GitLab 存 CA 的場景
+    - |
+      if [ -n "${INTERNAL_CA_PEM:-}" ]; then
+        cat "${INTERNAL_CA_PEM}" >> /kaniko/ssl/certs/ca-certificates.crt
+        echo ">> 已注入內部 CA 至 kaniko 信任庫"
+      fi
+    # --- 組出 tag 清單（策略見檔頭）----------------------------------------
+    - |
+      DESTINATIONS="--destination ${KANIKO_IMAGE}:${CI_COMMIT_SHORT_SHA}"
+      if [ -n "${CI_COMMIT_TAG:-}" ]; then
+        DESTINATIONS="${DESTINATIONS} --destination ${KANIKO_IMAGE}:${CI_COMMIT_TAG}"
+        DESTINATIONS="${DESTINATIONS} --destination ${KANIKO_IMAGE}:latest"
+      fi
+    # --- 執行建置 ----------------------------------------------------------
+    # --cache=true + --cache-repo：把每一層的建置結果存進 registry，
+    #   跨 pipeline / 跨 runner 共用；go mod download、npm ci 這種
+    #   「依賴沒變就整層命中」的步驟提速最有感
+    # --single-snapshot：層數多的 image 可解鎖更快的快照（可放 EXTRA_ARGS）
+    - >-
+      /kaniko/executor
+      --context "${KANIKO_CONTEXT}"
+      --dockerfile "${KANIKO_DOCKERFILE}"
+      ${DESTINATIONS}
+      --cache=true
+      --cache-repo "${KANIKO_CACHE_REPO}"
+      --cache-ttl "${KANIKO_CACHE_TTL}"
+      ${KANIKO_EXTRA_ARGS}
+
+# 預設建置 job：單 image 專案 include 本檔即用。
+# 只在 main push 與 tag pipeline 推圖——feature branch 跑 test 就好，
+# 不要把半成品塞爆 registry（要開 MR 預覽圖再 extends 覆寫 rules）
+build-image:
+  extends: .kaniko-build
+  rules:
+    # 多 image 專案用這個開關關掉預設 job（見檔頭用法）
+    - if: $SKIP_DEFAULT_BUILD_IMAGE == "true"
+      when: never
+    - if: $CI_COMMIT_TAG
+    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH

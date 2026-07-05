@@ -1,0 +1,151 @@
+---
+# =============================================================================
+# roles/monitoring/tasks/main.yml — mgmt-01 監控堆疊（規劃書 §9）
+#
+# 四個容器同一個 compose 專案：Prometheus（抓取+告警規則）、Grafana（儀表板）、
+# Alertmanager（告警路由）、Blackbox（端到端 TLS 探測——憑證到期告警的資料源）。
+#
+# 前置依賴（由 site.yml 順序保證）：
+#   00-bootstrap：mgmt-01 裝好 Docker Engine；10-pki：ca.crt 已派送到 pki_dir；
+#   30/31/40：patroni/rabbitmq/haproxy 的 metrics 端點已就緒（沒就緒也能部署，
+#   只是對應 target 會 down，等該層上線自然轉綠）。
+# =============================================================================
+
+# ---------- 1. 目錄結構 ----------
+# grafana/provisioning 整個目錄會掛進容器蓋掉映像內建的 /etc/grafana/provisioning，
+# Grafana 啟動時逐一讀取 datasources/dashboards/alerting/plugins/notifiers
+# 子目錄——缺目錄會報錯（alerting 缺失甚至直接啟動失敗），所以空目錄也要建齊。
+# 全部 root:0755 / 檔案 0644：prometheus(nobody)、grafana(472)、blackbox(nobody)
+# 都是容器內非 root 身分，要能「讀」這些唯讀掛載的設定。
+- name: 建立監控堆疊目錄結構
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - "{{ monitoring_home }}"
+    - "{{ monitoring_home }}/prometheus"
+    - "{{ monitoring_home }}/alertmanager"
+    - "{{ monitoring_home }}/blackbox"
+    - "{{ monitoring_home }}/grafana"
+    - "{{ monitoring_home }}/grafana/provisioning"
+    - "{{ monitoring_home }}/grafana/provisioning/datasources"
+    - "{{ monitoring_home }}/grafana/provisioning/dashboards"
+    - "{{ monitoring_home }}/grafana/provisioning/alerting"
+    - "{{ monitoring_home }}/grafana/provisioning/plugins"
+    - "{{ monitoring_home }}/grafana/provisioning/notifiers"
+
+# ---------- 2. Blackbox 的內部 CA ----------
+# 為什麼 copy 一份而不直接掛 {{ pki_dir }}/ca.crt？
+#   compose 專案的掛載來源全部收斂在 /opt/monitoring 底下，血緣單純
+#   （搬遷/重建 mgmt-01 只看一個目錄），容器也不直接依賴主機 PKI 路徑。
+#   ca.crt 是公開信任鏈、非機密 → 0644，不需要 no_log。
+# remote_src：來源就在 mgmt-01 上（10-pki 已派送），不是 controller 推檔。
+- name: 複製內部 CA chain 給 blackbox 容器
+  ansible.builtin.copy:
+    src: "{{ pki_dir }}/ca.crt"
+    dest: "{{ monitoring_home }}/blackbox/ca.crt"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart blackbox
+
+# PKI 契約（CONVENTIONS.md §5）：pki_leaf 重簽/換 CA 時設 host fact
+# pki_certs_changed=true。正常情況上面的 copy 比對內容就會 changed→notify；
+# 這個橋接 task 是契約要求的保險絲——確保 10-pki 重跑後再跑本 playbook，
+# blackbox 一定會重啟、以新 CA 驗證探測目標。/bin/true 只是掛 notify 的載體。
+- name: 偵測 PKI 憑證輪替並排程 blackbox 重啟
+  ansible.builtin.command: /bin/true
+  changed_when: true
+  when: pki_certs_changed | default(false)
+  notify: restart blackbox
+
+# ---------- 3. 各服務設定檔 ----------
+# prometheus.yml（抓誰）與 rules.yml（何時告警）分檔但都由 Prometheus 消化，
+# 共用同一個 handler；兩份都不含機密 → 0644 即可。
+- name: 佈署 Prometheus 設定與告警規則
+  ansible.builtin.template:
+    src: "{{ item }}.j2"
+    dest: "{{ monitoring_home }}/prometheus/{{ item }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - prometheus.yml
+    - rules.yml
+  notify: restart prometheus
+
+- name: 佈署 Blackbox 探測模組設定
+  ansible.builtin.template:
+    src: blackbox.yml.j2
+    dest: "{{ monitoring_home }}/blackbox/blackbox.yml"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart blackbox
+
+# 目前只有空 receiver 佔位、無機密；日後解開 SMTP 註解填入認證時，
+# 記得把本 task 改成 mode 0600 + no_log（模板內也有相同提醒）
+- name: 佈署 Alertmanager 路由設定
+  ansible.builtin.template:
+    src: alertmanager.yml.j2
+    dest: "{{ monitoring_home }}/alertmanager/alertmanager.yml"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart alertmanager
+
+# datasource 用 provisioning 檔而非 UI 手動加：重建 mgmt-01 後 Grafana
+# 一起動就有 Prometheus 資料源，不依賴人工步驟或 grafana-data volume 殘留
+- name: 佈署 Grafana datasource provisioning
+  ansible.builtin.template:
+    src: grafana-datasource-prometheus.yaml.j2
+    dest: "{{ monitoring_home }}/grafana/provisioning/datasources/prometheus.yaml"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart grafana
+
+# ---------- 4. docker compose 專案 ----------
+# environment 內含 Grafana admin 密碼 → 0600 + no_log（root 讀就夠：
+# docker compose 以 root 跑）。本檔變更「不需要」notify：image/env/ports
+# 這類容器定義層級的變更，下面 state=present（≒ docker compose up -d）
+# 自己會偵測並 recreate 對應容器；handlers 只負責 compose 偵測不到的
+# 「bind mount 設定檔內容變更」。
+- name: 佈署 docker-compose.yml
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ monitoring_home }}/docker-compose.yml"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+
+- name: 啟動監控堆疊（prometheus / grafana / alertmanager / blackbox）
+  community.docker.docker_compose_v2:
+    project_src: "{{ monitoring_home }}"
+    state: present
+
+# 把排隊中的 restart 立刻執行掉再驗埠——否則設定已變但容器還跑舊設定，
+# 下面的 wait_for 與 99-verify 會在「舊狀態」上假通過
+- name: 立即套用尚未生效的設定變更
+  ansible.builtin.meta: flush_handlers
+
+# ---------- 5. 部署自驗：四個埠就緒 ----------
+# 只驗 TCP 可達；「抓取目標 ≥90% up」等行為驗證由 99-verify 把關。
+# 埠綁在 0.0.0.0，用 127.0.0.1 驗最不受網路環境影響。
+- name: 等待監控服務監聽埠就緒
+  ansible.builtin.wait_for:
+    host: 127.0.0.1
+    port: "{{ item.port | int }}"
+    timeout: "{{ monitoring_wait_timeout }}"
+  loop:
+    - { name: prometheus, port: "{{ monitoring_prometheus_port }}" }
+    - { name: grafana, port: "{{ monitoring_grafana_port }}" }
+    - { name: alertmanager, port: "{{ monitoring_alertmanager_port }}" }
+    - { name: blackbox, port: "{{ monitoring_blackbox_port }}" }
+  loop_control:
+    label: "{{ item.name }}:{{ item.port }}"

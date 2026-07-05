@@ -1,0 +1,21 @@
+---
+# =============================================================================
+# roles/keepalived/meta/main.yml
+# =============================================================================
+galaxy_info:
+  author: email-proxy-infra
+  description: >-
+    Keepalived 單播 VRRP（ADR-7）：由 group_vars 的 keepalived_instances 驅動的
+    泛用 VIP 漂移 role——lb（服務/egress VIP）、postgres（PgBouncer VIP）、
+    rabbitmq（AMQPS VIP）三組共用同一份模板，網卡自動偵測、不硬編任何 IP。
+  license: MIT
+  min_ansible_version: "2.16"
+  platforms:
+    - name: Ubuntu
+      versions:
+        - all
+
+# 與 haproxy / egress_proxy 的先後順序由 playbook 的 roles 列表保證
+# （keepalived 排最後，track_script 起來時被追蹤的行程已就緒），
+# 不用 meta dependencies 硬綁——硬綁會讓 --tags 單跑時拖進整個依賴鏈。
+dependencies: []

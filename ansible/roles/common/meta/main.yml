@@ -1,0 +1,19 @@
+---
+galaxy_info:
+  role_name: common
+  namespace: email_proxy
+  author: justin.sc.hsu
+  description: 所有主機的系統基線（時區/NTP/hosts/proxy/sysctl/swap/limits/journald/SSH 強化）
+  company: PTC-NEC
+  license: MIT
+  min_ansible_version: "2.16"
+  platforms:
+    - name: Ubuntu
+      versions: ["all"]
+  galaxy_tags:
+    - system
+    - baseline
+
+# 刻意不宣告 role 依賴：執行順序由 playbook（00-bootstrap.yml）控制，
+# meta 依賴會讓 role 被隱式重複執行、破壞 --tags 的可預期性
+dependencies: []

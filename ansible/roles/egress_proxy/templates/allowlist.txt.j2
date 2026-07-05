@@ -1,0 +1,17 @@
+# =============================================================================
+# /etc/squid/allowlist.txt — {{ ansible_managed }}
+#
+# 由 Ansible 管理（roles/egress_proxy）：要增刪網域，請改
+# inventories/*/group_vars/egress.yml 的 egress_allowlist 再重跑 41-egress.yml
+# ——手改本檔必被下一次部署覆蓋。
+#
+# 格式：一行一網域（squid dstdomain ACL 檔，# 開頭為註解）。
+#   開頭帶「.」 = 涵蓋該網域與其所有子網域（例：.ubuntu.com 含 archive.ubuntu.com）
+#   不帶「.」  = 只精確比對該主機名（例：api.sendgrid.com）
+#
+# 治理提醒：每新增一行 = 多開一條「允許出網」的通道，請走 PR review——
+# 這份清單就是整套系統對外行為的稽核事實。
+# =============================================================================
+{% for entry in egress_allowlist %}
+{{ entry }}
+{% endfor %}

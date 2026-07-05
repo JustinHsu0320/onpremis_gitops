@@ -1,0 +1,20 @@
+---
+# =============================================================================
+# 60-monitoring.yml — 可觀測性（規劃書 §9）
+#
+# node_exporter 佈到全部主機；mgmt-01 跑 Prometheus + Grafana + Alertmanager +
+# Blackbox（TLS 憑證到期探測：到期前 30 天告警）。
+# 各服務的原生 metrics 端點（patroni 8008 / rabbitmq 15692 / haproxy 8404）
+# 由 Prometheus 直接抓，不再額外佈 exporter sidecar。
+# =============================================================================
+- name: 全主機 node_exporter
+  hosts: all
+  tags: [monitoring, node-exporter]
+  roles:
+    - role: node_exporter
+
+- name: Prometheus / Grafana / Alertmanager / Blackbox（mgmt-01）
+  hosts: monitoring
+  tags: [monitoring, prometheus]
+  roles:
+    - role: monitoring

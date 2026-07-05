@@ -1,0 +1,57 @@
+#cloud-config
+# =============================================================================
+# cloud-init「userdata」——首次開機自舉（bootstrap）
+# （由 terraform/modules/vm/main.tf 渲染後 base64 塞進 guestinfo.userdata）
+#
+# 這份文件的任務只有一個：把機器帶到「mgmt-01 的 Ansible 能 SSH 進來」的狀態。
+# 多一步都不做——套件、PKI、服務……全部是 Ansible role 的事（Layer 2）。
+# 在這裡多做的每一件事，都是日後「到底是誰設定的？」考古題的來源。
+# =============================================================================
+
+hostname: ${hostname}
+fqdn: ${fqdn}
+
+# /etc/hosts 由 Ansible common role 全權管理（ADR-5）。
+# "localhost" 模式 = cloud-init 只維護 127.0.1.1 那一行（避免 sudo 解析
+# 自己主機名失敗的警告），其餘內容一概不碰、不會與 Ansible 互踩。
+manage_etc_hosts: localhost
+
+# 只建立 ansible 自動化帳號，「不建立」預設的 ubuntu 使用者——
+# 少一個帳號 = 少一個攻擊面；個人帳號如有需要由 Ansible 統一開設。
+users:
+  - name: ansible
+    gecos: "Ansible automation (email_proxy Layer 2)"
+    shell: /bin/bash
+    # 鎖住密碼欄位：這個帳號「只能」用金鑰登入，沒有密碼可以被猜
+    lock_passwd: true
+    # NOPASSWD：自動化帳號無密碼可輸入，Ansible 的 become 才跑得動。
+    # 風險已收斂：金鑰只存在 mgmt-01（VLAN 99，防火牆僅維運跳板可達）
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    # 對應 mgmt-01 的 ~/.ssh/id_email_proxy.pub（inventory 的
+    # ansible_ssh_private_key_file 指向其私鑰）——Layer 1 交棒 Layer 2 的唯一憑證
+    ssh_authorized_keys:
+      - ${ansible_public_key}
+
+# 全面禁用 SSH 密碼認證（ssh_pwauth 是 cloud-init 層的開關……）
+ssh_pwauth: false
+disable_root: true
+
+# ……但 cloud-init 各發行版落地方式不一，這裡再直接落一份 sshd 設定檔，
+# 把「金鑰 only」寫死成可稽核的檔案（之後 hardening role 會接手同一路徑）
+write_files:
+  - path: /etc/ssh/sshd_config.d/99-email-proxy-bootstrap.conf
+    owner: root:root
+    permissions: "0644"
+    content: |
+      PasswordAuthentication no
+      KbdInteractiveAuthentication no
+      PermitRootLogin no
+
+# 套件安裝交給 Ansible；首次開機不 update/upgrade——
+# 開機時間可預期，而且這台機器可能還沒被允許直連外網（egress 白名單）
+package_update: false
+package_upgrade: false
+
+runcmd:
+  # 讓上面的 sshd 設定立即生效（Ubuntu 的服務名是 ssh；reload 不斷既有連線）
+  - systemctl reload ssh || systemctl reload sshd

@@ -1,0 +1,14 @@
+---
+# =============================================================================
+# 41-egress.yml — 對外出口 Squid（規劃書 §4）
+#
+# 與 lb 同居、主備 + VIP（VI_EGRESS 已在 40-lb 的 keepalived 一併設定，
+# 因為 keepalived 是「一台主機一份設定檔」——見 group_vars/lb.yml 註解）。
+# 這裡只負責 Squid 本體與白名單。
+# =============================================================================
+- name: Squid 顯式白名單正向代理
+  hosts: egress
+  tags: [egress]
+  serial: 1
+  roles:
+    - role: egress_proxy

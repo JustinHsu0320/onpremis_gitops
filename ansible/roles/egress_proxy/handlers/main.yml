@@ -1,0 +1,14 @@
+---
+# =============================================================================
+# roles/egress_proxy/handlers/main.yml
+# =============================================================================
+
+# reload = systemd 對 squid 下 reload（等價 squid -k reconfigure / SIGHUP）：
+# 重讀 squid.conf 與 dstdomain 引用的白名單檔，「既有 CONNECT 隧道不中斷」。
+# restart 會砍斷所有進行中的出網連線（例如正在跑的 apt 下載）——
+# 改白名單這種日常操作不該付出這種代價，所以一律 reload。
+- name: Reload squid
+  ansible.builtin.systemd_service:
+    name: squid
+    state: reloaded
+  listen: reload squid

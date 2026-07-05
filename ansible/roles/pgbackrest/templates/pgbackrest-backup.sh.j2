@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# =============================================================================
+# /usr/local/bin/pgbackrest-backup.sh — {{ ansible_managed }}
+#
+# 每晚由 pgbackrest-backup.timer 以 postgres 身分執行（三台 pg 都會被喚醒）。
+#
+# 【核心設計：leader 判斷放在「執行當下」而不是「部署當下」】
+#   Patroni 隨時可能 failover——如果部署時把 timer 只裝在當時的 leader，
+#   failover 後備份就默默斷了。反過來：三台都裝 timer、腳本開頭問本機
+#   Patroni「我現在是 leader 嗎」，不是就安靜退出。無論誰當 leader，
+#   當晚 01:30 一定恰好有一台（新 leader）執行備份，failover 零維運動作。
+# =============================================================================
+set -euo pipefail
+
+STANZA="{{ pgbackrest_stanza }}"
+# Patroni REST 綁在「節點 IP」上（CONVENTIONS.md §3），不是 127.0.0.1，
+# 所以這裡打本機自己的 ansible_host（template 時逐台代入各自的 IP）
+PATRONI_URL="http://{{ ansible_host }}:{{ patroni_rest_port }}/primary"
+
+# -----------------------------------------------------------------------------
+# 1) 只有 leader 才備份
+#    GET /primary 的語意：本節點是 leader → 200；是 replica → 503。
+#    curl -f：非 2xx 回非零 exit code → 進入 if 的 else 分支。
+#    在 replica 上退出碼用 0：對 systemd 而言「我不是 leader」是正常情況，
+#    不是失敗——否則兩台 replica 每晚都會產生紅色的 failed unit 噪音告警。
+# -----------------------------------------------------------------------------
+if ! curl -sf -o /dev/null --max-time 10 "${PATRONI_URL}"; then
+    echo "INFO: this node is not the Patroni leader (or Patroni is down); skipping backup."
+    exit 0
+fi
+
+# -----------------------------------------------------------------------------
+# 2) 決定備份型別：週日全備、其他日子差異備份
+#    date +%u：ISO 星期（1=週一 … 7=週日），不受 locale 影響（別用 %a）。
+#    - full：完整拷貝整個 data dir（基準點）
+#    - diff：只拷「相對於最近一次 full」變更的檔案——還原時最多只需要
+#      1 full + 1 diff + WAL，比 incr（鏈式依賴）的還原路徑短、風險低
+# -----------------------------------------------------------------------------
+DOW="$(date +%u)"
+if [ "${DOW}" -eq "{{ pgbackrest_full_backup_weekday }}" ]; then
+    BACKUP_TYPE="full"
+else
+    BACKUP_TYPE="diff"
+fi
+
+echo "INFO: starting pgbackrest ${BACKUP_TYPE} backup for stanza ${STANZA} ..."
+
+# -----------------------------------------------------------------------------
+# 3) 執行備份
+#    retention 的清理（expire）會在 backup 結束時自動觸發，不需另外排程。
+#    失敗時 set -e 讓非零碼傳回 systemd → unit 顯示 failed →
+#    可由 60-monitoring 的 systemd unit 監控接手告警。
+# -----------------------------------------------------------------------------
+pgbackrest --stanza="${STANZA}" --type="${BACKUP_TYPE}" backup
+
+echo "INFO: pgbackrest ${BACKUP_TYPE} backup finished successfully."

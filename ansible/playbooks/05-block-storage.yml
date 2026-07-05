@@ -1,0 +1,20 @@
+---
+# =============================================================================
+# 05-block-storage.yml — 資料碟格式化與掛載（規劃書 §2.3）
+#
+# 補齊「Terraform 掛了 VMDK，guest 內卻還是生碟」這一段：把資料 VMDK 格式化
+# 成 xfs 並掛到服務資料目錄。必須排在「服務安裝之前」——否則服務先在 OS 碟建了
+# 資料目錄，碟再掛上去就把資料遮蔽掉了。
+#
+# 為什麼在 08-docker 之前：mgmt-01 的監控碟掛到 /var/lib/docker，要趕在 Docker
+# 安裝前掛好，Docker 的 named volume（Prometheus TSDB / Grafana 等）才會落在
+# 大碟。app 節點沒有資料碟（storage_volumes 為空）→ 本階段對它們無動作。
+#
+# lab（is_container=true）：block_storage role 內整段 when: not is_container，
+# 容器沒有 block device，本階段對實驗室是空操作。
+# =============================================================================
+- name: 格式化並掛載資料碟
+  hosts: postgres:rabbitmq:nfs:monitoring:gitlab
+  tags: [bootstrap, storage, block-storage]
+  roles:
+    - role: block_storage

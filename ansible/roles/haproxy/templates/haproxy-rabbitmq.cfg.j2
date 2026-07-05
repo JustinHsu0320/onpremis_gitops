@@ -1,0 +1,102 @@
+# {{ ansible_managed }}
+# =============================================================================
+# haproxy-rabbitmq.cfg — 訊息佇列層 HAProxy（profile=rabbitmq，mq-01..03 各一份）
+#
+# 拓撲（規劃書 §10.4 修正：app 一律經 VIP，不再直連個別 mq 節點）：
+#
+#   app（producer/consumer）
+#     │  amqps://rabbitmq-vip.{{ domain }}:{{ rabbitmq_amqps_port }}
+#     ▼
+#   listen amqps（TCP passthrough——TLS 由 RabbitMQ 自持 rabbitmq-server 憑證，
+#     │           憑證 SAN 含 VIP 名稱/IP，所以 app 驗得過）
+#     ▼
+#   mq-01..03 節點 IP:{{ rabbitmq_amqps_port }}（quorum queue 本身跨節點複寫，
+#                       連到任一健康節點都能存取所有佇列）
+#
+#   維運人員瀏覽器
+#     │  http://rabbitmq-vip:{{ haproxy_mq_mgmt_port }}（僅 VLAN 30 可達）
+#     ▼
+#   listen mq_mgmt（mode http、balance source 做 session 黏著）
+#     ▼
+#   mq-01..03 節點 IP:{{ haproxy_mq_mgmt_port }}
+#
+# 埠不衝突的原因（junior 常見疑問）：RabbitMQ 自己綁「節點 IP」的 5671/15672，
+# HAProxy 綁的是「VIP」的同號埠——同埠不同 IP，各聽各的。BACKUP 節點沒持有
+# VIP 也能綁（net.ipv4.ip_nonlocal_bind=1，見 role tasks 的註解）。
+# =============================================================================
+
+global
+    maxconn {{ haproxy_mq_maxconn }}
+    # 日誌走 stdout：haproxy.service 以 -Ws 前景執行，由 systemd-journald 收容
+    log stdout local0 info
+    user haproxy
+    group haproxy
+    chroot /var/lib/haproxy
+    # expose-fd listeners：無縫 reload（監聽 fd 交棒新行程，reload 不掉 SYN）
+    stats socket /run/haproxy/admin.sock mode 660 level admin expose-fd listeners
+
+defaults
+    log global
+    mode tcp
+    option tcplog
+    option dontlognull
+    timeout connect {{ haproxy_mq_timeout_connect }}
+    # AMQP 是長連線協定：consumer 掛著等訊息是常態，活性由協定層 heartbeat
+    # （RabbitMQ 預設 60s）維持；LB 逾時設 1h 是「heartbeat 都停了才算死連線」
+    # 的保守值——設太短會定期斬斷健康的 consumer，表現為週期性的重連風暴
+    timeout client {{ haproxy_mq_timeout_client }}
+    timeout server {{ haproxy_mq_timeout_server }}
+
+# -----------------------------------------------------------------------------
+# AMQPS：{{ rabbitmq_vip }}:{{ rabbitmq_amqps_port }} → mq 節點（TCP passthrough）
+# -----------------------------------------------------------------------------
+listen amqps
+    bind {{ rabbitmq_vip }}:{{ rabbitmq_amqps_port }}
+    mode tcp
+    # roundrobin 把「連線」平均鋪到三個節點：quorum queue 的 leader 分佈在
+    # 不同節點上，連線鋪開 = 流量與 CPU 也鋪開（RabbitMQ 會在叢集內部把
+    # 訊息轉送到佇列 leader 所在節點，客戶端不需要連對節點）
+    balance roundrobin
+    # L4 健檢（TCP 握手成功即視為活著）：AMQPS 是 TLS 加密流量，HAProxy
+    # 看不進協定內容；節點層面的深度健康（記憶體水位、分割區偵測）由
+    # rabbitmq prometheus 指標（:15692）在監控層把關，LB 只管「連不連得上」
+    option tcp-check
+    default-server inter {{ haproxy_mq_check_inter }} fall {{ haproxy_mq_check_fall }} rise {{ haproxy_mq_check_rise }}
+{% for h in groups['rabbitmq'] %}
+    server {{ h }} {{ hostvars[h].ansible_host }}:{{ rabbitmq_amqps_port }} check
+{% endfor %}
+
+# -----------------------------------------------------------------------------
+# 管理 UI：{{ rabbitmq_vip }}:{{ haproxy_mq_mgmt_port }} → mq 節點 15672（mode http）
+# -----------------------------------------------------------------------------
+listen mq_mgmt
+    bind {{ rabbitmq_vip }}:{{ haproxy_mq_mgmt_port }}
+    mode http
+    # balance source（以來源 IP 雜湊固定後端）：管理 UI 登入後的操作黏在
+    # 同一個節點，避免頁面在節點間跳來跳去（UI 本身無共享 session 機制）
+    balance source
+    # 健檢用 GET / 期望 200：management UI 首頁是「匿名可取的靜態頁」。
+    # 為什麼不用看起來更專業的 /api/health/checks/alarms 或 /api/aliveness-test？
+    # ——那些 API 端點全都要 HTTP Basic 認證，健檢沒帶憑據會拿到 401 被判死；
+    # 而把管理帳密明文塞進 LB 設定檔又違反機密管理原則。GET / 驗的是
+    # 「management plugin 有起來、HTTP 服務正常」，對 UI 分流的目的足夠
+    option httpchk GET /
+    http-check expect status 200
+    default-server inter {{ haproxy_mq_check_inter }} fall {{ haproxy_mq_check_fall }} rise {{ haproxy_mq_check_rise }}
+{% for h in groups['rabbitmq'] %}
+    server {{ h }} {{ hostvars[h].ansible_host }}:{{ haproxy_mq_mgmt_port }} check
+{% endfor %}
+
+# -----------------------------------------------------------------------------
+# stats / metrics（CONVENTIONS.md §3：節點 IP:{{ haproxy_stats_port }}）
+# -----------------------------------------------------------------------------
+frontend stats
+    # 綁節點 IP：三台 mq 的 HAProxy 狀態各自獨立可看（Prometheus 逐台抓）
+    bind {{ ansible_host }}:{{ haproxy_stats_port }}
+    # defaults 是 tcp，stats 頁面與 exporter 是 HTTP 服務 → 這裡覆寫回 http
+    mode http
+    stats enable
+    stats uri /stats
+    stats refresh {{ haproxy_stats_refresh }}
+    # HAProxy 3.x 內建 Prometheus exporter：/stats 給人看、/metrics 給機器抓
+    http-request use-service prometheus-exporter if { path /metrics }

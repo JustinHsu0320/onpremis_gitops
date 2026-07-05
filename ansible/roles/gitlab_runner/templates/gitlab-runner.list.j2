@@ -1,0 +1,13 @@
+# =============================================================================
+# /etc/apt/sources.list.d/gitlab-runner.list — 由 Ansible（gitlab_runner role）管理
+# 手改必被覆蓋；變更流程：改 template → PR → ansible-playbook
+#
+# 為什麼長這樣（給 junior）：
+#   - runner 與 gitlab-ce 是 packages.gitlab.com 上「兩個不同的 repo」，
+#     各自的金鑰、各自的來源檔；signed-by 指名專屬金鑰 = 信任範圍最小化
+#   - codename 用變數（預設 noble）：策略同 gitlab-ce repo——上游對最新
+#     Ubuntu LTS 支援晚幾個月，26.04 開通前先用 noble 包；gitlab-runner
+#     是靜態編譯的 Go 執行檔，跨版本安裝無相依風險
+#   - apt 的 egress proxy 由 common role 的 apt 設定檔統一處理，這裡不寫 proxy
+# =============================================================================
+deb [signed-by={{ gitlab_runner_keyring_path }}] {{ gitlab_runner_apt_repo_base }} {{ gitlab_apt_codename | default('noble') }} main

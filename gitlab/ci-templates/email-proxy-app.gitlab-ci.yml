@@ -1,0 +1,160 @@
+---
+# =============================================================================
+# gitlab/ci-templates/email-proxy-app.gitlab-ci.yml — email_proxy 本體管線
+# （Go 服務、VM + Docker Compose 部署——不進 K8s、不走 ArgoCD）
+#
+# ── ADR-6 完整流程（本模板是流程的「上半段」）───────────────────────────
+#   1. app repo push main → 本管線 test → build → kaniko 推三個映像：
+#        registry.ptc-nec.com.tw:5050/email-proxy/{api,worker,smtp}:<short-sha>
+#      （路徑契約 = infra repo group_vars/all/vars.yml 的 app_images：
+#        "{{ registry_host }}/email-proxy/api:{{ app_image_tag }}" …）
+#   2. deploy 階段用 Pipeline Trigger API 觸發 infra monorepo 的管線，
+#      帶變數 APP_IMAGE_TAG=<short-sha>
+#   3. infra 管線的 ansible-deploy-app job（rules 只認 trigger 來源）執行：
+#        ansible-playbook playbooks/50-app.yml -e app_image_tag=<short-sha>
+#   4. app_stack role 渲染新 compose → 50-app.yml 的 serial: 1 逐台滾動，
+#      配合 HAProxy 健檢（fall 3 × inter 5s）自然摘除/回掛 → 零中斷更新
+#
+# ── 為什麼繞一圈 infra repo，而不是在本 repo 直接跑 ansible？──────────
+#   權限最小化：inventory、vault 密碼、生產機 SSH 私鑰只存在 infra repo 的
+#   CI context。本 repo 只拿得到一把「只能觸發 infra 那條 pipeline」的
+#   trigger token——就算本 repo 被打穿，攻擊者也拿不到生產機的鑰匙。
+#   附帶好處：所有生產部署集中在 infra repo 的 pipeline / environment 頁，
+#   稽核（誰在何時部了哪個 tag）一頁看完。
+#
+# ── 使用方式（email_proxy app repo 的 .gitlab-ci.yml）────────────────────
+#   include:
+#     - project: "infra/email-proxy-infra"
+#       ref: main
+#       file: "gitlab/ci-templates/email-proxy-app.gitlab-ci.yml"
+#   需要的 CI 變數（Settings → CI/CD → Variables，皆 Masked + Protected）：
+#     INFRA_PROJECT_ID    = infra monorepo 的數字 project id（專案首頁可見）
+#     INFRA_TRIGGER_TOKEN = infra repo Settings → CI/CD → Pipeline trigger
+#                           tokens 建立的 token
+# =============================================================================
+
+# 巢狀 include：local 以本檔所在 repo（infra monorepo）為根解析
+include:
+  - local: gitlab/ci-templates/docker-build.gitlab-ci.yml
+
+stages: [test, build, image, deploy]
+
+default:
+  tags: [onprem-docker]
+
+variables:
+  # 本專案要建三個映像（api/worker/smtp），關掉 docker-build 模板的
+  # 預設單映像 build-image job，下面自己開三個 extends job
+  SKIP_DEFAULT_BUILD_IMAGE: "true"
+  # Go 依賴來源說明見 backend.gitlab-ci.yml（Squid 白名單或內部 Athens）
+  GOPROXY: "https://proxy.golang.org,direct"
+  GOPATH: "${CI_PROJECT_DIR}/.go"
+  # 觸發 infra 管線的目標 ref（infra repo 的部署一律走 main）
+  INFRA_REF: "main"
+
+cache:
+  key:
+    files: [go.sum]
+  paths:
+    - .go/pkg/mod/
+
+# ---------------------------------------------------------------------------
+# stage: test / build — 與 backend 模板同款（詳細註解見該檔）
+# ---------------------------------------------------------------------------
+go-test:
+  stage: test
+  image: golang:1.24
+  script:
+    - go vet ./...
+    # email_proxy 是多 goroutine 的 SMTP/佇列服務，-race 絕對不能省
+    - go test -race -count=1 -cover ./...
+
+go-build:
+  stage: build
+  image: golang:1.24
+  script:
+    # 三個進入點各自編譯，確保任何一個壞掉都在 image 階段之前就攔下
+    - CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o bin/api ./cmd/api
+    - CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o bin/worker ./cmd/worker
+    - CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o bin/smtp ./cmd/smtp
+  artifacts:
+    paths: [bin/]
+    expire_in: 1 day
+
+# ---------------------------------------------------------------------------
+# stage: image — 三個映像，各自 extends kaniko 模板
+# KANIKO_IMAGE 覆寫成 app_images 契約要求的固定路徑（registry/email-proxy/...），
+# 不用 CI_REGISTRY_IMAGE（那會跟著本 repo 的 group/專案名走，改名就毀契約）
+# ---------------------------------------------------------------------------
+.image-rules: &image-rules
+  - if: $CI_COMMIT_TAG
+  - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+image-api:
+  extends: .kaniko-build
+  rules: *image-rules
+  variables:
+    KANIKO_IMAGE: "${CI_REGISTRY}/email-proxy/api"
+    KANIKO_DOCKERFILE: "${CI_PROJECT_DIR}/build/api/Dockerfile"
+    KANIKO_CACHE_REPO: "${CI_REGISTRY}/email-proxy/api/cache"
+
+image-worker:
+  extends: .kaniko-build
+  rules: *image-rules
+  variables:
+    KANIKO_IMAGE: "${CI_REGISTRY}/email-proxy/worker"
+    KANIKO_DOCKERFILE: "${CI_PROJECT_DIR}/build/worker/Dockerfile"
+    KANIKO_CACHE_REPO: "${CI_REGISTRY}/email-proxy/worker/cache"
+
+image-smtp:
+  extends: .kaniko-build
+  rules: *image-rules
+  variables:
+    KANIKO_IMAGE: "${CI_REGISTRY}/email-proxy/smtp"
+    KANIKO_DOCKERFILE: "${CI_PROJECT_DIR}/build/smtp/Dockerfile"
+    KANIKO_CACHE_REPO: "${CI_REGISTRY}/email-proxy/smtp/cache"
+
+# ---------------------------------------------------------------------------
+# stage: deploy — 觸發 infra repo 的 Ansible 部署（ADR-6 交棒點）
+#
+# 只在 main push 觸發（semver tag 發版要不要自動部署，由團隊決定後再加
+# $CI_COMMIT_TAG 規則——建議 tag 發版走 infra repo 手動按，儀式感 = 謹慎）。
+# needs 三個 image job：映像全部推上 registry 之後才准觸發部署，
+# 否則 app 節點會 pull 到不存在的 tag。
+# ---------------------------------------------------------------------------
+trigger-infra-deploy:
+  stage: deploy
+  image:
+    # 只需要 curl；官方 curl image 的 entrypoint 是 curl 本體，要清空換 shell。
+    # 地端建議 mirror 到內部 registry 再改位址
+    name: curlimages/curl:8.10.1
+    entrypoint: [""]
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  needs: [image-api, image-worker, image-smtp]
+  script:
+    # gitlab.ptc-nec.com.tw 的 TLS 憑證由內部 CA 簽發：若 runner 未在
+    # config.toml 統一注入信任（作法見 docker-build 模板的 CA 註解），
+    # 就用 file variable INTERNAL_CA_PEM 讓 curl 驗得過——
+    # 千萬不要用 -k/--insecure 矇混，那等於自廢 TLS
+    - |
+      CA_OPT=""
+      if [ -n "${INTERNAL_CA_PEM:-}" ]; then
+        CA_OPT="--cacert ${INTERNAL_CA_PEM}"
+      fi
+    # Pipeline Trigger API：
+    #   POST /projects/:id/trigger/pipeline
+    #   - token   ：trigger token（只能起 pipeline，拿不到任何 repo 內容）
+    #   - ref     ：要在 infra repo 的哪個 ref 上起管線（main）
+    #   - variables[APP_IMAGE_TAG]：傳給 infra 管線的變數——
+    #     infra 的 ansible-deploy-app 以「$CI_PIPELINE_SOURCE == trigger 且
+    #     $APP_IMAGE_TAG 存在」為啟動條件，最終落地成
+    #     ansible-playbook playbooks/50-app.yml -e app_image_tag=<short-sha>
+    # --fail：HTTP 4xx/5xx 讓 job 直接紅掉（預設 curl 吞錯誤，絕不允許）
+    - >-
+      curl ${CA_OPT} --fail --silent --show-error --request POST
+      "${CI_API_V4_URL}/projects/${INFRA_PROJECT_ID}/trigger/pipeline"
+      --form "token=${INFRA_TRIGGER_TOKEN}"
+      --form "ref=${INFRA_REF}"
+      --form "variables[APP_IMAGE_TAG]=${CI_COMMIT_SHORT_SHA}"
+    - echo ">> 已觸發 infra 管線部署 app_image_tag=${CI_COMMIT_SHORT_SHA}，後續進度見 infra repo 的 pipeline / production environment 頁"

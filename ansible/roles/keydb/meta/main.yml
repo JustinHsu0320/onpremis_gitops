@@ -1,0 +1,20 @@
+---
+# =============================================================================
+# roles/keydb/meta/main.yml
+# =============================================================================
+galaxy_info:
+  author: email-proxy-infra
+  description: >-
+    KeyDB 3 master + 3 replica 快取叢集（每台 app 節點 1M+1R，Docker 容器、
+    host network、TLS-only + mTLS + requirepass，純快取不落地）。
+  license: MIT
+  min_ansible_version: "2.16"
+  platforms:
+    - name: Ubuntu
+      versions:
+        - all
+
+# 執行順序依賴（00-bootstrap 先裝好 Docker、10-pki 先簽好 keydb-server /
+# keydb-client 憑證）由 site.yml 的 play 順序保證，不用 meta dependencies
+# 硬綁——硬綁會讓 --tags keydb 單跑時把整個 bootstrap/pki 拖進來。
+dependencies: []

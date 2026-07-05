@@ -1,0 +1,22 @@
+# =============================================================================
+# pgbackrest-backup.timer — {{ ansible_managed }}
+#
+# 為什麼用 systemd timer 而不是 cron：
+#   1) 執行紀錄進 journal（cron 的 MAILTO 黑洞問題）
+#   2) Persistent 可補跑錯過的排程
+#   3) systemctl list-timers 一眼看到下次觸發時間，運維透明
+# =============================================================================
+[Unit]
+Description=Daily pgBackRest backup trigger
+
+[Timer]
+# 每日 01:30：避開日切批次/logrotate 尖峰；週日/平日的全備/差異判斷在腳本內
+OnCalendar={{ pgbackrest_backup_oncalendar }}
+# 隨機延遲最多 {{ pgbackrest_backup_random_delay }} 秒：三台 pg 的 timer 都會醒
+# （只有 leader 真的備份），錯開避免同秒齊打 Patroni REST 與 NFS
+RandomizedDelaySec={{ pgbackrest_backup_random_delay }}
+# 機器在 01:30 剛好停機（維護窗口）時，開機後補跑一次，不讓當天備份漏掉
+Persistent=true
+
+[Install]
+WantedBy=timers.target

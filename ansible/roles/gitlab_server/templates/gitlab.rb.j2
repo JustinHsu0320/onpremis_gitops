@@ -1,0 +1,107 @@
+# =============================================================================
+# /etc/gitlab/gitlab.rb — 由 Ansible（gitlab_server role）全量管理，手改必被覆蓋
+#
+# 變更流程：改 roles/gitlab_server/templates/gitlab.rb.j2 → PR → ansible-playbook
+# 生效方式：gitlab-ctl reconfigure（gitlab.rb 變更時由 Ansible handler 自動觸發）
+#
+# 原則：只寫「有明確理由偏離 omnibus 預設」的設定；其餘交給預設值，
+# 讓本檔的每一行 diff 都值得 review（同 docker daemon.json 的哲學）
+# =============================================================================
+
+## ---------------------------------------------------------------------------
+## 對外 URL
+## ---------------------------------------------------------------------------
+# external_url 一次決定三件事：nginx 監聽埠（https → 443）、rails 產生的
+# 所有連結（clone URL、通知信內的網址）、以及 omnibus 預設尋找的憑證檔名
+# （/etc/gitlab/ssl/<host>.crt/.key——本 role 的憑證就是照這個慣例落地的）
+external_url "{{ gitlab_external_url }}"
+
+# Container Registry 走同一台 omnibus nginx 的 5050 埠（CONVENTIONS.md §3）。
+# ADR-6：app 映像由 CI build 一次 → push 到這個 registry → 各 app 節點 pull，
+# 取代「每台節點自己 build」的漂移來源。
+# registry 用「同一張」憑證：pki_leaf 簽的 gitlab-server 憑證 SAN 已同時涵蓋
+# gitlab.{{ domain }} 與 registry.{{ domain }}（group_vars/gitlab.yml extra_sans）
+registry_external_url "{{ gitlab_registry_external_url }}"
+
+## ---------------------------------------------------------------------------
+## TLS（內部 CA，PKI 契約見 CONVENTIONS.md §5）
+## ---------------------------------------------------------------------------
+# 明確指路徑而不靠檔名慣例猜測：junior 半夜排障時 grep 一次就找到憑證在哪
+nginx['ssl_certificate'] = "{{ gitlab_server_ssl_dir }}/gitlab.{{ domain }}.crt"
+nginx['ssl_certificate_key'] = "{{ gitlab_server_ssl_dir }}/gitlab.{{ domain }}.key"
+
+# registry 的 5050 站台也由同一個 nginx 服務、共用同一對憑證檔（SAN 已涵蓋）
+registry_nginx['ssl_certificate'] = "{{ gitlab_server_ssl_dir }}/gitlab.{{ domain }}.crt"
+registry_nginx['ssl_certificate_key'] = "{{ gitlab_server_ssl_dir }}/gitlab.{{ domain }}.key"
+
+# 地端內部 CA 簽發、機器也出不了網：ACME/Let's Encrypt 必須關，
+# 否則 reconfigure 會嘗試向外申請憑證然後卡住失敗
+letsencrypt['enable'] = false
+
+## ---------------------------------------------------------------------------
+## 備份
+## ---------------------------------------------------------------------------
+# 單位是「秒」：604800 = 保留 7 天。gitlab 只清「自己產的」過期備份檔
+gitlab_rails['backup_keep_time'] = {{ gitlab_server_backup_keep_time }}
+
+# 備份先落本機（restore 演練最快），異地副本由維運排程把本路徑同步出去。
+# 注意：目前儲存契約（CONVENTIONS.md §4）的 NFS 匯出只有 attachments 與
+# pgbackup 兩個，「GitLab 備份的異地目的地」尚待契約補充——在補上之前，
+# 請至少把 crontab 的 gitlab-backup create + rsync 排程列入維運 runbook
+gitlab_rails['backup_path'] = "{{ gitlab_server_backup_path }}"
+
+## ---------------------------------------------------------------------------
+## 效能（依 gitlab-01 VM 規格調校）
+## ---------------------------------------------------------------------------
+# Puma worker 數經驗法則：min(vCPU 數, 可用記憶體 / 1.2GB)。
+# gitlab-01 = 4 vCPU / 8GB → 4 workers ≈ 4.8GB，加上 sidekiq/gitaly/內嵌 PG
+# 剛好塞進 8GB。VM 規格調整時同步改 defaults 的 gitlab_server_puma_workers
+{% if gitlab_server_puma_workers | int > 0 %}
+puma['worker_processes'] = {{ gitlab_server_puma_workers }}
+{% else %}
+# gitlab_server_puma_workers=0：交回 omnibus 依 CPU/記憶體自動計算
+{% endif %}
+
+## ---------------------------------------------------------------------------
+## 監控
+## ---------------------------------------------------------------------------
+# omnibus 內建的 prometheus 保留：它抓的是 GitLab「內部」元件
+# （puma/sidekiq/gitaly/workhorse…）的細粒度指標，站台級 Prometheus
+# 之後可用 federation 或直接抓各 exporter 端點納入
+prometheus_monitoring['enable'] = true
+
+# 但 node_exporter 必須停用：本專案全站主機已由 60-monitoring 佈署
+# 系統級 node_exporter 聽 9100（CONVENTIONS.md §3），omnibus 再起一個
+# 自己的 node_exporter 會撞埠/重複取樣——主機指標只能有一個事實來源
+node_exporter['enable'] = false
+
+# readiness/liveness/metrics 端點的來源 IP 白名單（預設只有 127.0.0.0/8）。
+# 加 VLAN 50：本 role 部署自驗與 runner 健檢經 gitlab.{{ domain }}（非 loopback）打進來；
+# 加 VLAN 99：mgmt-01 的 Prometheus blackbox 探測也要能看 readiness
+gitlab_rails['monitoring_whitelist'] = ['127.0.0.0/8', '{{ vlan_devops_cidr }}', '{{ vlan_mgmt_cidr }}']
+
+## ---------------------------------------------------------------------------
+## 一般
+## ---------------------------------------------------------------------------
+# 與全站 timezone 契約一致（group_vars/all/vars.yml），
+# CI pipeline 時間戳、通知信時間才不會跟系統日誌對不起來
+gitlab_rails['time_zone'] = "{{ timezone }}"
+
+## ---------------------------------------------------------------------------
+## SMTP —— 喝自己的香檳（預設關閉，需要通知信時解除註解）
+## ---------------------------------------------------------------------------
+# GitLab 的通知信「不裝 postfix、不直連外部郵件服務」，而是走本專案
+# email_proxy 自己的入口：svc-api.{{ domain }}:465（SMTPS，邊界 HAProxy
+# TCP passthrough → app:2525 smtp-receiver）——內部服務吃自己家的服務，
+# 郵件外送的白名單/稽核/重試全部沿用 email_proxy 既有機制，不另開出網破口。
+# smtp_ca_file 指系統信任庫即可：pki_leaf 已把內部 CA 裝進去。
+# 啟用時記得把帳密放 vault（vault_gitlab_smtp_*）再經 vars.yml 別名引用。
+#
+# gitlab_rails['smtp_enable'] = true
+# gitlab_rails['smtp_address'] = "svc-api.{{ domain }}"
+# gitlab_rails['smtp_port'] = 465
+# gitlab_rails['smtp_tls'] = true                                  # SMTPS（implicit TLS）
+# gitlab_rails['smtp_openssl_verify_mode'] = 'peer'                # 驗對端憑證，防中間人
+# gitlab_rails['smtp_ca_file'] = "/etc/ssl/certs/ca-certificates.crt"
+# gitlab_rails['gitlab_email_from'] = "gitlab@{{ domain }}"
+# gitlab_rails['gitlab_email_reply_to'] = "noreply@{{ domain }}"

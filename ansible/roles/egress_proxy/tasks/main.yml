@@ -1,0 +1,66 @@
+---
+# =============================================================================
+# roles/egress_proxy/tasks/main.yml — Squid 顯式白名單正向代理（規劃書 §4）
+#
+# 設計思想（junior 必讀）：這是地端環境的「唯一合法出網通道」。
+# 「這套系統會連外去哪」不再是散落各處的隱性知識，而是 group_vars/egress.yml
+# 裡一份可 review、可稽核的白名單——沒列的網域就是連不出去（預設拒絕）。
+#
+# 與 lb 同居（ADR-3）；egress VIP（VI_EGRESS）由 keepalived role 統一管理
+# （keepalived 是「一台主機一份設定檔」），本 role 只負責 Squid 本體與白名單。
+# =============================================================================
+
+# Ubuntu 26.04 官方 archive 的 squid 7.2：不加第三方 repo（規劃書鐵律）。
+# cache_valid_time 避免每次重跑都 apt update（冪等 + 提速）
+- name: 安裝 Squid 套件
+  ansible.builtin.apt:
+    name: squid
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+# 白名單「必須」先於 squid.conf 落地：下一個 task 的 validate（squid -k parse）
+# 會真的打開 dstdomain 引用的檔案——首次部署時檔案還不存在的話 parse 直接失敗。
+# 內容不是機密（就是允許出網的網域清單）→ 0644 即可
+- name: 佈署網域白名單 /etc/squid/allowlist.txt
+  ansible.builtin.template:
+    src: allowlist.txt.j2
+    dest: /etc/squid/allowlist.txt
+    owner: root
+    group: root
+    mode: "0644"
+  notify: reload squid
+
+# 整檔接管 squid.conf（不用 conf.d 疊加）：白名單策略必須是「這個檔案就是全部」，
+# 不能存在套件預設值或別的工具丟進 conf.d 繞過 deny all 的可能。
+# validate 先 parse 再換檔：語法錯誤在落地前就擋下，正在跑的 squid 不會讀到壞設定
+- name: 佈署 /etc/squid/squid.conf（整檔接管）
+  ansible.builtin.template:
+    src: squid.conf.j2
+    dest: /etc/squid/squid.conf
+    owner: root
+    group: root
+    mode: "0644"
+    validate: squid -k parse -f %s
+  notify: reload squid
+
+# enabled=true 開機自啟；state=started 只保證「有在跑」，
+# 設定變更的生效交給 reload handler（squid -k reconfigure 語意，連線不中斷）
+- name: 啟用並啟動 squid 服務
+  ansible.builtin.systemd_service:
+    name: squid
+    enabled: true
+    state: started
+
+# 先把排隊中的 reload 立刻執行掉再驗埠——否則首次部署時套件以「Debian 預設
+# 設定」自啟的服務也會讓 wait_for 假通過（埠通了但跑的還是無白名單的預設值）
+- name: 立即套用尚未生效的設定變更
+  ansible.builtin.meta: flush_handlers
+
+# 部署自驗：埠有開才算部署完成。「白名單放行 / 非白名單 403」的行為級驗證
+# 由 99-verify.yml（verify-egress）從 app 節點經 VIP 實測
+- name: 等待 Squid 監聽 {{ squid_port }}
+  ansible.builtin.wait_for:
+    host: 127.0.0.1
+    port: "{{ squid_port }}"
+    timeout: "{{ egress_proxy_wait_timeout }}"

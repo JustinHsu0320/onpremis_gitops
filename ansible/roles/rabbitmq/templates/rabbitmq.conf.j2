@@ -1,0 +1,85 @@
+# =============================================================================
+# /etc/rabbitmq/rabbitmq.conf — {{ ansible_managed }}
+#
+# RabbitMQ 4.x 的 sysctl 風格新格式設定檔（不是舊的 Erlang term rabbitmq.config）。
+# 本檔只在節點「啟動時」讀取，改完必須 systemctl restart rabbitmq-server。
+# 本檔由 Ansible roles/rabbitmq 管理，手改必被覆蓋——要調參數請改 inventory 變數。
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# 叢集組建：classic_config 靜態成員清單
+# -----------------------------------------------------------------------------
+# 為什麼選 classic_config 而不是 DNS / consul / etcd 後端：
+#   成員固定三台、增減必先改 inventory（走 PR），靜態清單最簡單、零外部依賴。
+#   節點第一次啟動時會依序嘗試聯絡清單中的 peer 自動加入叢集（自動湊團），
+#   已入團的節點之後從本地資料庫讀成員資訊，這份清單只是 bootstrap 用。
+# 名稱解析：rabbit@<短主機名> 靠 /etc/hosts —— common role 已管理（ADR-5），
+#   三台的短名/FQDN 都在 hosts 檔裡，不依賴外部 DNS。
+# 成員從 groups['rabbitmq'] 展開，絕不硬編主機名（CONVENTIONS.md §1）
+cluster_formation.peer_discovery_backend = classic_config
+{% for host in groups['rabbitmq'] %}
+cluster_formation.classic_config.nodes.{{ loop.index }} = rabbit@{{ host }}
+{% endfor %}
+
+# -----------------------------------------------------------------------------
+# Listener：AMQPS only（明文 AMQP 全關）
+# -----------------------------------------------------------------------------
+# listeners.tcp = none 把 5672 明文口整個關掉——資料層 VLAN 30 雖是內網，
+# 但「內網 = 可信」是老舊假設；帳密與信件內容一律走 TLS（規劃書 §5）
+listeners.tcp = none
+## 綁「節點 IP」而非預設的全介面：同一台 mq 節點上 HAProxy 要綁 VIP:5671，
+## wildcard socket 會讓 HAProxy EADDRINUSE（埠共存原則：服務綁自己、LB 綁 VIP）
+listeners.ssl.1 = {{ ansible_host }}:{{ rabbitmq_amqps_port }}
+
+# TLS 憑證：內部 CA（pki_leaf role 簽發，397 天）；SAN 含節點名/IP 與
+# rabbitmq-vip（app 經 HAProxy VIP 連入時驗的是 VIP 名稱，見 group_vars/rabbitmq.yml）
+ssl_options.cacertfile = {{ pki_dir }}/ca.crt
+ssl_options.certfile = {{ pki_dir }}/rabbitmq-server.crt
+ssl_options.keyfile = {{ pki_dir }}/rabbitmq-server.key
+
+# server-only TLS 的取捨（為什麼不開 mTLS）：
+#   - client（app）驗 server 憑證 → 防竊聽、防假冒 broker，已涵蓋主要威脅
+#   - 客戶端身分認證交給 AMQP 帳密（vault 管理），不要求 client 憑證：
+#     開 mTLS 要再為每個 app 容器派發/輪替 client 憑證，複雜度上升
+#     但增益有限（app 與 mq 同屬受控內網段）。若日後要升級 mTLS，
+#     改 verify_peer + fail_if_no_peer_cert=true 並為 app 加發 client 憑證即可
+ssl_options.verify = verify_none
+ssl_options.fail_if_no_peer_cert = false
+
+# -----------------------------------------------------------------------------
+# Management UI / API（15672，HTTP）
+# -----------------------------------------------------------------------------
+# 綁 0.0.0.0 但實際可達性由防火牆限縮在 VLAN 30（規劃書 §4）；
+# HAProxy 的 VIP 15672 也會反代它（維運從管理網經 VIP 看管理介面）。
+# 不開 management TLS：流量僅存在於受控段內，且 99-verify 與
+# community.rabbitmq 模組都打本機 127.0.0.1:15672
+## 同上：management 綁節點 IP，VIP:15672 由 HAProxy 代理
+management.tcp.ip = {{ ansible_host }}
+management.tcp.port = {{ rabbitmq_management_port }}
+
+# -----------------------------------------------------------------------------
+# Prometheus metrics（rabbitmq_prometheus plugin）
+# -----------------------------------------------------------------------------
+# mgmt-01 的 Prometheus 直接抓各節點 15692 的 /metrics
+prometheus.tcp.port = {{ rabbitmq_prometheus_port }}
+
+# -----------------------------------------------------------------------------
+# 資源保護水位
+# -----------------------------------------------------------------------------
+# 記憶體高水位：超過「實體 RAM x 比例」即對 publisher 施加流控（背壓），
+# 防止吃光記憶體被 OOM killer 擊殺。prod 0.6；lab 容器降規 0.3
+# （zz_lab_overrides.yml），default 是 role 單獨渲染時的 fallback
+vm_memory_high_watermark.relative = {{ rabbitmq_vm_memory_high_watermark | default('0.6') }}
+
+# 磁碟低水位（絕對值）：可用空間低於 2GB 即擋 publish——raft log / 訊息落盤
+# 寫不進去的後果比拒收訊息嚴重得多
+disk_free_limit.absolute = {{ rabbitmq_disk_free_limit }}
+
+# -----------------------------------------------------------------------------
+# 網路分割處理：pause_minority（三節點防裂腦的標準解）
+# -----------------------------------------------------------------------------
+# 發生 partition 時，「少數側」節點自我暫停（停止服務、等網路復原自動重join），
+# 多數側繼續服務——確保任何時刻最多只有一側在收寫入，杜絕裂腦後的資料分歧。
+# 三節點奇數成員下這是官方建議值；代價是少數側的 client 會斷線（由 HAProxy
+# 健檢把流量導向多數側）
+cluster_partition_handling = pause_minority

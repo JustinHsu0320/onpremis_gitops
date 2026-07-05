@@ -1,0 +1,25 @@
+---
+# =============================================================================
+# roles/gitlab_server/meta/main.yml
+# =============================================================================
+galaxy_info:
+  role_name: gitlab_server
+  namespace: email_proxy
+  author: justin.sc.hsu
+  description: >-
+    GitLab CE Omnibus + Container Registry（gitlab-01，VLAN 50）：
+    官方 apt repo、內部 CA TLS、gitlab.rb 全量管理、readiness 自驗。
+  company: PTC-NEC
+  license: MIT
+  min_ansible_version: "2.16"
+  platforms:
+    - name: Ubuntu
+      versions: ["all"]
+  galaxy_tags:
+    - gitlab
+    - devops
+
+# 不宣告對 common / pki_leaf 的 meta 依賴：順序由 site.yml 保證
+# （70-gitlab 僅依賴 00-bootstrap 與 10-pki），硬綁會讓 --tags gitlab
+# 單跑時把整個基線 role 拖進來重跑，拖慢部署（同 docker role 的決策）
+dependencies: []

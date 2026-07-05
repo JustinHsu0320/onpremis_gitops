@@ -1,0 +1,13 @@
+# =============================================================================
+# /etc/systemd/journald.conf.d/99-persistent.conf — 由 Ansible（common role）管理
+#
+# 為什麼要持久化：預設 Storage=auto 且 /var/log/journal 不存在時，
+# 日誌只寫進 /run/log/journal（tmpfs）——主機一重開機，事故現場全部蒸發。
+# 地端環境沒有雲端集中日誌可依賴，本機 journal 就是第一手證據。
+# =============================================================================
+[Journal]
+# persistent：落盤到 /var/log/journal（journald 重啟時會自行建立該目錄）
+Storage=persistent
+# 磁碟用量上限：日誌無上限增長 → 根碟被吃滿 → 整台機器連 SSH 都出問題。
+# 超過上限時 journald 自動輪替刪最舊的，不需要人工介入
+SystemMaxUse={{ common_journald_max_use }}

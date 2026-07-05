@@ -1,0 +1,23 @@
+# =============================================================================
+# pgbackrest-backup.service — {{ ansible_managed }}
+#
+# oneshot：不是常駐服務，被 pgbackrest-backup.timer 喚醒、跑完腳本就結束。
+# 沒有 [Install] 段是刻意的：這個 unit 不該被 enable 成開機自啟，
+# 它唯一的入口就是 timer（以及人工 systemctl start 做手動備份演練）。
+# =============================================================================
+[Unit]
+Description=pgBackRest scheduled backup (full on Sunday, diff otherwise)
+# 備份需要網路（Patroni REST 判斷 leader）與 NFS 掛載（repo 所在）
+After=network-online.target remote-fs.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# 與 archive-push / repo 檔案擁有者同一身分，避免 repo 內權限打架
+User=postgres
+ExecStart=/usr/local/bin/pgbackrest-backup.sh
+# 降低備份對生產負載的影響：CPU nice + IO best-effort 低優先
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+# stdout/stderr 進 journal：journalctl -u pgbackrest-backup 即可查每晚結果

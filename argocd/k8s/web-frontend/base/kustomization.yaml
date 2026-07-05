@@ -1,0 +1,21 @@
+# =============================================================================
+# web-frontend base Kustomization
+#
+# base = 所有環境共通的宣告。overlay（如 overlays/prod）引用本目錄後
+# 疊加環境差異（namespace、副本數、映像 tag…）。
+# ArgoCD 的 Application 永遠指向 overlay，不會直接部署 base。
+# =============================================================================
+---
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - deployment.yaml
+  - service.yaml
+  - ingress.yaml
+
+# 統一貼上組織級 label（只貼 metadata.labels，不動 selector ——
+# selector 不可變，且已在各資源內顯式宣告）
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: platform

@@ -1,0 +1,21 @@
+---
+# =============================================================================
+# roles/haproxy/meta/main.yml
+# =============================================================================
+galaxy_info:
+  author: email-proxy-infra
+  description: >-
+    HAProxy「一份 role 三種面孔」：edge（443 TLS 終止 / 465 TCP passthrough）、
+    postgres（Patroni REST 健檢驅動的 RW/RO 分流）、rabbitmq（AMQPS VIP +
+    管理 UI）。profile 由 group_vars 的 haproxy_profile 決定。
+  license: MIT
+  min_ansible_version: "2.16"
+  platforms:
+    - name: Ubuntu
+      versions:
+        - all
+
+# 執行順序依賴（pki_leaf 先簽好 svc-api.pem、後端服務先起）由 site.yml 的
+# playbook 順序保證，不用 meta dependencies 硬綁——硬綁會讓
+# `--tags lb` 單跑時把不相干的 role 拖進來。
+dependencies: []

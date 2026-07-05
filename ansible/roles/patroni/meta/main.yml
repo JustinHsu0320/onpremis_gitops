@@ -1,0 +1,26 @@
+---
+# =============================================================================
+# roles/patroni/meta/main.yml
+# 依賴說明：本 role 假設（皆為 playbook 層順序保證，不寫進 dependencies
+# 以免被隱式重複執行）：
+#   - 10-pki（pki_leaf）已派送 patroni-etcd-client / postgres-server 憑證與 ca.crt
+#   - 30-postgres 前段的 etcd role 已讓 DCS quorum 就緒
+#   - 後續的 pgbackrest role 會建立 stanza（在那之前 archive_command 失敗屬預期）
+# =============================================================================
+galaxy_info:
+  author: justin
+  company: PTC-NEC
+  description: Patroni-managed PostgreSQL 18 HA cluster (etcd DCS, sync replication, RPO=0)
+  license: MIT
+  min_ansible_version: "2.16"
+  platforms:
+    - name: Ubuntu
+      versions:
+        - all
+  galaxy_tags:
+    - postgresql
+    - patroni
+    - database
+    - clustering
+
+dependencies: []

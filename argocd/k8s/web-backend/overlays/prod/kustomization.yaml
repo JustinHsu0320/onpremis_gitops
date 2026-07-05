@@ -1,0 +1,34 @@
+# =============================================================================
+# web-backend 正式環境 overlay
+#
+# ArgoCD Application（argocd/apps/web-backend.yaml）指向本目錄。
+# 結構與 web-frontend 的 prod overlay 同構，詳細註解見該檔。
+# =============================================================================
+---
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# 正式環境 namespace（CreateNamespace=true 首次同步自動建立）
+namespace: web-backend
+
+resources:
+  - ../../base
+
+patches:
+  # 正式環境副本數（base 只給 1）
+  - path: replicas-patch.yaml
+
+# =============================================================================
+# 【CI bump 流程的接縫】映像 tag 不由人手改 ——
+# gitlab/ci-templates 的 bump job 在應用 repo 出新版後執行：
+#
+#   cd argocd/k8s/web-backend/overlays/prod
+#   kustomize edit set image \
+#     registry.ptc-nec.com.tw:5050/platform/web-backend:v1.1.0
+#   git commit && git push   → ArgoCD 自動同步上線
+#
+# 回滾 = git revert 該 bump commit（完整說明見 web-frontend 的 prod overlay）。
+# =============================================================================
+images:
+  - name: registry.ptc-nec.com.tw:5050/platform/web-backend # 對應 base deployment 的 image（不含 tag）
+    newTag: v1.0.0 # ← CI bump job 自動改寫此行，人不手改

@@ -1,0 +1,81 @@
+# =============================================================================
+# /etc/default/etcd — {{ ansible_managed }}
+#
+# Ubuntu 的 etcd-server 套件以 systemd EnvironmentFile 載入本檔，
+# 每個 ETCD_* 環境變數等價於 etcd 的同名 --flag。
+# 注意：etcd 只在「啟動時」讀本檔，改完必須 systemctl restart etcd（沒有 reload）。
+# 本檔由 Ansible roles/etcd 管理，手改必被覆蓋——要調參數請改 inventory 變數。
+# =============================================================================
+
+# 成員名稱：直接用 inventory 主機名，與 ETCD_INITIAL_CLUSTER 的 name=url 對應，
+# 也讓 etcdctl member list / 監控面板上的名字與機器名一一對得上
+ETCD_NAME="{{ inventory_hostname }}"
+
+# 資料目錄（raft log + keyspace 快照）：prod 掛獨立 SSD VMDK（etcd 對 fsync
+# 延遲極敏感，與 PG 的 I/O 隔離）；權限 etcd:etcd 0700 由 role 收斂
+ETCD_DATA_DIR="{{ etcd_data_dir }}"
+
+# ---------------------------------------------------------------------------
+# 監聽與對外宣告位址（全 HTTPS；埠號見 CONVENTIONS.md §3：client 2379 / peer 2380）
+# ---------------------------------------------------------------------------
+# peer 埠只綁節點 IP：raft 複寫只發生在 pg 節點之間，不需要 localhost
+ETCD_LISTEN_PEER_URLS="https://{{ ansible_host }}:{{ etcd_peer_port }}"
+
+# client 埠額外綁 127.0.0.1：本機 etcdctl 健檢（本 role 與 99-verify）走 localhost，
+# 免依賴網卡 IP；憑證 SAN 已含 IP:127.0.0.1（group_vars/postgres.yml 的 extra_sans）
+ETCD_LISTEN_CLIENT_URLS="https://{{ ansible_host }}:{{ etcd_client_port }},https://127.0.0.1:{{ etcd_client_port }}"
+
+# 對叢集「宣告」的 client 位址：給其他成員/客戶端重導向用，必須是別台連得到的
+# 節點 IP（不能是 127.0.0.1，宣告 localhost 會把別人導去連自己）
+ETCD_ADVERTISE_CLIENT_URLS="https://{{ ansible_host }}:{{ etcd_client_port }}"
+ETCD_INITIAL_ADVERTISE_PEER_URLS="https://{{ ansible_host }}:{{ etcd_peer_port }}"
+
+# 專用 metrics 端點（明文 HTTP，只綁節點 IP）：etcd 官方建議把 /metrics 與 /health
+# 從 client 埠（2379，全 TLS + 雙向驗證）拆出來獨立聽——否則 Prometheus 抓 metrics
+# 也得配一整套 client 憑證。metrics 無敏感資料、只在 VLAN30 內、由防火牆限制來源，
+# 明文可接受。對應 prometheus.yml 的 job etcd（規劃書 §9：etcd metrics）
+ETCD_LISTEN_METRICS_URLS="http://{{ ansible_host }}:{{ etcd_metrics_port }}"
+
+# ---------------------------------------------------------------------------
+# initial bootstrap（僅資料目錄為「空」的第一次啟動生效；之後成員資訊都從
+# data dir 讀，這幾行會被忽略——所以既有叢集重啟時維持 new 是安全的，
+# 不會把跑著的叢集重新初始化）
+# ---------------------------------------------------------------------------
+# 三節點全展開（groups['etcd'] + hostvars 取 IP，絕不硬編主機名/IP——CONVENTIONS §1）
+ETCD_INITIAL_CLUSTER="{% for h in groups['etcd'] %}{{ h }}=https://{{ hostvars[h].ansible_host }}:{{ etcd_peer_port }}{% if not loop.last %},{% endif %}{% endfor %}"
+ETCD_INITIAL_CLUSTER_STATE="new"
+
+# cluster token：防止「不同叢集的成員互相誤加入」（例如 lab 與 prod 網路打通時），
+# token 不同的 peer 會被拒絕
+ETCD_INITIAL_CLUSTER_TOKEN="{{ etcd_cluster_token }}"
+
+# ---------------------------------------------------------------------------
+# TLS —— client 面（Patroni / etcdctl → etcd:2379）
+# ---------------------------------------------------------------------------
+# 為什麼 CLIENT_CERT_AUTH=true（雙向驗證）：DCS 裡放的是整個 PG 叢集的「腦」
+# （leader key、拓撲、動態設定），寫壞一筆就可能觸發錯誤的 failover。
+# 純 server TLS 只防竊聽、防不了未授權讀寫；開了雙向驗證後，只有持「內部 CA
+# 簽發之 client 憑證」的 Patroni（patroni-etcd-client 憑證）與維運 etcdctl
+# （etcd 憑證，peer profile 含 clientAuth）能碰 DCS
+ETCD_CERT_FILE="{{ pki_dir }}/etcd.crt"
+ETCD_KEY_FILE="{{ pki_dir }}/etcd.key"
+ETCD_TRUSTED_CA_FILE="{{ pki_dir }}/ca.crt"
+ETCD_CLIENT_CERT_AUTH="true"
+
+# ---------------------------------------------------------------------------
+# TLS —— peer 面（etcd ↔ etcd raft 複寫 :2380）
+# ---------------------------------------------------------------------------
+# peer 同樣雙向驗證：防止任意主機拿著 token 假冒成員加入叢集，複走整份 keyspace。
+# etcd 憑證是 peer profile（serverAuth+clientAuth 兼備），server/peer 共用一張
+ETCD_PEER_CERT_FILE="{{ pki_dir }}/etcd.crt"
+ETCD_PEER_KEY_FILE="{{ pki_dir }}/etcd.key"
+ETCD_PEER_TRUSTED_CA_FILE="{{ pki_dir }}/ca.crt"
+ETCD_PEER_CLIENT_CERT_AUTH="true"
+
+# ---------------------------------------------------------------------------
+# raft timing（值來自 group_vars/etcd.yml；SSD 環境用預設 100/1000 即可）
+# ---------------------------------------------------------------------------
+# heartbeat 應約等於節點間 RTT 的 max(10ms, RTT)；election 建議為 heartbeat 的
+# 10 倍——太短會在 I/O 抖動時誤觸發選舉，太長會拉高故障轉移時間
+ETCD_HEARTBEAT_INTERVAL="{{ etcd_heartbeat_interval }}"
+ETCD_ELECTION_TIMEOUT="{{ etcd_election_timeout }}"

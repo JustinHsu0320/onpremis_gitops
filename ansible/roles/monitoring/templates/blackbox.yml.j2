@@ -1,0 +1,47 @@
+{#
+  blackbox.yml.j2 — Blackbox exporter 探測模組定義
+
+  兩個模組都掛內部 CA（/etc/blackbox/ca.crt，由 tasks 從 pki_dir 複製後
+  唯讀掛入容器）：我們的服務憑證由自建 Issuing CA 簽發，容器內建信任庫
+  不認得——不掛 CA 的話要嘛探測失敗、要嘛得開 insecure_skip_verify，
+  而後者等於放棄「憑證有效性」這個探測重點（絕不接受）。
+
+  timeout 10s < scrape_interval 15s：探測必須在下一輪抓取前收斂，
+  否則 Prometheus 端會出現 context deadline exceeded 的假失敗。
+#}
+# ===== {{ ansible_managed }} =====
+modules:
+  # ---------- http_2xx_internal_ca：HTTPS GET 探測 ----------
+  # 用途：https://svc-api.{{ domain }}/health（見 prometheus.yml job blackbox-https）
+  # 成功條件：TLS 握手通過（內部 CA 驗證）且 HTTP 狀態碼恰為 200——
+  # /health 是 app 的健康端點，3xx/4xx 都代表鏈路有問題，不放寬。
+  # 副產品：probe_ssl_earliest_cert_expiry（憑證最早到期時間戳）
+  # → rules.yml 的 CertExpirySoon 告警資料源。
+  http_2xx_internal_ca:
+    prober: http
+    timeout: 10s
+    http:
+      valid_status_codes: [200]
+      tls_config:
+        ca_file: /etc/blackbox/ca.crt
+
+  # ---------- tcp_tls_internal_ca：TCP + TLS 握手探測 ----------
+  # 用途：rabbitmq-vip.{{ domain }}:5671（AMQPS）。只做 TCP 連線 + TLS 握手
+  # + 憑證鏈驗證，不講 AMQP 協定——「佇列功能正常」由 99-verify 的
+  # 發佈/消費測試把關，這裡驗的是 VIP 可達與憑證有效兩件事。
+  tcp_tls_internal_ca:
+    prober: tcp
+    timeout: 10s
+    tcp:
+      tls: true
+      tls_config:
+        ca_file: /etc/blackbox/ca.crt
+
+  # ---------- tcp_connect：純 TCP 可達性探測（不做 TLS） ----------
+  # 用途：pgbouncer VIP(6432) 與 egress VIP(3128)。這兩個不適合 tcp+tls 探測：
+  # pgbouncer 走 PG 協定的 STARTTLS（先明文再升級，非 implicit TLS）、
+  # egress 3128 是明文 proxy 埠。這裡只驗「VIP 有人持有、TCP 連得上」，
+  # 用來抓 keepalived 兩側同亡導致「VIP 消失」的故障（見 prometheus.yml 說明）
+  tcp_connect:
+    prober: tcp
+    timeout: 5s

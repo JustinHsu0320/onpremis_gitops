@@ -1,0 +1,23 @@
+---
+# =============================================================================
+# roles/nfs_server/handlers/main.yml
+#
+# reload vs restart 的分工：
+#   - exports 表變更 → reload（exportfs -ra 熱套用，client 掛載不中斷）
+#   - nfsd 啟動參數（vers3/udp）變更 → restart（daemon 重啟才會重讀）
+# restart 期間 client 端因為是 hard mount，IO 只會短暫阻塞後自動恢復，
+# 不會拿到壞資料（見 nfs_client role 的掛載選項註解）。
+# =============================================================================
+
+# exportfs 參數：-r 依 exports 檔「重新同步」匯出表（含移除已刪項目）、-a 全部套用。
+# noqa 理由：CONVENTIONS.md §8 規定 handler 命名為小寫「reload <service>」，
+# 契約要求而非筆誤，故壓掉 name[casing]。
+- name: reload nfs-server  # noqa: name[casing]
+  ansible.builtin.command: exportfs -ra
+  changed_when: true
+
+# noqa 理由：同上，契約規定小寫「restart <service>」。
+- name: restart nfs-server  # noqa: name[casing]
+  ansible.builtin.systemd_service:
+    name: "{{ nfs_server_service }}"
+    state: restarted

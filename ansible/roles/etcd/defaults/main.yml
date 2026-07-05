@@ -1,0 +1,39 @@
+---
+# =============================================================================
+# roles/etcd/defaults/main.yml — etcd role 的可調參數（單一服務 knob）
+#
+# 分工原則（group_vars/all/vars.yml 檔頭）：
+#   - 「拓撲事實」與跨 role 契約變數放 inventories/*/group_vars/
+#     （etcd_cluster_token、etcd_heartbeat_interval、etcd_election_timeout
+#      定義於 group_vars/etcd.yml；pki_dir 定義於 group_vars/all/vars.yml）
+#   - 這裡只放「單一服務自己的 knob」，全部可被 inventory 覆寫
+# =============================================================================
+
+# Ubuntu 26.04 官方 archive 的 distro 套件（etcd 3.5.16）；不加第三方 repo。
+# etcd-client 提供 etcdctl，健康檢查與 99-verify 都靠它
+etcd_packages:
+  - etcd-server
+  - etcd-client
+
+# 資料目錄（CONVENTIONS.md §4 路徑契約）：prod 是 Terraform 配的獨立 VMDK 掛載點，
+# lab 是普通目錄——file 模組對兩者行為一致，role 內不需分支
+etcd_data_dir: /var/lib/etcd
+
+# 埠號（CONVENTIONS.md §3 埠號總表是唯一事實來源，這裡只是參數化引用點）
+etcd_client_port: 2379
+etcd_peer_port: 2380
+# 專用 metrics 端點埠（明文 HTTP，Prometheus 抓取用；見 etcd.default.j2 註解）
+etcd_metrics_port: 2381
+
+# 心跳/選舉參數的 fallback（正式值由 inventories/*/group_vars/etcd.yml 提供，
+# group_vars 優先權高於 role defaults；放這裡是讓 role 單獨測試時也能 render）
+etcd_heartbeat_interval: 100          # ms
+etcd_election_timeout: 1000           # ms
+
+# 叢集健康檢查的重試參數：initial bootstrap 三台要都起來才有 quorum，
+# 12 次 x 5 秒 = 最多等 60 秒，足夠涵蓋三台先後啟動 + leader 選舉的時間差
+etcd_health_retries: 12
+etcd_health_delay: 5
+
+# wait_for client 埠的逾時（秒）：etcd 啟動即綁埠（不等 quorum），120 秒非常寬裕
+etcd_port_wait_timeout: 120

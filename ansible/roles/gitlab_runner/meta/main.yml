@@ -1,0 +1,27 @@
+---
+# =============================================================================
+# roles/gitlab_runner/meta/main.yml
+# =============================================================================
+galaxy_info:
+  role_name: gitlab_runner
+  namespace: email_proxy
+  author: justin.sc.hsu
+  description: >-
+    GitLab Runner（runner-01，VLAN 50）：官方 apt repo、docker executor、
+    glrt- token 註冊（冪等）、job 容器掛載內部 CA。
+  company: PTC-NEC
+  license: MIT
+  min_ansible_version: "2.16"
+  platforms:
+    - name: Ubuntu
+      versions: ["all"]
+  galaxy_tags:
+    - gitlab
+    - ci
+
+# docker executor 的硬相依：沒有 Docker Engine，runner 一個 job 都跑不了。
+# 00-bootstrap.yml 已對 gitlab_runner 群組裝過 docker，這裡再以 meta 依賴
+# 硬綁（規格要求），讓 70-gitlab.yml --tags runner 單獨執行時也自給自足
+# ——docker role 冪等，重跑的代價只是幾秒的狀態檢查
+dependencies:
+  - role: docker

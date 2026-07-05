@@ -1,0 +1,114 @@
+---
+# =============================================================================
+# gitlab/ci-templates/frontend.gitlab-ci.yml — Node 前端 app repo 範例管線
+#
+# 適用對象：公司各前端 SPA repo（K8s 部署、ArgoCD 同步；容器通常是
+# nginx/caddy 托靜態檔的 multi-stage image）。
+# app repo 的 .gitlab-ci.yml 只需要：
+#   include:
+#     - project: "infra/email-proxy-infra"
+#       ref: main
+#       file: "gitlab/ci-templates/frontend.gitlab-ci.yml"
+#   variables:
+#     GITOPS_KUSTOMIZE_DIR: "argocd/k8s/web-frontend/overlays/prod"  # 按需覆寫
+#
+# 流程與 backend 模板完全同構（GitOps：CI 只碰 Git）：
+#   lint / test → build（dist/）→ image（kaniko）→ bump gitops image tag
+#   → ArgoCD 自動同步。詳細機制註解見 backend.gitlab-ci.yml，此處不重複。
+# =============================================================================
+
+# 巢狀 include：local 以本檔所在 repo（infra monorepo）為根解析
+include:
+  - local: gitlab/ci-templates/docker-build.gitlab-ci.yml
+
+stages: [test, build, image, deploy]
+
+default:
+  tags: [onprem-docker]
+
+variables:
+  # 地端 npm 來源：Squid 白名單放行 registry.npmjs.org，或（推薦）架
+  # Verdaccio / Nexus npm mirror 後設 NPM_CONFIG_REGISTRY 指內部位址
+  # NPM_CONFIG_REGISTRY: "https://nexus.ptc-nec.com.tw/repository/npm/"
+  # npm 的下載快取收進 workspace，讓 GitLab cache 機制保存（見下方 cache）
+  NPM_CONFIG_CACHE: "${CI_PROJECT_DIR}/.npm"
+  # --- gitops repo 與 kustomize overlay 位置（契約說明見 backend 模板）---
+  GITOPS_REPO_HOST: "gitlab.ptc-nec.com.tw"
+  GITOPS_REPO_PATH: "infra/email-proxy-infra"
+  GITOPS_BRANCH: "main"
+  GITOPS_KUSTOMIZE_DIR: "argocd/k8s/web-frontend/overlays/prod"
+  KUSTOMIZE_IMAGE_NAME: "registry.ptc-nec.com.tw:5050/web/frontend"
+
+# lock file 沒變 → npm ci 直接吃快取，不重抓整棵依賴樹
+cache:
+  key:
+    files: [package-lock.json]
+  paths:
+    - .npm/
+
+# ---------------------------------------------------------------------------
+# stage: test — lint + 單元測試（兩個 job 平行跑，都掛就都回報，比串行快）
+# ---------------------------------------------------------------------------
+frontend-lint:
+  stage: test
+  image: node:22
+  script:
+    # npm ci（不是 npm install）：嚴格依 lock file 還原，保證可重現建置
+    - npm ci --prefer-offline
+    - npm run lint
+
+frontend-test:
+  stage: test
+  image: node:22
+  script:
+    - npm ci --prefer-offline
+    # 約定 package.json 有 CI 友善的測試腳本（單次執行、非 watch 模式），
+    # 例如 "test:ci": "vitest run --coverage"
+    - npm run test:ci
+
+# ---------------------------------------------------------------------------
+# stage: build — 產靜態檔（dist/）
+# 若 Dockerfile 是 multi-stage（node builder → nginx runtime）可省本 job，
+# 保留的理由同 backend 模板：建置錯誤越早炸越好
+# ---------------------------------------------------------------------------
+frontend-build:
+  stage: build
+  image: node:22
+  script:
+    - npm ci --prefer-offline
+    - npm run build
+  artifacts:
+    paths: [dist/]
+    expire_in: 1 day
+
+# ---------------------------------------------------------------------------
+# stage: image — 由 docker-build 模板的 build-image job 提供（kaniko）
+# stage: deploy — bump gitops repo（與 backend 模板同一套，僅 overlay 目錄
+#   與 image 名不同；認證 / token / protected branch 的完整說明見 backend 模板）
+# ---------------------------------------------------------------------------
+bump-gitops-image-tag:
+  stage: deploy
+  image: alpine/k8s:1.31.1   # 內含 git + kustomize；建議 mirror 進內部 registry
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  variables:
+    GIT_STRATEGY: none       # 只操作 gitops repo，不需要 app 原始碼
+  script:
+    - IMAGE_TAG="${CI_COMMIT_TAG:-${CI_COMMIT_SHORT_SHA}}"
+    # GITOPS_PUSH_USER / GITOPS_PUSH_TOKEN = gitops repo 的 Project Access
+    # Token（write_repository）——Deploy Token 是唯讀的、不能 push，
+    # 詳見 backend.gitlab-ci.yml 的認證說明
+    - git clone --depth 1 --branch "${GITOPS_BRANCH}" "https://${GITOPS_PUSH_USER}:${GITOPS_PUSH_TOKEN}@${GITOPS_REPO_HOST}/${GITOPS_REPO_PATH}.git" gitops
+    - cd "gitops/${GITOPS_KUSTOMIZE_DIR}"
+    - kustomize edit set image "${KUSTOMIZE_IMAGE_NAME}=${CI_REGISTRY_IMAGE}:${IMAGE_TAG}"
+    - git config user.name "gitops-ci"
+    - git config user.email "gitops-ci@ptc-nec.com.tw"
+    - git add kustomization.yaml
+    - |
+      if git diff --cached --quiet; then
+        echo ">> image tag 未變更，跳過 commit"
+        exit 0
+      fi
+    - git commit -m "chore(${CI_PROJECT_NAME}): image -> ${IMAGE_TAG} (pipeline ${CI_PIPELINE_ID})"
+    - git push origin "${GITOPS_BRANCH}"

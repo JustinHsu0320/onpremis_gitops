@@ -1,0 +1,30 @@
+---
+# =============================================================================
+# vault.yml — 全站機密（本檔案在 Git 內必須是 ansible-vault 密文）
+# 編輯方式： ansible-vault edit inventories/prod/group_vars/all/vault.yml
+# 產生原則：每個服務獨立強密碼、絕不共用（修正舊環境 PG/PgBouncer/SSH 同一組弱密碼）
+# =============================================================================
+vault_postgres_superuser_password: "CHANGEME"
+vault_postgres_replicator_password: "CHANGEME"
+vault_postgres_app_password: "CHANGEME"
+vault_pgbouncer_auth_password: "CHANGEME"
+vault_pgbouncer_admin_password: "CHANGEME"
+vault_patroni_restapi_password: "CHANGEME"
+vault_rabbitmq_admin_password: "CHANGEME"
+vault_rabbitmq_app_user_password: "CHANGEME"
+# Erlang cookie：RabbitMQ 叢集節點互認的共享密鑰（等同叢集 root 權限）
+vault_rabbitmq_erlang_cookie: "CHANGEME"
+vault_keydb_password: "CHANGEME"
+# VRRP 認證密碼上限 8 字元（keepalived 協定限制），每個 VIP 各自獨立
+vault_vrrp_pass_svc: "CHANGEME"
+vault_vrrp_pass_egress: "CHANGEME"
+vault_vrrp_pass_pg: "CHANGEME"
+vault_vrrp_pass_mq: "CHANGEME"
+vault_app_jwt_secret: "CHANGEME"
+vault_app_encryption_key: "CHANGEME"
+# 以下兩個是外部服務憑證，真值請向服務申請後以 ansible-vault edit 填入
+vault_microsoft_client_secret: "CHANGEME"
+vault_sendgrid_api_key: "CHANGEME"
+vault_grafana_admin_password: "CHANGEME"
+vault_pgbackrest_cipher_pass: "CHANGEME"
+vault_gitlab_root_password: "CHANGEME"

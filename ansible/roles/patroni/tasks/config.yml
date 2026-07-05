@@ -1,0 +1,91 @@
+---
+# =============================================================================
+# roles/patroni/tasks/config.yml — 目錄、憑證權限與 /etc/patroni/config.yml
+# =============================================================================
+
+# 資料目錄父層（/var/lib/postgresql/18）：套件裝完通常已存在，
+# 這裡收斂 owner 是為了自訂 pg_data_dir 指到別處（例如獨立資料碟掛載點）時
+# 父層也一定可被 postgres 穿越。prod 的獨立碟由 Terraform 掛好，
+# file 模組對「掛載點」與「普通目錄」行為一致（只動 owner/mode，不動磁碟），
+# 所以這裡不需要 is_container 分支
+- name: 建立 PostgreSQL 資料目錄父層
+  ansible.builtin.file:
+    path: "{{ patroni_pg_data_dir | dirname }}"
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: "0755"
+
+# 0700 是 PG 的硬性要求：資料目錄權限太鬆 postmaster 會直接拒絕啟動。
+# 先建好空目錄讓首次 initdb（Patroni bootstrap）直接落在正確權限上
+- name: 建立 PostgreSQL 資料目錄（postgres:postgres 0700）
+  ansible.builtin.file:
+    path: "{{ patroni_pg_data_dir }}"
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: "0700"
+
+# prod 專用：WAL 獨立磁碟（順序寫的 WAL 與隨機 I/O 的資料檔分開）。
+# pg_wal_dir「非空」才執行——lab 把它設為空字串（WAL 與 data 同碟），
+# 空字串下不可建目錄（path: "" 會報錯），也不會傳 --waldir 給 initdb。
+# initdb 要求 waldir 是「空目錄」，file 建空目錄或收斂既有權限都安全
+- name: 建立獨立 WAL 目錄（pg_wal_dir 非空時；prod 獨立 WAL 碟）
+  ansible.builtin.file:
+    path: "{{ pg_wal_dir }}"
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: "0700"
+  when: pg_wal_dir | default('') | length > 0
+
+# 為什麼要在這裡補 owner：pki_leaf 在 10-pki 階段簽發這些憑證時，
+# 本機還沒裝 postgresql-18、postgres 帳號尚不存在，私鑰只能先落地為 root。
+# 套件裝好（postgres 帳號誕生）後把擁有者補正，Patroni（以 postgres 身分跑）
+# 與 PG 的 ssl_key_file 才讀得到。私鑰 0600 是 PG 對 ssl_key_file 的硬性要求
+- name: 授權 Patroni / PG 憑證給 postgres 服務帳號（pki_leaf 簽發時帳號尚不存在）
+  ansible.builtin.file:
+    path: "{{ pki_dir }}/{{ item.file }}"
+    owner: postgres
+    group: postgres
+    mode: "{{ item.mode }}"
+  loop:
+    - { file: patroni-etcd-client.crt, mode: "0644" }
+    - { file: patroni-etcd-client.key, mode: "0600" }
+    - { file: postgres-server.crt, mode: "0644" }
+    - { file: postgres-server.key, mode: "0600" }
+  notify: reload patroni
+
+- name: 建立 /etc/patroni 設定目錄
+  ansible.builtin.file:
+    path: "{{ patroni_config_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+# 本 role 的靈魂（template 內每個區塊都有「為什麼」）。
+# owner postgres + 0600：內含 restapi / superuser / replication 三組密碼，
+# 而 Patroni 服務（Ubuntu 套件 unit 以 postgres 身分跑）必須讀得到。
+# no_log：這個 task 的 diff 會把整份含密碼的設定印進日誌 → 靜音（機密 task 契約）
+- name: 佈署 /etc/patroni/config.yml（含密碼，0600 + no_log）
+  ansible.builtin.template:
+    src: config.yml.j2
+    dest: "{{ patroni_config_file }}"
+    owner: postgres
+    group: postgres
+    mode: "0600"
+  no_log: true
+  notify: reload patroni
+
+# PKI 契約（CONVENTIONS.md §5）：pki_leaf 重簽憑證時只改 pki_dir 下的檔案並設
+# host fact pki_certs_changed=true——本 role 的 template/file task 看不到那個變更
+# （重跑時全部 ok 不 changed），所以需要這個「橋接」task 把憑證更新事件轉譯成
+# Patroni 的 reload（10-pki 重簽後重跑 30-postgres 即自動生效：
+# PG 自 v10 起 SIGHUP 就會重讀 ssl_* 檔案，不必 restart）
+- name: PKI 憑證已更新時觸發 Patroni reload（pki_certs_changed 契約）
+  ansible.builtin.debug:
+    msg: 偵測到 pki_leaf 重簽憑證，Patroni 將 reload 以載入新憑證
+  when: pki_certs_changed | default(false)
+  changed_when: true
+  notify: reload patroni

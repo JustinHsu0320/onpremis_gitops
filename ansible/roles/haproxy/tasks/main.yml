@@ -1,0 +1,102 @@
+---
+# =============================================================================
+# roles/haproxy/tasks/main.yml — HAProxy「一份 role 三種面孔」（規劃書 §7.5）
+#
+# 同一組 task 流程套用三種 profile，唯一分歧點是「選哪個 template」：
+#   edge     → templates/haproxy-edge.cfg.j2     （lb：443 TLS 終止 / 465 passthrough）
+#   postgres → templates/haproxy-postgres.cfg.j2 （pg：Patroni 健檢驅動的 RW/RO 分流）
+#   rabbitmq → templates/haproxy-rabbitmq.cfg.j2 （mq：AMQPS VIP + 管理 UI）
+#
+# 修正的核心痛點（規劃書 §7.5：config drift）：backend 由 groups[...] 動態展開，
+# 同群組每台 lb 的設定「結構上不可能」不同步；playbook 層 serial: 1 滾動套用，
+# 搭配 keepalived 的 VIP 漂移，設定變更全程對外服務不中斷。
+# =============================================================================
+
+# 防呆優先：profile 打錯字（或 group_vars 漏設）時，在第一個 task 就給出
+# 人話錯誤訊息，而不是等 template task 報「找不到 haproxy-xxx.cfg.j2」
+- name: 驗證 haproxy_profile 為合法值
+  ansible.builtin.assert:
+    that:
+      - haproxy_profile | default('') in haproxy_supported_profiles
+    fail_msg: >-
+      haproxy_profile 必須是 {{ haproxy_supported_profiles | join(' / ') }} 之一，
+      目前值：{{ haproxy_profile | default('未定義') }}（請檢查該群組的 group_vars）
+    success_msg: "haproxy_profile={{ haproxy_profile }}"
+
+# Ubuntu 26.04 官方 archive 的 haproxy 3.2：不加第三方 repo（規劃書鐵律）。
+# cache_valid_time 避免每次重跑都 apt update（冪等 + 提速）。
+- name: 安裝 HAProxy 套件
+  ansible.builtin.apt:
+    name: haproxy
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+# 為什麼要 ip_nonlocal_bind：postgres/rabbitmq profile 的 HAProxy 綁的是
+# 「VIP:埠」（如 10.20.30.10:6432），但 VIP 同一時間只在 keepalived MASTER
+# 那台的網卡上——BACKUP 節點沒持有 VIP，預設 kernel 會拒絕綁定不存在的位址，
+# HAProxy 直接起不來，VIP 漂移過來時也就無人接手。此參數允許綁定「非本機
+# 持有」的 IP，讓三台的 HAProxy 隨時都在待命。
+# edge profile 綁 *:443 其實用不到它，但統一設定無害、少一個條件分支。
+# net.* 開頭的 sysctl 是 network-namespace 級參數，lab 容器內可設定，
+# 不需要 is_container guard（對比 vm.*/kernel.* 那類要跳過的 kernel 級參數）。
+- name: 允許綁定非本機持有的 IP（VIP 待命的關鍵）
+  ansible.posix.sysctl:
+    name: net.ipv4.ip_nonlocal_bind
+    value: "1"
+    sysctl_file: /etc/sysctl.d/99-haproxy.conf
+    sysctl_set: true
+    reload: true
+    state: present
+
+# PKI 契約（CONVENTIONS.md §5）：10-pki 重簽憑證時 pki_leaf 會設 host fact
+# pki_certs_changed=true。edge 的 443 憑證是 svc-api.pem（pki_leaf 以
+# bundle_pem 重組的 crt+chain+key），pem 內容變了但 haproxy.cfg 沒變
+# → template task 不會觸發 handler，所以需要這個「橋接 task」把憑證輪替
+# 事件轉成 reload（HAProxy reload 時重讀 crt 檔）。postgres/rabbitmq profile
+# 目前純 TCP 不吃憑證，但保留橋接讓行為跨 profile 一致、日後加 TLS bind 不會漏。
+# /bin/true 只是掛 notify 的載體，本身無副作用。
+- name: 偵測 PKI 憑證輪替並排程 reload
+  ansible.builtin.command: /bin/true
+  changed_when: true
+  when: pki_certs_changed | default(false)
+  notify: reload haproxy
+
+# validate 是這個 task 的防呆關鍵：先在暫存路徑（%s）跑 `haproxy -c` 語法
+# 檢查，「通過才落檔」——語法錯誤的設定永遠到不了 /etc/haproxy/haproxy.cfg，
+# 也就永遠不會把一台正常運作的 LB reload 成起不來的狀態。
+# 注意 -c 也會檢查 crt 檔存在與否（edge 依賴 10-pki 先產出 svc-api.pem，
+# 順序由 site.yml 保證）。設定檔不含機密（密碼都在後端服務），0644 即可。
+- name: 佈署 haproxy.cfg（模板依 haproxy_profile 選擇）
+  ansible.builtin.template:
+    src: "haproxy-{{ haproxy_profile }}.cfg.j2"
+    dest: /etc/haproxy/haproxy.cfg
+    owner: root
+    group: root
+    mode: "0644"
+    validate: /usr/sbin/haproxy -c -f %s
+  notify: reload haproxy
+
+# enabled=true：開機自啟；state=started 只保證「有在跑」，設定變更的生效
+# 交給 reload handler（master-worker 無縫換組態，既有連線不斷）。
+- name: 啟用並啟動 haproxy 服務
+  ansible.builtin.systemd_service:
+    name: haproxy
+    enabled: true
+    state: started
+
+# 先把排隊中的 reload 立刻執行掉再驗埠——否則首次部署時 apt 裝完就以
+# Debian 預設設定起了服務，埠可能通了但跑的還是舊組態，下面的 wait_for
+# 會給出「假通過」。
+- name: 立即套用尚未生效的設定變更
+  ansible.builtin.meta: flush_handlers
+
+# 部署自驗：stats 埠三種 profile 都有綁（節點 IP:8404），拿它當
+# 「HAProxy 已用新組態起來」的通用信號。VIP 埠不在這裡驗——BACKUP 節點
+# 綁了 VIP 埠但封包根本路由不進來，驗了也是假象；VIP 層的端到端可達性
+# 由 99-verify 對應段落負責。
+- name: 等待 stats 端點監聽 {{ haproxy_stats_port }}
+  ansible.builtin.wait_for:
+    host: "{{ ansible_host }}"
+    port: "{{ haproxy_stats_port }}"
+    timeout: "{{ haproxy_wait_timeout }}"

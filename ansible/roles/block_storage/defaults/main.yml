@@ -1,0 +1,44 @@
+---
+# =============================================================================
+# roles/block_storage/defaults/main.yml — 資料碟格式化與掛載（規劃書 §2.3）
+#
+# 這個 role 補的是「Terraform 掛了 VMDK，但 guest OS 裡那顆碟還是生的」這一段：
+# Terraform 只負責「把虛擬磁碟接到 VM 上」，磁碟在 guest 內要不要分割、格式化、
+# 掛到哪個路徑，是 OS 組態的職責 —— 也就是 Ansible 的事。少了這個 role，
+# 服務資料（PG data/WAL、etcd、附件、MQ）會全部寫進 40-100GB 的 OS 碟，
+# 掛上去的 200G/1T 大碟卻閒置，且資料不在「排除快照 + keep_on_remove」的
+# 獨立 VMDK 上，VM 一重建就連資料一起消失。
+#
+# ★ 只在實體/VM 主機執行（is_container=true 的實驗室容器沒有 block device，
+#   整個 role 由 tasks 的 when 條件跳過）。
+# =============================================================================
+
+# 由各群組 group_vars 定義的「碟 → 掛載點」對應清單。空清單 = 這台沒有資料碟。
+# 每個項目：
+#   mountpoint : 掛載到哪個路徑
+#   size_gb    : 這顆碟的容量（用來從多顆裸碟中「認出」是哪一顆——見下方偵測說明）
+#   owner/group: 掛載點根目錄的擁有者（帳號此時可能還沒建，見 block_storage_apply_owner）
+#   mode       : 掛載點根目錄權限
+storage_volumes: [] # noqa: var-naming[no-role-prefix]  # group_vars 契約變數，比照 nfs_exports/keepalived_instances 不加 role 前綴
+
+# 檔案系統型別：xfs 對資料庫與大檔案友善，且支援「線上擴充」
+# （vSphere 加大 VMDK 後 xfs_growfs 即可，不需卸載）——地端擴容首選
+block_storage_fstype: xfs
+
+# 掛載參數：noatime 省掉每次讀取都回寫 access time 的無謂 IO；
+# nofail 讓「碟臨時缺席」不會卡住開機（資料碟故障應由監控告警，不該讓機器開不起來）
+block_storage_mount_opts: "defaults,noatime,nofail"
+
+# size 比對容差：VMDK 標稱 200GB，guest 看到的 bytes 會略少於 200×1024³
+# （廠商 GB vs GiB、metadata 保留），用 ±12% 窗口涵蓋，同時仍能區分
+# 200/100/50/10 這種數量級不同的碟
+block_storage_size_tolerance: 0.12
+
+# 掛載點根目錄的擁有者要不要在這裡就設定？
+#   false（預設）：只設 root:root + mode，owner 交給對應服務 role 收斂
+#     （patroni/etcd/rabbitmq role 本來就會 chown 自己的資料目錄，且它們比
+#      本 role 晚跑、屆時服務帳號才存在）——避免在帳號還沒建時瞎設 owner
+# noqa var-naming[no-role-prefix]：storage_* 是本 role 的對外契約變數
+# （group_vars 覆寫 storage_volumes / 可調 block_storage_fstype 等），比照專案內
+# nfs_exports、keepalived_instances 的慣例不加 role 前綴，讀起來更貼近其語義
+block_storage_apply_owner: false # noqa: var-naming[no-role-prefix]

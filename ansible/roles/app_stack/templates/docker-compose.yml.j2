@@ -1,0 +1,91 @@
+{#
+  docker-compose.yml.j2 — email_proxy 應用堆疊（api / worker / smtp-receiver）
+
+  為什麼 network_mode: host（junior 必讀）：
+    1. KeyDB 同居設計：app 用 rediss://127.0.0.1:{{ keydb_port }} 連「宿主上」的
+       KeyDB。bridge 模式下容器的 127.0.0.1 是容器自己，這條連線直接斷頭。
+    2. 埠即契約：8080（/health）與 2525（SMTP）直接綁在節點 IP 上，與
+       CONVENTIONS.md §3 埠號總表、LB 後端設定一對一，沒有 NAT 映射這層心智負擔。
+    3. 效能：省掉 docker-proxy / NAT 一層封包處理，SMTP 高併發時有感。
+
+  機密不在本檔（全在 .env，0600 + no_log），本檔 0644 即可。
+  模式切換：app_stack_mock=true 時 build 本地 mock（實驗室沒有 registry）；
+  false 時 pull registry.{{ domain }} 的正式映像（ADR-6）。
+#}
+# ===== {{ ansible_managed }} =====
+services:
+  api:
+{% if app_stack_mock %}
+    # mock 模式：本地 build 極簡模擬器。三個 service 共用同一個 build
+    # context 與 image tag——BuildKit cache 會讓後兩次 build 直接命中，
+    # 實際只做一次；統一 tag 也避免長出三個重複映像
+    build: ./mock
+    image: email-proxy-mock:local
+    # 一個映像三種角色：argv 決定行為（見 mock/mock_service.py 的檔頭註解）
+    command: ["python", "/app/mock_service.py", "api"]
+{% else %}
+    # prod 模式（ADR-6）：CI build 一次 → push registry → 這裡只 pull，
+    # 節點上絕不 build（build 環境差異 = 不可重現的部署）
+    image: "{{ app_images.api }}"
+{% endif %}
+    container_name: email-proxy-api
+    network_mode: host
+    restart: unless-stopped
+    # 介面契約（DB/MQ/快取/機密/egress）全部經 .env 注入：
+    # mock 與真 app 拿到一模一樣的環境，介面在 lab 就被驗證過
+    env_file: .env
+    volumes:
+      # 附件放 NFS 掛載（規劃書核心修正）：SMTP 收信節點寫入的附件，
+      # worker 在「另一台節點」寄送時讀得到——寫本機碟做不到這件事
+      - {{ attachments_mount }}:/data/attachments
+      # 憑證唯讀掛入；容器內路徑與宿主 pki_dir 一致（/etc/email-proxy/pki），
+      # .env 裡的 sslrootcert / KEYDB_TLS_* 路徑宿主/容器兩邊通用。
+      # 憑證輪替後的 recreate 由 tasks 的 PKI 橋接 task notify handler 處理
+      - {{ pki_dir }}:/etc/email-proxy/pki:ro
+    healthcheck:
+      # LB 打的是節點 8080（外部視角），這是容器層的第二道防線：
+      # unhealthy 在 docker ps 一眼可見。用 wget：alpine（busybox）內建，
+      # 不假設映像裝了 curl；prod 映像契約上也必須提供 wget
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:{{ app_http_port }}/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  worker:
+{% if app_stack_mock %}
+    build: ./mock
+    image: email-proxy-mock:local
+    command: ["python", "/app/mock_service.py", "worker"]
+{% else %}
+    image: "{{ app_images.worker }}"
+{% endif %}
+    container_name: email-proxy-worker
+    # worker 不對外聽埠，但仍用 host network：它要連 127.0.0.1 的 KeyDB，
+    # 且三個 service 網路模型一致 = 除錯時只有一套心智模型
+    network_mode: host
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      # worker 是附件的「讀取方」（寄送時取件），與 smtp 寫入方共用 NFS
+      - {{ attachments_mount }}:/data/attachments
+      - {{ pki_dir }}:/etc/email-proxy/pki:ro
+    # worker 沒有埠可健檢；佇列消費停滯由 Prometheus 的 RabbitMQ
+    # 指標（queue depth）告警，不在容器層硬湊 healthcheck
+
+  smtp:
+{% if app_stack_mock %}
+    build: ./mock
+    image: email-proxy-mock:local
+    command: ["python", "/app/mock_service.py", "smtp"]
+{% else %}
+    image: "{{ app_images.smtp }}"
+{% endif %}
+    container_name: email-proxy-smtp
+    network_mode: host
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      # smtp-receiver 是附件的「寫入方」：收信時把附件落到共享 NFS
+      - {{ attachments_mount }}:/data/attachments
+      - {{ pki_dir }}:/etc/email-proxy/pki:ro

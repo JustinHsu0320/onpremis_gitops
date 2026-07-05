@@ -1,0 +1,120 @@
+---
+# =============================================================================
+# group_vars/all/vars.yml — 全站共用「非機密」變數（規劃書 §6.5）
+#
+# 分工原則：
+#   - 這裡放「拓撲事實」（VIP、埠、路徑）與「機密別名」
+#   - 可調參數的預設值放在各 role 的 defaults/main.yml（單一服務的 knob）
+#   - 機密真值只存在 vault.yml（密文），這裡以 vault_* 別名引用
+#   - lab 環境的降規覆寫在 inventories/lab/group_vars/all/zz_lab_overrides.yml
+# =============================================================================
+
+# ---------- 基本識別 ----------
+domain: ptc-nec.com.tw
+timezone: Asia/Taipei
+
+# NTP：地端環境優先指向公司內部時源；這裡先用台灣 NTP pool 示範
+ntp_servers:
+  - 0.tw.pool.ntp.org
+  - 1.tw.pool.ntp.org
+  - time.stdtime.gov.tw
+
+# ---------- 環境開關（lab 會覆寫） ----------
+# 是否運行於容器實驗室：true 時跳過 kernel 級 sysctl、swapoff、磁碟操作
+is_container: false
+# 主機層（apt / docker daemon / 全域環境變數）是否經 egress proxy 出網
+use_egress_proxy: true
+# 名稱解析策略（ADR-5）：由 Ansible 統一管理 /etc/hosts；改用公司 DNS 時設 false
+manage_etc_hosts: true
+
+# ---------- VIP 與網段（CONVENTIONS.md §2/§3 的唯一事實來源） ----------
+internal_cidr: 10.20.0.0/16
+vlan_edge_cidr: 10.20.10.0/24
+vlan_app_cidr: 10.20.20.0/24
+vlan_data_cidr: 10.20.30.0/24
+vlan_storage_cidr: 10.20.40.0/24
+vlan_devops_cidr: 10.20.50.0/24
+vlan_mgmt_cidr: 10.20.99.0/24
+
+service_vip: 10.20.10.10          # 443/465 對外入口（keepalived VI_SVC, vrid 10）
+egress_vip: 10.20.10.20           # Squid 3128（keepalived VI_EGRESS, vrid 12）
+pgbouncer_vip: 10.20.30.10        # 6432 RW / 6433 RO（keepalived VI_PG, vrid 30）
+rabbitmq_vip: 10.20.30.20         # 5671 AMQPS（keepalived VI_MQ, vrid 31）
+
+# ---------- 服務埠（跨 role 引用的才放這裡） ----------
+app_http_port: 8080
+app_smtp_port: 2525
+pgbouncer_port: 6432
+pgbouncer_ro_port: 6433
+patroni_rest_port: 8008
+rabbitmq_amqps_port: 5671
+keydb_port: 6379                  # master（TLS-only）
+keydb_replica_port: 6380          # replica（TLS-only；cluster bus 為 port+10000）
+squid_port: 3128
+
+# ---------- 路徑契約（CONVENTIONS.md §4） ----------
+pki_dir: /etc/email-proxy/pki
+ca_root: /opt/email-proxy-ca
+# 伺服器端實體路徑（nfs-01 本機看到的）
+nfs_v4_root: /export                     # NFSv4 pseudo-root（fsid=0），見 nfs_server 模板註解
+nfs_attachments_export: /export/mail-proxy/attachments
+nfs_pgbackup_export: /export/mail-proxy/pgbackup
+# client 端掛載路徑 = 伺服器路徑去掉 pseudo-root 前綴（NFSv4 掛載語意）
+nfs_attachments_v4path: /mail-proxy/attachments
+nfs_pgbackup_v4path: /mail-proxy/pgbackup
+# NFS export 的客戶端 ACL（= NFS 伺服器「看到的」來源網段）。
+# prod：跨 VLAN 路由，來源就是 app/資料層的真實網段；
+# lab：多重掛網模擬，節點從 vlan40 的腳連 NFS → zz_lab_overrides 覆寫成儲存網段
+nfs_attachments_clients: "{{ vlan_app_cidr }}"
+nfs_pgbackup_clients: "{{ vlan_data_cidr }}"
+attachments_mount: /mnt/attachments
+pgbackup_mount: /mnt/pgbackup
+
+# PKI 簽發主機（Issuing CA 所在）：永遠取 monitoring 群組第一台
+internal_ca_host: "{{ groups['monitoring'][0] }}"
+
+# ---------- 對外 proxy 三件套（規劃書 §4） ----------
+egress_proxy_url: "http://egress-proxy.{{ domain }}:{{ squid_port }}"
+# NO_PROXY 用「網域字尾 + 內網 CIDR」一次涵蓋，避免逐台列 host 的漏列風險
+no_proxy_list: "localhost,127.0.0.1,.{{ domain }},{{ internal_cidr }}"
+
+# ---------- 內部 Registry（GitLab Container Registry，ADR-6） ----------
+registry_host: "registry.{{ domain }}"
+# app 映像：CI build 一次 → push registry → 各節點 pull（取代各節點自行 build）
+app_image_tag: latest             # CI 部署時以 -e app_image_tag=<git-sha> 覆寫
+app_images:
+  api: "{{ registry_host }}/email-proxy/api:{{ app_image_tag }}"
+  worker: "{{ registry_host }}/email-proxy/worker:{{ app_image_tag }}"
+  smtp: "{{ registry_host }}/email-proxy/smtp:{{ app_image_tag }}"
+
+# ---------- 機密別名（規劃書 §6.5：role 一律引用這些別名，不直接碰 vault_*） ----------
+postgres_superuser_password: "{{ vault_postgres_superuser_password }}"
+postgres_replicator_password: "{{ vault_postgres_replicator_password }}"
+postgres_app_password: "{{ vault_postgres_app_password }}"
+pgbouncer_auth_password: "{{ vault_pgbouncer_auth_password }}"
+pgbouncer_admin_password: "{{ vault_pgbouncer_admin_password }}"
+patroni_restapi_password: "{{ vault_patroni_restapi_password }}"
+rabbitmq_admin_password: "{{ vault_rabbitmq_admin_password }}"
+rabbitmq_app_user_password: "{{ vault_rabbitmq_app_user_password }}"
+rabbitmq_erlang_cookie: "{{ vault_rabbitmq_erlang_cookie }}"
+keydb_password: "{{ vault_keydb_password }}"
+vrrp_pass_svc: "{{ vault_vrrp_pass_svc }}"
+vrrp_pass_egress: "{{ vault_vrrp_pass_egress }}"
+vrrp_pass_pg: "{{ vault_vrrp_pass_pg }}"
+vrrp_pass_mq: "{{ vault_vrrp_pass_mq }}"
+app_jwt_secret: "{{ vault_app_jwt_secret }}"
+app_encryption_key: "{{ vault_app_encryption_key }}"
+microsoft_client_secret: "{{ vault_microsoft_client_secret }}"
+sendgrid_api_key: "{{ vault_sendgrid_api_key }}"
+grafana_admin_password: "{{ vault_grafana_admin_password }}"
+pgbackrest_cipher_pass: "{{ vault_pgbackrest_cipher_pass }}"
+gitlab_root_password: "{{ vault_gitlab_root_password }}"
+
+# ---------- /etc/hosts 內容（manage_etc_hosts=true 時由 common role 寫入） ----------
+# 主機部分由 inventory 動態展開；這裡只列「非主機」的服務名稱（VIP 與別名）
+extra_hosts_entries:
+  - { ip: "{{ service_vip }}", names: ["svc-api.{{ domain }}", "svc-api"] }
+  - { ip: "{{ egress_vip }}", names: ["egress-proxy.{{ domain }}", "egress-proxy"] }
+  - { ip: "{{ pgbouncer_vip }}", names: ["pgbouncer-vip.{{ domain }}", "pgbouncer-vip"] }
+  - { ip: "{{ rabbitmq_vip }}", names: ["rabbitmq-vip.{{ domain }}", "rabbitmq-vip"] }
+  - { ip: 10.20.50.11, names: ["gitlab.{{ domain }}", "registry.{{ domain }}"] }

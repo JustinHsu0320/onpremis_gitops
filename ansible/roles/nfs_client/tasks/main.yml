@@ -1,0 +1,78 @@
+---
+# =============================================================================
+# roles/nfs_client/tasks/main.yml — NFS 掛載（app 節點掛附件、pg 節點掛備份庫）
+#
+# 目的（規劃書 §7.4）：全 app 節點掛「同一個」NFS 附件目錄，根治
+# 「SMTP 收信節點寫本機碟、worker 在別台讀不到附件」的痛點；
+# pg 節點則掛 pgBackRest 備份庫。掛哪些由 nfs_mounts 變數驅動。
+# =============================================================================
+
+# common role 已裝 nfs-common；這裡再宣告一次是保險絲——apt 的 state=present
+# 冪等無害，卻能保證本 role 單獨重跑（如新節點只跑 20-storage）也自給自足
+- name: 安裝 nfs-common
+  ansible.builtin.apt:
+    name: nfs-common
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+# ansible.posix.mount state=mounted 一次完成三件事：建掛載點目錄、寫入 fstab
+# （開機自動掛載）、立即掛載——單一 task 就冪等地涵蓋「現在」與「重開機後」。
+#
+# 掛載選項的抉擇（定義於 defaults，都是血淚教訓，不要隨手改）：
+#   - hard（而非 soft）：NFS 伺服器失聯時，hard 讓 IO「阻塞等待」直到伺服器
+#     回來；soft 則 timeout 後回傳 EIO，應用層拿到半截壞檔還以為寫成功了。
+#     附件與 PG 備份都是不可回復的資料——寧可等、不可錯。
+#     nfs-01 單點由 vSphere HA 保護（RTO 約 1-3 分鐘），阻塞期間 app 的 IO
+#     會排隊，伺服器回來後自動續傳，資料零損——hard + vSphere HA 就是
+#     本專案附件層的可用性方案。
+#   - proto=tcp + vers=4.1：對齊 server 端 v4-only；v4.1 全部流量收斂單一
+#     2049 port（防火牆極簡），session 機制也比 v4.0 更能正確處理重連。
+#   - timeo=600,retrans=2：RPC 60 秒（600 分秒）逾時、重試 2 次後在 dmesg 印
+#     "server not responding"——只是告警訊號，hard mount 仍會繼續等待。
+#   - _netdev：告訴 systemd「這是網路檔案系統」，等網路就緒才掛載、關機時
+#     先卸載再斷網——沒有它，開機流程可能在網路起來前搶掛 NFS 而卡死。
+#   - noatime：附件讀取極頻繁，每次 read 都回寫 access time 等於把讀放大成
+#     NFS 寫入；關掉可省大量無意義的網路 IO（本系統沒有任何功能依賴 atime）。
+# 先確保掛載點目錄存在：ansible.posix.mount 在部分版本/路徑情境下不會自動建立。
+# 注意「先檢查是否已掛載」：對已掛載的 NFS 路徑做 file/mode 操作，
+# 動到的是遠端檔案系統（且可能因 squash 身分而 EROFS）——只在未掛載時建本地目錄
+- name: 檢查掛載點是否已生效
+  ansible.builtin.command: mountpoint -q {{ item.path }}
+  loop: "{{ nfs_mounts }}"
+  loop_control:
+    label: "{{ item.path }}"
+  register: nfs_client_mountpoint_check
+  changed_when: false
+  failed_when: false
+
+- name: 建立掛載點目錄（僅在尚未掛載時）
+  ansible.builtin.file:
+    path: "{{ item.item.path }}"
+    state: directory
+    mode: "0755"
+  loop: "{{ nfs_client_mountpoint_check.results }}"
+  loop_control:
+    label: "{{ item.item.path }}"
+  when: item.rc != 0
+
+- name: 掛載 NFS（寫 fstab + 立即掛載）
+  ansible.posix.mount:
+    path: "{{ item.path }}"
+    src: "{{ item.src }}"
+    fstype: "{{ nfs_client_fstype }}"
+    opts: "{{ nfs_client_mount_opts }}"
+    state: mounted
+  loop: "{{ nfs_mounts }}"
+  loop_control:
+    label: "{{ item.path }} <- {{ item.src }}"
+
+# mountpoint -q 回傳 0 = 該路徑「真的」是掛載點。這是關鍵防呆：
+# 若 fstab 寫成功但實際掛載悄悄失敗，路徑會是一個「看起來一模一樣的本機空目錄」，
+# app 會把附件寫進本機碟——那正是本 role 要根治的痛點，所以部署當下就擋掉。
+- name: 驗證掛載點確實生效（mountpoint -q）
+  ansible.builtin.command: mountpoint -q {{ item.path }}
+  loop: "{{ nfs_mounts }}"
+  loop_control:
+    label: "{{ item.path }}"
+  changed_when: false

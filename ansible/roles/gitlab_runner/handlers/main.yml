@@ -1,0 +1,14 @@
+---
+# =============================================================================
+# roles/gitlab_runner/handlers/main.yml
+# handler 名稱依契約用小寫「restart <service>」（CONVENTIONS.md §8.6），
+# 對 ansible-lint 的 name[casing] 加 noqa
+# =============================================================================
+
+# 選 restart 而非 reload：gitlab-runner 雖會自動偵測 config.toml 變更，
+# 但 concurrent 這類全域參數的採用時機文件保證不明——restart 確定生效，
+# 且 runner 重啟不中斷「執行中」的 job（等 job 跑完才收工），代價可接受
+- name: restart gitlab-runner  # noqa: name[casing]
+  ansible.builtin.systemd_service:
+    name: gitlab-runner
+    state: restarted

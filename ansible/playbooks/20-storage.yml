@@ -1,0 +1,30 @@
+---
+# =============================================================================
+# 20-storage.yml — 儲存層（規劃書 §7.4：修正「附件寫本機碟」痛點）
+#
+# nfs-01 匯出兩個區：附件（app 掛）、PG 備份庫（pg 掛，pgBackRest repo）。
+# NFSv4.1 + hard mount：NFS 短暫故障時 app IO 阻塞等待而非回傳壞資料，
+# 配合 vSphere HA（RTO 1-3 分鐘）構成附件層的可用性方案。
+# =============================================================================
+- name: NFS Server（nfs-01）
+  hosts: nfs
+  tags: [storage, nfs-server]
+  roles:
+    - role: nfs_server
+
+- name: App 節點掛載附件目錄
+  hosts: app
+  tags: [storage, nfs-client]
+  roles:
+    - role: nfs_client
+
+# NFSv4 掛載路徑相對於 pseudo-root（見 group_vars/app.yml 的同款註解）
+- name: PG 節點掛載備份庫
+  hosts: postgres
+  tags: [storage, nfs-client]
+  vars:
+    nfs_mounts:
+      - path: "{{ pgbackup_mount }}"
+        src: "nfs-01.{{ domain }}:{{ nfs_pgbackup_v4path }}"
+  roles:
+    - role: nfs_client

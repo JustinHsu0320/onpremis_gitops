@@ -1,0 +1,50 @@
+---
+# =============================================================================
+# roles/keydb/defaults/main.yml — KeyDB 可調參數（單一服務的 knob）
+#
+# 跨 role 契約變數（keydb_port、keydb_password、pki_dir、is_container）
+# 定義於 inventories/*/group_vars/，本檔只放「僅本 role 關心」的預設值。
+# =============================================================================
+
+# ---------- 容器映像 ----------
+# 上游 eqalpha/keydb 沒有發佈 multi-arch manifest：x86_64 與 arm64 是兩個
+# 「不同名字的 tag」（x86_64_v6.3.4 / arm64_v6.3.4），無法靠 docker 自動選架構。
+# 這裡依 ansible_architecture 自動挑選，讓 Apple Silicon 上的 lab 容器也能跑。
+keydb_image: "eqalpha/keydb:{{ 'arm64' if ansible_architecture == 'aarch64' else 'x86_64' }}_v6.3.4"
+
+# redis_exporter（規劃書 §9 的 KeyDB metrics；multi-arch，amd64/arm64 皆可）
+keydb_exporter_image: "oliver006/redis_exporter:v1.62.0"
+keydb_exporter_port: 9121
+
+# ---------- 佈署路徑（CONVENTIONS.md §4：keydb compose 專案 = /opt/keydb） ----------
+keydb_home: /opt/keydb
+
+# eqalpha/keydb 映像內建 keydb 使用者的 UID/GID：容器 entrypoint 以 root 起動後
+# 會 gosu 降權到這個身分執行 keydb-server，所以宿主上掛進容器的 conf/tls/data
+# 檔案擁有者必須是 999:999，服務才讀得到（data 還要能寫 nodes.conf）
+keydb_container_uid: "999"
+keydb_container_gid: "999"
+
+# ---------- 埠 ----------
+# master 埠（keydb_port=6379）與 replica 埠（keydb_replica_port=6380）都是
+# 跨 role 契約，真正的定義在 group_vars/all/vars.yml（group_vars 優先於
+# role defaults）。這裡保留同值 fallback 只為了讓本 role 可獨立測試；
+# 要改埠請改 group_vars + CONVENTIONS.md §3，不要只改這裡（會被覆蓋、無效）。
+keydb_replica_port: 6380
+
+# ---------- 記憶體 ----------
+# 快取上限；lab 由 zz_lab_overrides.yml 覆寫為 256mb（group_vars 優先於 defaults）
+keydb_maxmemory: 1gb
+# 淘汰策略——為什麼選 volatile-lru 見 templates/keydb.conf.j2 內的註解
+keydb_maxmemory_policy: volatile-lru
+
+# ---------- cluster 參數 ----------
+# 節點失聯判定毫秒數：比預設 15000 積極，快取場景寧可快點 failover
+keydb_cluster_node_timeout: 5000
+
+# ---------- 部署後健檢 ----------
+# wait_for 監聽埠的等待上限（秒）
+keydb_wait_timeout: 60
+# 建叢集後等待 cluster_state:ok 的重試次數與間隔（秒）
+keydb_cluster_ok_retries: 30
+keydb_cluster_ok_delay: 2

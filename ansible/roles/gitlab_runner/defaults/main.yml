@@ -1,0 +1,66 @@
+---
+# =============================================================================
+# roles/gitlab_runner/defaults/main.yml — GitLab Runner（runner-01，VLAN 50，
+# docker executor）。lab 實驗室不部署（lab inventory 無 gitlab_runner 群組成員）。
+#
+# 契約變數（由 inventory 提供，CONVENTIONS.md §7）：
+#   domain / use_egress_proxy / egress_proxy_url / no_proxy_list
+# =============================================================================
+
+# ---------- APT repo 來源 ----------
+# runner 與 gitlab-ce 是兩個「不同」的 packages.gitlab.com repo，
+# 各自有金鑰與來源檔（同一套 keyring + signed-by 模式，理由見 gitlab_server）
+gitlab_runner_apt_key_url: https://packages.gitlab.com/runner/gitlab-runner/gpgkey
+gitlab_runner_keyring_path: /etc/apt/keyrings/gitlab-runner.asc
+gitlab_runner_apt_repo_base: https://packages.gitlab.com/runner/gitlab-runner/ubuntu/
+
+# codename 策略同 gitlab_server（上游對最新 LTS 支援晚幾個月，26.04 頻道
+# 開通前先用 noble 包；gitlab-runner 是靜態編譯的 Go 單一執行檔，跨版本更無風險）。
+# noqa 理由：與 gitlab_server role 共用同名開關（inventory 一處覆寫、兩 repo 同步切換），
+# 屬跨 role 介面變數，不加 role 前綴
+gitlab_apt_codename: noble  # noqa: var-naming[no-role-prefix]
+
+# ---------- GitLab 伺服器位址 ----------
+# 契約缺口的補位：gitlab_external_url 定義在 group_vars/gitlab.yml，
+# 「只作用於 gitlab 群組」，runner-01 屬 gitlab_runner 群組拿不到——
+# 這裡以相同值補上 role 預設（defaults 優先序最低，日後把變數上移到
+# group_vars/all 或 gitlab_runner group_vars 時自動讓位）。
+# noqa 理由：沿用契約變數名（註冊 URL 的規格指名此變數），不加 role 前綴
+gitlab_external_url: "https://gitlab.{{ domain }}"  # noqa: var-naming[no-role-prefix]
+
+# ---------- 註冊 ----------
+# gitlab_runner_registration_token「刻意不給預設值」（undefined = 跳過註冊）：
+# GitLab 16+ 的新版流程是在 UI/API 先建 runner 拿 glrt- 開頭的 authentication
+# token（Admin Area → CI/CD → Runners → New instance runner），舊式
+# --registration-token 已於 18.0 移除。拿到 token 後以
+#   -e gitlab_runner_registration_token=glrt-xxxx
+# 或 vault 別名傳入重跑本 role 即完成註冊（已註冊主機會自動跳過，冪等）。
+#
+# gitlab_runner_registration_token: glrt-xxxx   # ← 不要在這裡放真值！走 vault/-e
+
+# 未指定 image 的 job 用的預設容器映像：alpine 小而萬用
+gitlab_runner_default_image: alpine:3.20
+
+# ---------- config.toml 調整 ----------
+gitlab_runner_config_path: /etc/gitlab-runner/config.toml
+
+# 全域同時執行的 job 數上限：runner-01 為 4 vCPU，4 個併發 job 是
+# 「CI 吞吐」與「單一 job 建置速度」的折衷起點；vCPU 加大時同步調整
+gitlab_runner_concurrent: 4
+
+# docker executor 掛進每個 job 容器的 volume：
+#   /cache                              → runner 預設的跨 job 快取
+#   /usr/local/share/ca-certificates:ro → 內部 CA 目錄（唯讀）：job 容器內
+#     跑 update-ca-certificates（或直接指 CA 檔）即可信任內部
+#     registry.{{ domain }} / gitlab.{{ domain }}——否則 docker login/push
+#     與 curl 內部服務全部 TLS 驗證失敗。唯讀掛載：job 不可污染宿主信任庫
+gitlab_runner_docker_volumes:
+  - "/cache"
+  - "/usr/local/share/ca-certificates:/usr/local/share/ca-certificates:ro"
+
+# ---------- get_url 模組的出網 proxy ----------
+# 同 gitlab_server/docker role：get_url 是模組自行出網，prod 需明確注入 proxy
+gitlab_runner_proxy_env:
+  HTTP_PROXY: "{{ egress_proxy_url }}"
+  HTTPS_PROXY: "{{ egress_proxy_url }}"
+  NO_PROXY: "{{ no_proxy_list }}"

@@ -1,0 +1,19 @@
+---
+# =============================================================================
+# 70-gitlab.yml — DevOps 層：GitLab CE + Runner（VLAN 50）
+#
+# GitOps 的心臟：git repo + CI + Container Registry 全部自建於地端。
+# lab inventory 沒有這兩個群組 → 實驗室自動跳過本階段（hosts 匹配為空）。
+# 記憶體需求：gitlab-01 建議 8GB（含 registry）。
+# =============================================================================
+- name: GitLab CE + Container Registry
+  hosts: gitlab
+  tags: [gitlab]
+  roles:
+    - role: gitlab_server
+
+- name: GitLab Runner（docker executor）
+  hosts: gitlab_runner
+  tags: [gitlab, runner]
+  roles:
+    - role: gitlab_runner

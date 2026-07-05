@@ -1,0 +1,23 @@
+{#
+  grafana-datasource-prometheus.yaml.j2 — Grafana datasource provisioning
+
+  為什麼用 provisioning 檔而不是 UI 手動加：IaC 原則——重建 mgmt-01 後
+  Grafana 一起動就有 Prometheus 資料源，不依賴人工步驟或 grafana-data
+  volume 的殘留狀態；datasource 的唯一事實來源是這份受版控的檔案。
+#}
+# ===== {{ ansible_managed }} =====
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    # uid 固定值：日後 provision 儀表板 JSON 時要引用這個 uid，
+    # 不固定的話每次重建 uid 亂數化、儀表板全部斷連
+    uid: prometheus
+    type: prometheus
+    # proxy 模式：瀏覽器的查詢經 Grafana 後端轉發，瀏覽器不需要直連 9090
+    access: proxy
+    # compose 網路內以 service 名互連（同一個 monitoring network）
+    url: "http://prometheus:{{ monitoring_prometheus_port }}"
+    isDefault: true
+    # 鎖 UI 編輯：改 datasource 一律改本檔重跑 playbook，防 config drift
+    editable: false

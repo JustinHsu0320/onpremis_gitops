@@ -1,0 +1,200 @@
+---
+# =============================================================================
+# roles/pgbackrest/tasks/main.yml — pgBackRest 備份體系（規劃書 §9）
+#
+# 全貌（junior 必讀）：
+#   1. WAL 歸檔：Patroni 已把 archive_command 設成 pgbackrest archive-push
+#      （patroni role 的契約），PG 每產生一段 WAL 就推進 NFS repo
+#   2. 每日備份：systemd timer 01:30 喚醒腳本 → 只有 Patroni leader 執行
+#      → 週日全備、其他日差異備份
+#   3. 還原（PITR）：任一份全備 + 之後的 diff + WAL = 可還原到任意時間點
+#
+# 三台 pg 都佈署相同的 conf/腳本/timer（對稱佈署），「誰真的跑備份」
+# 由腳本在執行當下問 Patroni 決定——failover 後不需要重佈任何東西。
+# =============================================================================
+
+# Ubuntu 官方 archive 的 pgbackrest 2.58：不加第三方 repo（規劃書鐵律）
+- name: 安裝 pgBackRest 套件
+  ansible.builtin.apt:
+    name: pgbackrest
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+# pgBackRest 讀設定的優先路徑是 /etc/pgbackrest/pgbackrest.conf；
+# 套件只給 /etc/pgbackrest.conf 範例檔，目錄要自己建
+- name: 確保 /etc/pgbackrest 設定目錄存在
+  ansible.builtin.file:
+    path: /etc/pgbackrest
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: "0750"
+
+# log-level-file=detail 會寫 /var/log/pgbackrest；執行身分是 postgres
+# （備份與 archive-push 都以 postgres 跑），目錄權限要配合
+- name: 確保 pgBackRest 日誌目錄存在
+  ansible.builtin.file:
+    path: /var/log/pgbackrest
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: "0750"
+
+# conf 內含 repo1-cipher-pass（repo 加密金鑰）→ no_log + 0640。
+# 洩漏此值 = 攻擊者拿到 NFS 上的備份即可解密整個資料庫。
+- name: 佈署 pgbackrest.conf
+  ansible.builtin.template:
+    src: pgbackrest.conf.j2
+    dest: /etc/pgbackrest/pgbackrest.conf
+    owner: postgres
+    group: postgres
+    mode: "0640"
+  no_log: true
+
+# 【NFS root_squash 陷阱】repo 在 NFS 掛載點下，而 export 開了 root_squash：
+# root 在 NFS 上會被壓成 nobody，用預設身分（root）mkdir 必失敗。
+# 改以 postgres 身分建立——建立者即擁有者，之後備份讀寫也是同一身分。
+# run_once：三台掛的是同一個 NFS export，建一次就好。
+- name: 建立 NFS 上的 pgBackRest repo 目錄（以 postgres 身分，避開 root_squash）
+  ansible.builtin.file:
+    path: "{{ pgbackrest_repo_path }}"
+    state: directory
+    mode: "0750"
+  become: true
+  become_user: postgres
+  run_once: true
+
+# ---------------------------------------------------------------------------
+# 找出 Patroni leader：stanza-create / check / 首次全備都必須在 leader 上跑
+# （replica 是唯讀的，stanza-create 需要對 PG 下寫入類的管理指令）。
+# Patroni REST 的語意：GET /primary 只有 leader 回 200，replica 回 503。
+# 不硬編主機名（CONVENTIONS.md §1）：迴圈整個 postgres 群組逐台問。
+# ---------------------------------------------------------------------------
+- name: 探測 Patroni leader（/primary 回 200 者即是）
+  ansible.builtin.uri:
+    url: "http://{{ hostvars[item].ansible_host }}:{{ patroni_rest_port }}/primary"
+    status_code: [200, 503]
+  loop: "{{ groups['postgres'] }}"
+  loop_control:
+    label: "{{ item }}"
+  register: pgbackrest_primary_probe
+  run_once: true
+
+- name: 記錄 leader 的 inventory 主機名（供後續 delegate_to）
+  ansible.builtin.set_fact:
+    pgbackrest_pg_leader: >-
+      {{ pgbackrest_primary_probe.results
+         | selectattr('status', 'equalto', 200)
+         | map(attribute='item') | first }}
+  run_once: true
+
+# ---------------------------------------------------------------------------
+# stanza-create：初始化 repo 內這套叢集的目錄結構與加密層（一次性動作）
+# ---------------------------------------------------------------------------
+# 冪等前置：pgbackrest info 的 JSON status.code==1 代表「stanza 尚未建立」；
+# code==0（正常）或 2（有 stanza 沒備份）都代表已建立，跳過 stanza-create
+- name: 查詢 stanza 現況（冪等判斷用）
+  ansible.builtin.command: pgbackrest --stanza={{ pgbackrest_stanza }} --output=json info
+  become: true
+  become_user: postgres
+  register: pgbackrest_stanza_info
+  changed_when: false
+  failed_when: false
+  run_once: true
+  delegate_to: "{{ pgbackrest_pg_leader }}"
+
+# Jinja 的 or 會短路：rc != 0 時不會去解析壞掉的 stdout
+- name: 建立 stanza（僅首次；在 leader 上執行）
+  ansible.builtin.command: pgbackrest --stanza={{ pgbackrest_stanza }} stanza-create
+  become: true
+  become_user: postgres
+  changed_when: true
+  run_once: true
+  delegate_to: "{{ pgbackrest_pg_leader }}"
+  when: >-
+    pgbackrest_stanza_info.rc != 0 or
+    (pgbackrest_stanza_info.stdout | from_json | first).status.code == 1
+
+# check 會驗證：conf 正確、repo 可寫、且「PG 的 archive_command 真的把 WAL
+# 推得進 repo」——這是整條 PITR 鏈路的煙霧測試。
+# retries：叢集剛 bootstrap 完，archive 程序可能還在追第一批 WAL segment，
+# 給它幾輪機會而不是立刻紅。
+- name: 驗證 WAL 歸檔通路（pgbackrest check）
+  ansible.builtin.command: pgbackrest --stanza={{ pgbackrest_stanza }} check
+  become: true
+  become_user: postgres
+  register: pgbackrest_check_result
+  changed_when: false
+  retries: "{{ pgbackrest_check_retries }}"
+  delay: "{{ pgbackrest_check_delay }}"
+  until: pgbackrest_check_result.rc == 0
+  run_once: true
+  delegate_to: "{{ pgbackrest_pg_leader }}"
+
+# ---------------------------------------------------------------------------
+# 排程備份：script + systemd service/timer（三台對稱佈署，leader 判斷在腳本內）
+# ---------------------------------------------------------------------------
+# root:postgres 0750：postgres（service User=）可執行，其他人不可讀——
+# 腳本本身無機密，但收窄面向是基本習慣
+- name: 佈署備份腳本 /usr/local/bin/pgbackrest-backup.sh
+  ansible.builtin.template:
+    src: pgbackrest-backup.sh.j2
+    dest: /usr/local/bin/pgbackrest-backup.sh
+    owner: root
+    group: postgres
+    mode: "0750"
+
+- name: 佈署 pgbackrest-backup.service（oneshot，由 timer 觸發）
+  ansible.builtin.template:
+    src: pgbackrest-backup.service.j2
+    dest: /etc/systemd/system/pgbackrest-backup.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart pgbackrest-backup.timer
+
+- name: 佈署 pgbackrest-backup.timer（每日 01:30）
+  ansible.builtin.template:
+    src: pgbackrest-backup.timer.j2
+    dest: /etc/systemd/system/pgbackrest-backup.timer
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart pgbackrest-backup.timer
+
+# daemon_reload：首次佈署時 unit 剛落地、handler 尚未 flush，
+# 這裡先 reload 才 enable 得到新 unit
+- name: 啟用並啟動備份 timer
+  ansible.builtin.systemd_service:
+    name: pgbackrest-backup.timer
+    enabled: true
+    state: started
+    daemon_reload: true
+
+# ---------------------------------------------------------------------------
+# 首次全備：選擇「部署當下立刻做一次」而不是等 timer——
+#   1) 沒有第一份全備之前，PITR 保護是零、WAL 也無從 expire
+#   2) 99-verify 之後可加驗「repo 至少有一份備份」
+# ---------------------------------------------------------------------------
+- name: 重新查詢 stanza 資訊（判斷是否已有任何備份）
+  ansible.builtin.command: pgbackrest --stanza={{ pgbackrest_stanza }} --output=json info
+  become: true
+  become_user: postgres
+  register: pgbackrest_info_after
+  changed_when: false
+  run_once: true
+  delegate_to: "{{ pgbackrest_pg_leader }}"
+
+# async/poll：全備可能跑很久，交給 async 避免 SSH 連線逾時斷線；
+# poll=30 每半分鐘回來看一眼，超過 pgbackrest_first_backup_timeout 才放棄
+- name: 首次全量備份（repo 尚無任何備份時；在 leader 上執行）
+  ansible.builtin.command: pgbackrest --stanza={{ pgbackrest_stanza }} --type=full backup
+  become: true
+  become_user: postgres
+  changed_when: true
+  run_once: true
+  delegate_to: "{{ pgbackrest_pg_leader }}"
+  async: "{{ pgbackrest_first_backup_timeout }}"
+  poll: 30
+  when: (pgbackrest_info_after.stdout | from_json | first).backup | length == 0

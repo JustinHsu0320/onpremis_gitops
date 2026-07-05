@@ -1,0 +1,23 @@
+---
+# =============================================================================
+# roles/etcd/meta/main.yml
+# 依賴說明：本 role 假設 10-pki（pki_leaf）已把 etcd.crt/.key 與 ca.crt 派送到
+# pki_dir——這是 playbook 層順序保證（site.yml：10-pki → 30-postgres），
+# 不寫進 dependencies 以免 pki_leaf 被隱式重複執行。
+# =============================================================================
+galaxy_info:
+  author: justin
+  company: PTC-NEC
+  description: etcd three-node cluster with mutual TLS, serving as the DCS for Patroni
+  license: MIT
+  min_ansible_version: "2.16"
+  platforms:
+    - name: Ubuntu
+      versions:
+        - all
+  galaxy_tags:
+    - etcd
+    - clustering
+    - database
+
+dependencies: []

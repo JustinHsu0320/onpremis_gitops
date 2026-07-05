@@ -1,0 +1,144 @@
+---
+# =============================================================================
+# issue_cert.yml — 單張葉憑證的完整生命週期（由 main.yml 以 loop 逐項 include）
+#
+# item 欄位見 defaults/main.yml 開頭的契約說明。流程：
+#   目標主機產 key（不離開本機）→ 產 CSR → slurp CSR →
+#   delegate 到簽發主機用 Issuing CA 簽（副本存 issued/ 供稽核）→
+#   slurp 憑證 → 落地目標主機 →（可選）組 HAProxy bundle → 匯總 changed 契約 fact
+# =============================================================================
+
+# 解析檔案的「有效擁有者」：首次部署（10-pki 先於服務安裝）服務帳號還不存在
+# → 暫以 root 落地，服務 role 裝完套件後 chown；「重跑」時帳號已存在
+# → 直接落在 group_vars 宣告的最終擁有者上。
+# 為什麼要這樣繞：若永遠寫 root，pki_leaf 與服務 role 會互相把 owner 改來改去
+# （所有權乒乓），每次重跑都是一堆假 changed，冪等性報表完全失真
+- name: 解析憑證檔案的有效擁有者（帳號未建立前暫用 root）
+  ansible.builtin.command: getent passwd {{ item.owner | default('root') }}
+  register: pki_leaf_owner_lookup
+  changed_when: false
+  failed_when: false
+
+- name: 解析憑證檔案的有效群組
+  ansible.builtin.command: getent group {{ item.group | default('root') }}
+  register: pki_leaf_group_lookup
+  changed_when: false
+  failed_when: false
+
+# rc==0 = 帳號/群組存在（服務套件已安裝）→ 用 group_vars 宣告值；否則暫用 root
+- name: 設定有效擁有者事實
+  ansible.builtin.set_fact:
+    pki_leaf_eff_owner: "{{ item.owner | default('root') if pki_leaf_owner_lookup.rc == 0 else 'root' }}"
+    pki_leaf_eff_group: "{{ item.group | default('root') if pki_leaf_group_lookup.rc == 0 else 'root' }}"
+
+# 私鑰只在目標主機上生成與存放——這是整個 PKI 流程的安全底線。
+# 回傳值不含私鑰內容，故不需 no_log
+- name: 產生葉憑證私鑰（本機生成、永不離開）
+  community.crypto.openssl_privatekey:
+    path: "{{ pki_dir }}/{{ item.name }}.key"
+    size: "{{ pki_key_size | default(2048) }}"
+    type: RSA
+    owner: "{{ pki_leaf_eff_owner }}"
+    group: "{{ pki_leaf_eff_group }}"
+    mode: "{{ item.key_mode | default(pki_leaf_key_mode) }}"
+  register: pki_leaf_key_result
+
+# SAN 是現代 TLS 驗證的主角（CN 只是顯示用途）：預設涵蓋 fqdn/短名/本機 IP，
+# 需要 VIP 名稱的服務（pgbouncer/rabbitmq/svc-api）由 group_vars 以 extra_sans 追加。
+# EKU 依 profile 給最小集合：server 憑證拿去當 client 用會被對端拒絕——這是特性不是 bug
+- name: 產生 CSR（SAN + profile 對應之 EKU）
+  community.crypto.openssl_csr:
+    path: "{{ pki_dir }}/{{ item.name }}.csr"
+    privatekey_path: "{{ pki_dir }}/{{ item.name }}.key"
+    common_name: "{{ item.cn | default(inventory_hostname ~ '.' ~ domain) }}"
+    subject_alt_name: "{{ pki_leaf_default_sans + (item.extra_sans | default([])) }}"
+    key_usage: [digitalSignature, keyEncipherment]
+    key_usage_critical: true
+    extended_key_usage: "{{ pki_leaf_profile_eku[item.profile] }}"
+    use_common_name_for_san: false
+    owner: root
+    group: root
+    mode: "0644"
+
+# CSR 是公開資訊（只含公鑰與主體描述），用 slurp 讀進記憶體轉交簽發主機，
+# 全程不落地 controller 磁碟
+- name: 讀取 CSR 內容
+  ansible.builtin.slurp:
+    src: "{{ pki_dir }}/{{ item.name }}.csr"
+  register: pki_leaf_csr_content
+
+# delegate 到簽發主機用 Issuing CA 私鑰簽發；簽出的憑證同時就是 issued/ 稽核副本
+# （檔名帶 inventory_hostname 前綴，避免不同主機的同名憑證互撞）。
+# x509_certificate 對「既存且與 CSR 相符的有效憑證」不重簽 → 重跑 0 changed；
+# 到期前主動輪替用 -e pki_leaf_force_renew=true 強制重簽
+- name: 由 Issuing CA 簽發憑證（+397d，副本存 issued/）
+  community.crypto.x509_certificate:
+    path: "{{ pki_leaf_issued_dir }}/{{ inventory_hostname }}-{{ item.name }}.crt"
+    csr_content: "{{ pki_leaf_csr_content.content | b64decode }}"
+    provider: ownca
+    ownca_path: "{{ pki_leaf_issuing_ca_cert }}"
+    ownca_privatekey_path: "{{ pki_leaf_issuing_ca_key }}"
+    ownca_not_after: "{{ pki_leaf_validity }}"
+    force: "{{ pki_leaf_force_renew | bool }}"
+    owner: root
+    group: root
+    mode: "0644"
+  delegate_to: "{{ internal_ca_host }}"
+
+- name: 自簽發主機取回憑證內容
+  ansible.builtin.slurp:
+    src: "{{ pki_leaf_issued_dir }}/{{ inventory_hostname }}-{{ item.name }}.crt"
+  delegate_to: "{{ internal_ca_host }}"
+  register: pki_leaf_signed_crt
+
+# 憑證是公開資訊 → 0644；擁有者同私鑰的有效擁有者邏輯（避免與服務 role 乒乓）
+- name: 憑證落地目標主機
+  ansible.builtin.copy:
+    content: "{{ pki_leaf_signed_crt.content | b64decode }}"
+    dest: "{{ pki_dir }}/{{ item.name }}.crt"
+    owner: "{{ pki_leaf_eff_owner }}"
+    group: "{{ pki_leaf_eff_group }}"
+    mode: "0644"
+  register: pki_leaf_crt_result
+
+# ---------------------------------------------------------------------------
+# 可選：HAProxy 格式 bundle（葉 crt + issuing + root + 私鑰，單一 PEM）
+# HAProxy 的 crt 參數要求「憑證鏈與私鑰同檔」；chain 部分直接取自
+# 已派送的 pki_dir/ca.crt（= issuing+root，順序正確）
+# ---------------------------------------------------------------------------
+# bundle 內含私鑰 → slurp 出來的內容是機密，必須 no_log
+- name: 讀取私鑰內容供 bundle 組裝
+  ansible.builtin.slurp:
+    src: "{{ pki_dir }}/{{ item.name }}.key"
+  register: pki_leaf_key_material
+  no_log: true
+  when: item.bundle_pem | default(false)
+
+# copy+content 內容比對即冪等；含私鑰 → mode 0600 + no_log（規範 §5）
+# 用 YAML literal block（|）保證三段 PEM 之間是真換行——
+# 在 Jinja 表達式串 '\n' 會落地成字面反斜線+n（曾在 ca-chain 踩雷）
+- name: 組裝 HAProxy 格式 bundle（crt+chain+key）
+  ansible.builtin.copy:
+    content: |
+      {{ pki_leaf_signed_crt.content | b64decode | trim }}
+      {{ pki_leaf_ca_chain.content | b64decode | trim }}
+      {{ pki_leaf_key_material.content | b64decode | trim }}
+    dest: "{{ pki_dir }}/{{ item.name }}.pem"
+    owner: root
+    group: root
+    mode: "0600"
+  register: pki_leaf_bundle_result
+  no_log: true
+  when: item.bundle_pem | default(false)
+
+# 【契約】匯總本張憑證的所有異動：任一步 changed 就把全域 fact 立起來，
+# 讓之後的服務 role（同一次 site.yml 內）能 notify 自己的 reload handler。
+# 只在 true 時設值、絕不設 false：避免覆蓋前面迴圈已立起的 true。
+# noqa 理由：pki_certs_changed 是 CONVENTIONS.md §5 的跨 role 契約 fact 名，不可加前綴
+- name: 匯總異動至契約 fact pki_certs_changed # noqa: var-naming[no-role-prefix]
+  ansible.builtin.set_fact:
+    pki_certs_changed: true
+  when: >-
+    pki_leaf_key_result is changed
+    or pki_leaf_crt_result is changed
+    or pki_leaf_bundle_result is changed

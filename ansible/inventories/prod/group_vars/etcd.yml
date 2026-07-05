@@ -1,0 +1,12 @@
+---
+# =============================================================================
+# group_vars/etcd.yml — etcd（Patroni 的 DCS，與 postgres 同居）
+#
+# etcd 對磁碟 fsync 延遲極度敏感（規劃書 §2.1）：prod 的 /var/lib/etcd
+# 掛獨立 SSD VMDK（由 Terraform 配置）；lab 容器內就直接用 OS 碟。
+# =============================================================================
+
+etcd_cluster_token: email-proxy-etcd
+# etcd 心跳/選舉參數：SSD 環境用預設值即可；若 datastore 延遲偏高才需要調
+etcd_heartbeat_interval: 100          # ms
+etcd_election_timeout: 1000           # ms

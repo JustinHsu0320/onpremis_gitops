@@ -1,0 +1,88 @@
+# =============================================================================
+# AppProject: platform —— 平台應用的「安全邊界」
+#
+# AppProject 是 ArgoCD 的多租戶/最小權限機制，回答三個問題：
+#   1. 允許從「哪些 repo」拉 manifests？（sourceRepos）
+#   2. 允許部署到「哪些叢集的哪些 namespace」？（destinations）
+#   3. 允許建立「哪些種類」的 K8s 資源？（cluster/namespace 白名單）
+#
+# 為什麼不全用內建的 default project？—— default 三項全開（*/*），
+# 任何一個 Application 定義被改壞（或惡意 MR 混進來），就能把資源部署到
+# kube-system、建 ClusterRoleBinding 提權。platform project 把爆炸半徑
+# 收斂在「本 repo → 兩個應用 namespace → 一般工作負載資源」之內。
+#
+# 【架構邊界 / ADR-4】本 project 只涵蓋平台 K8s 上的 web-frontend /
+# web-backend。email_proxy 跑在 VM（Ansible + Compose 管理），不屬於
+# 任何 AppProject —— 不要為它開 destination。
+#
+# 本檔由 root Application 自動同步（source #1: argocd/projects/），
+# 修改後 push 即生效，不需 kubectl。
+# =============================================================================
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: platform
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: platform
+  # finalizer：project 被刪時，確保先清算底下 Application 的關聯，
+  # 避免留下孤兒 Application 卡在 Unknown
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  description: 平台前後端應用（web-frontend / web-backend）—— 僅限內部 GitLab 來源
+
+  # ---------------------------------------------------------------------------
+  # 1. 來源限定：只信任內部 GitLab 的 gitops repo。
+  #    就算有人在 Application 裡把 repoURL 改成外部網址，ArgoCD 也會拒同步。
+  #    不要寫萬用字元（如 https://gitlab.ptc-nec.com.tw/*），
+  #    精確到 repo 才能防「同一台 GitLab 上的其他 repo」混入。
+  # ---------------------------------------------------------------------------
+  sourceRepos:
+    - https://gitlab.ptc-nec.com.tw/platform/gitops.git
+
+  # ---------------------------------------------------------------------------
+  # 2. 目的地限定：只允許 in-cluster 的兩個應用 namespace。
+  #    新應用上線時，在這裡「顯式」加一組 destination —— 刻意保留這道
+  #    人工審查關卡（MR review），不用 namespace: '*' 圖方便。
+  # ---------------------------------------------------------------------------
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: web-frontend
+    - server: https://kubernetes.default.svc
+      namespace: web-backend
+
+  # ---------------------------------------------------------------------------
+  # 3a. 叢集層級資源白名單 ——「最小化」是重點。
+  #     唯一放行 Namespace：因為 Application 開了 CreateNamespace=true，
+  #     首次同步需要建立 web-frontend / web-backend namespace。
+  #     其餘一律禁止：ClusterRole(Binding)、CRD、PV、MutatingWebhook…
+  #     這些都是提權/劫持叢集的常見載體，應用層 GitOps 沒有理由碰它們。
+  # ---------------------------------------------------------------------------
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
+
+  # ---------------------------------------------------------------------------
+  # 3b. namespace 層級資源：預設全允許（namespaceResourceWhitelist 不設限），
+  #     但明確封鎖兩類「不該由應用自己管」的資源：
+  #     - ResourceQuota / LimitRange：配額由平台團隊統一治理，
+  #       不能讓應用透過 GitOps 幫自己鬆綁配額。
+  # ---------------------------------------------------------------------------
+  namespaceResourceBlacklist:
+    - group: ""
+      kind: ResourceQuota
+    - group: ""
+      kind: LimitRange
+
+  # ---------------------------------------------------------------------------
+  # 孤兒資源告警：namespace 裡出現「不是 Git 宣告」的資源時，UI 顯示警告。
+  #     warn: true 只警告不動手 —— 手動除錯時建的臨時資源不會被誤殺，
+  #     但會在 UI 上留下醒目提示，敦促回歸 Git 管理。
+  # ---------------------------------------------------------------------------
+  orphanedResources:
+    warn: true
+
+# 【擴充註記】之後接 SSO / 多團隊時，可在 spec 加 roles（project 內 RBAC）
+# 與 syncWindows（例：上班尖峰禁止自動同步）——目前單一平台團隊，暫不需要。

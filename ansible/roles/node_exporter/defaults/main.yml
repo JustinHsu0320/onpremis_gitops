@@ -1,0 +1,21 @@
+---
+# =============================================================================
+# roles/node_exporter/defaults/main.yml — node_exporter 可調參數
+#
+# 本 role 沒有跨 role 契約變數要從 group_vars 引用；埠號 9100 雖是
+# CONVENTIONS.md §3 的契約值，但只有 monitoring role（Prometheus 抓取端）
+# 與本 role 兩處使用，各自在 defaults 記載並以註解互相對照。
+# =============================================================================
+
+# 監聽埠：CONVENTIONS.md §3 契約值（全主機 9100）。
+# 改這裡必須同步改 roles/monitoring/defaults/main.yml 的
+# monitoring_node_exporter_port，且先走契約文件 PR——否則 Prometheus 會抓空。
+node_exporter_port: 9100
+
+# Ubuntu 官方 archive 的套件名與 systemd unit 名（distro 事實，非調校旋鈕；
+# 放 defaults 是為了讓日後換發行版時只改一處）
+node_exporter_package: prometheus-node-exporter
+node_exporter_service: prometheus-node-exporter
+
+# 部署後等待監聽埠就緒的上限（秒）
+node_exporter_wait_timeout: 30

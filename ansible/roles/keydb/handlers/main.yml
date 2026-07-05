@@ -1,0 +1,22 @@
+---
+# =============================================================================
+# roles/keydb/handlers/main.yml
+# =============================================================================
+
+# 為什麼是 recreate 而不是 restart？
+#   conf 與 tls 是「volume 掛進去的檔案」，內容變了 docker compose 偵測不到
+#   （compose 只比對 image / 容器設定），必須 recreate: always 強制重建，
+#   容器才會重讀新設定與新憑證。
+#
+# 影響（junior 必讀）：本 handler 會「同時」重建本機的 master 與 replica
+#   兩個容器——這台的 master slot 會由他台的 replica failover 接手、
+#   這台的 replica 下線期間其 master 暫時無副本。快取層短暫抖動可接受
+#   （資料可從 PG 重建），但 prod 憑證輪替 / 調參請用
+#   `ansible-playbook ... --limit app-01` 逐台滾動，一次只動一台，
+#   不要讓三台同時 recreate（那等於整個快取層瞬間全滅）。
+- name: Restart keydb
+  community.docker.docker_compose_v2:
+    project_src: "{{ keydb_home }}"
+    state: present
+    recreate: always
+  listen: restart keydb

@@ -1,0 +1,25 @@
+# =============================================================================
+# web-frontend Service（base）
+#
+# ClusterIP 就夠：對外流量一律走 Ingress（見 ingress.yaml），
+# 地端沒有雲 LB，NodePort 也刻意不用 —— 出入口收斂在 ingress-nginx 一處，
+# 方便統一做 TLS 終結、存取日誌與速率限制。
+# =============================================================================
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-frontend
+  labels:
+    app.kubernetes.io/name: web-frontend
+    app.kubernetes.io/component: frontend
+spec:
+  type: ClusterIP
+  selector:
+    # 對齊 Deployment 的 selector label（只用最穩定的 name label）
+    app.kubernetes.io/name: web-frontend
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80 # Service 對內的埠：叢集內一律打 80，簡單好記
+      targetPort: http # 指向容器的「具名 port」：容器改埠號時此檔不用動

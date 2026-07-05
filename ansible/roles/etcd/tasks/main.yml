@@ -1,0 +1,115 @@
+---
+# =============================================================================
+# roles/etcd/tasks/main.yml — etcd 三節點叢集（Patroni 的 DCS，與 postgres 同居）
+#
+# 為什麼 30-postgres.yml 對本 role「刻意不用 serial」：
+#   etcd 的 initial bootstrap 需要三台「同時」啟動互相找到彼此才能湊出 quorum
+#   （ETCD_INITIAL_CLUSTER 列了三個 peer，單台起來會一直等其他成員）。
+#   若用 serial: 1，第一台會卡在等 quorum、直到 playbook 超時。
+#
+# 副作用（維運必知）：對「已運行的叢集」改設定/換憑證時，三台會在 flush_handlers
+#   處同時重啟 → 短暫失去 quorum（Patroni 進入安全的唯讀保護）→ 數秒內自復原。
+#   計畫性變更請改用 --limit pg-01 / pg-02 / pg-03 逐台套用，全程保住 quorum。
+# =============================================================================
+
+# 為什麼用官方 archive 套件：Ubuntu 26.04 的 etcd 3.5.16 已滿足 Patroni 4.1 的
+# DCS 需求；不加第三方 apt repo 可縮小供應鏈攻擊面，也讓版本跟著 distro 安全更新走
+- name: 安裝 etcd 套件（server + etcdctl 工具）
+  ansible.builtin.apt:
+    name: "{{ etcd_packages }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+# 為什麼收斂到 0700：資料目錄裡是 raft log 與 keyspace 快照——內含 Patroni 寫入的
+# 整個 PG 叢集拓撲與設定，只允許 etcd 服務帳號本人讀寫。
+# prod 這個路徑是 Terraform 配的獨立 SSD VMDK 掛載點（etcd 對 fsync 延遲極敏感，
+# 獨立碟避免被 PG 的 I/O 干擾）；lab 是普通目錄。file 模組對掛載點與普通目錄
+# 行為一致（只動 owner/mode，不動掛載），所以不需要 is_container 分支
+- name: 收斂 etcd 資料目錄權限（etcd:etcd 0700）
+  ansible.builtin.file:
+    path: "{{ etcd_data_dir }}"
+    state: directory
+    owner: etcd
+    group: etcd
+    mode: "0700"
+
+# 為什麼這裡要補 group：pki_leaf 在 10-pki 階段簽發 etcd 憑證時，本機還沒安裝
+# etcd 套件、etcd 群組尚不存在，私鑰只能先落地為 root:root。套件裝好（etcd 帳號
+# 誕生）後把 group 補為 etcd，服務帳號才讀得到 0640 的私鑰。
+# 若權限有變（例如 pki_leaf 重簽後回到 root:root）也要重啟讓 etcd 重新載入
+- name: 授權 etcd 私鑰給服務帳號（root:etcd 0640）
+  ansible.builtin.file:
+    path: "{{ pki_dir }}/etcd.key"
+    owner: root
+    group: etcd
+    mode: "0640"
+  notify: restart etcd
+
+# etcd 只在「啟動時」讀 /etc/default/etcd（Ubuntu 套件的 systemd unit 以
+# EnvironmentFile 載入），沒有 reload 一說 → 設定變更一律 notify restart
+- name: 產生 /etc/default/etcd 環境檔
+  ansible.builtin.template:
+    src: etcd.default.j2
+    dest: /etc/default/etcd
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart etcd
+
+# PKI 契約（CONVENTIONS.md §5）：pki_leaf 重簽憑證時只改 pki_dir 下的檔案並設
+# host fact pki_certs_changed=true——本 role 自己的 template/file task 看不到那個
+# 變更（重跑時全部 ok 不 changed），所以需要這個「橋接」task 把憑證更新事件
+# 轉譯成本服務的 restart（10-pki 重簽後重跑 30-postgres 即自動生效）
+- name: PKI 憑證已更新時觸發 etcd 重啟（pki_certs_changed 契約）
+  ansible.builtin.debug:
+    msg: 偵測到 pki_leaf 重簽憑證，etcd 將重啟以載入新憑證
+  when: pki_certs_changed | default(false)
+  changed_when: true
+  notify: restart etcd
+
+- name: 啟動 etcd 服務並設為開機啟動
+  ansible.builtin.systemd_service:
+    name: etcd
+    enabled: true
+    state: started
+
+# 為什麼在這裡 flush handlers 而不是等 play 結尾：讓「設定/憑證變更 → 重啟」
+# 發生在健康檢查「之前」，下面驗的才是新設定跑出來的叢集，而不是舊行程的假健康。
+# 再次提醒：無 serial 之下三台會同時重啟 → 短暫失去 quorum 後自復原；
+# 計畫性變更請用 --limit 逐台跑，quorum 全程不斷
+- name: 立即套用待生效的設定/憑證變更
+  ansible.builtin.meta: flush_handlers
+
+# etcd 行程一起來就綁 client 埠（不等 quorum 成形），先等埠開再做叢集級健檢，
+# 可以把「行程沒起來」和「quorum 沒湊齊」兩種故障區分開，好除錯
+- name: 等待本機 etcd client 埠就緒（127.0.0.1:2379）
+  ansible.builtin.wait_for:
+    host: 127.0.0.1
+    port: "{{ etcd_client_port }}"
+    timeout: "{{ etcd_port_wait_timeout }}"
+
+# 叢集級健康檢查：--cluster 會向任一端點要成員清單、再逐一探測全部端點，
+# 所以 run_once 打 127.0.0.1 一次就涵蓋三台（憑證 SAN 已含 IP:127.0.0.1）。
+# 帶客戶端憑證是因為 ETCD_CLIENT_CERT_AUTH=true——沒有內部 CA client 憑證連
+# 健檢都做不了，這正是我們要的存取語意。retries 是為了等 initial bootstrap：
+# 三台先後啟動 + leader 選舉需要幾秒，重試直到三個端點都 healthy 才放行後續
+# 的 Patroni 部署（DCS 不健康時起 Patroni 只會得到一堆誤導性錯誤）
+- name: 等待叢集全部端點 healthy（quorum 就緒）
+  ansible.builtin.command: >-
+    etcdctl --endpoints=https://127.0.0.1:{{ etcd_client_port }}
+    --cacert={{ pki_dir }}/ca.crt
+    --cert={{ pki_dir }}/etcd.crt
+    --key={{ pki_dir }}/etcd.key
+    endpoint health --cluster
+  environment:
+    ETCDCTL_API: "3"
+  register: etcd_cluster_health
+  changed_when: false
+  retries: "{{ etcd_health_retries }}"
+  delay: "{{ etcd_health_delay }}"
+  # 部分 etcd 版本把健檢結果經 zap logger 印到 stderr，stdout+stderr 一起數最穩
+  until: >-
+    (etcd_cluster_health.stdout_lines + etcd_cluster_health.stderr_lines)
+    | select('search', 'is healthy') | list | length == (groups['etcd'] | length)
+  run_once: true

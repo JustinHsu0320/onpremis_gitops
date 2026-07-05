@@ -1,0 +1,353 @@
+---
+# =============================================================================
+# roles/rabbitmq/tasks/main.yml — RabbitMQ 4.x 三節點叢集 + quorum queues
+#
+# 為什麼 31-rabbitmq.yml 對本 role「刻意不用 serial」：
+#   叢集組建靠 linear strategy 的「每個 task 在全部主機跑完才進下一個 task」
+#   特性做出順序——「seed 先起（await_startup）→ 其餘再起（classic_config
+#   自動加入）→ 全員 await_online_nodes」。若用 serial: 1，非 seed 節點會在
+#   自己的批次裡等不到別人，順序反而更難控制。
+#
+# 副作用（維運必知）：對「已運行的叢集」改設定/換憑證重跑全群組時，三台會在
+#   flush_handlers 處同時重啟 → quorum queue 短暫失去多數。計畫性變更請
+#   --limit mq-01/02/03 逐台套用（quorum queue 容忍單節點離線，全程不中斷）。
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# 1. 安裝前防護：擋住套件安裝觸發的自動啟動
+# ---------------------------------------------------------------------------
+
+# 先探測套件是否已安裝：policy-rc.d 防護只在「首次安裝」需要（見下一個 task），
+# 已裝過的重跑不再放置防護檔，維持重跑 0 changed 的冪等契約
+- name: 檢查 rabbitmq-server 是否已安裝
+  ansible.builtin.command: dpkg-query -W -f='${Status}' rabbitmq-server
+  register: rabbitmq_pkg_status
+  changed_when: false
+  failed_when: false
+
+# 為什麼要 policy-rc.d：Debian/Ubuntu 套件裝完會自動 start 服務。RabbitMQ
+# 首次啟動時若找不到 Erlang cookie 會「自產一把隨機 cookie」並以單機叢集
+# 之姿跑起來——cookie 是叢集互認密鑰，三台各自拿著不同的隨機 cookie 就
+# 永遠湊不成叢集，事後還得停機清資料目錄重來。所以：cookie 沒就位前，
+# server 絕不能先跑。policy-rc.d exit 101 = 安裝期間拒絕一切服務啟動請求，
+# 等 cookie/設定全部落地後（本檔第 8 節）才移除並依序啟動
+- name: 放置 policy-rc.d 阻擋安裝期間的服務自動啟動（僅首次安裝）
+  ansible.builtin.copy:
+    dest: /usr/sbin/policy-rc.d
+    content: |
+      #!/bin/sh
+      # 由 Ansible roles/rabbitmq 臨時放置：套件安裝期間禁止服務自動啟動，
+      # 安裝流程結束後即移除。exit 101 = 拒絕所有 invoke-rc.d 動作。
+      exit 101
+    owner: root
+    group: root
+    mode: "0755"
+  when: "'install ok installed' not in rabbitmq_pkg_status.stdout"
+
+# ---------------------------------------------------------------------------
+# 2. 套件安裝
+# ---------------------------------------------------------------------------
+
+# 官方 archive 的 distro 套件（4.0.5 + Erlang 27），不加第三方 repo；
+# python3-requests 給 community.rabbitmq 的 HTTP API 模組用（第 10 節）
+- name: 安裝 RabbitMQ 套件
+  ansible.builtin.apt:
+    name: "{{ rabbitmq_packages }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+# ---------------------------------------------------------------------------
+# 3. Erlang cookie（必須先於首次啟動）
+# ---------------------------------------------------------------------------
+
+# 收斂 /var/lib/rabbitmq 的 owner：prod 若把資料碟（disk1-mqdata）掛到這裡，
+# 掛載點根目錄是 root:root（block_storage 不設 owner），而 dpkg 安裝時不會去改
+# 「已存在的掛載點」擁有者——沒有這步，rabbitmq 使用者建不了 mnesia 子目錄、
+# 首次啟動就失敗。冪等：無掛碟的情況（dpkg 已設對）重跑 0 changed
+- name: 確保 RabbitMQ 資料目錄擁有者正確（資料碟掛載點情境）
+  ansible.builtin.file:
+    path: /var/lib/rabbitmq
+    state: directory
+    owner: rabbitmq
+    group: rabbitmq
+    mode: "0750"
+
+# cookie = Erlang 分散式節點的「叢集互認密鑰」：cookie 相同的節點可互相
+# 執行任意 Erlang 呼叫，等同叢集 root 權限——所以 0400 + no_log，
+# 真值放 vault（vault_rabbitmq_erlang_cookie），role 只引用非 vault 別名。
+# cookie 變更 = 叢集成員身分重置，必須 restart 才生效
+- name: 佈署 Erlang cookie（叢集互認密鑰）
+  ansible.builtin.copy:
+    content: "{{ rabbitmq_erlang_cookie }}"
+    dest: /var/lib/rabbitmq/.erlang.cookie
+    owner: rabbitmq
+    group: rabbitmq
+    mode: "0400"
+  no_log: true
+  notify: restart rabbitmq
+
+# ---------------------------------------------------------------------------
+# 4./5. 主設定與 plugin 清單
+# ---------------------------------------------------------------------------
+
+# rabbitmq.conf 只在啟動時讀取（無熱重載）→ 變更一律 notify restart
+- name: 產生 /etc/rabbitmq/rabbitmq.conf
+  ansible.builtin.template:
+    src: rabbitmq.conf.j2
+    dest: /etc/rabbitmq/rabbitmq.conf
+    owner: root
+    group: rabbitmq
+    mode: "0644"
+  notify: restart rabbitmq
+
+- name: 產生 /etc/rabbitmq/enabled_plugins
+  ansible.builtin.template:
+    src: enabled_plugins.j2
+    dest: /etc/rabbitmq/enabled_plugins
+    owner: root
+    group: rabbitmq
+    mode: "0644"
+  notify: restart rabbitmq
+
+# ---------------------------------------------------------------------------
+# 6. delayed message exchange plugin（社群 plugin，不在 distro 套件內）
+# ---------------------------------------------------------------------------
+
+- name: 安裝 delayed message exchange plugin
+  when: rabbitmq_delayed_plugin_enabled
+  block:
+    # plugins 目錄路徑含 RabbitMQ 版本號（/usr/lib/rabbitmq/lib/
+    # rabbitmq_server-4.0.5/plugins），套件升級路徑就變——不可寫死，
+    # 每次執行時動態定位。glob 展開需要 shell（command 模組不做 glob）
+    - name: 定位 RabbitMQ plugins 目錄（路徑含版本號，動態解析）
+      ansible.builtin.shell: ls -d /usr/lib/rabbitmq/lib/rabbitmq_server-*/plugins
+      register: rabbitmq_plugins_dir_result
+      changed_when: false
+
+    # egress 白名單對應：get_url 打 github.com（release 頁）→ 302 轉址到
+    # objects/release-assets.githubusercontent.com（實際資產）；Squid 白名單放行
+    # .githubusercontent.com 與 github.com 兩者缺一不可（見 egress role 白名單）。
+    # proxy 三件套只在 use_egress_proxy=true 時套（lab 直連 NAT）。
+    # 冪等：dest 檔已存在時 get_url 直接跳過下載（不帶 force/checksum）
+    - name: 下載 delayed message exchange plugin（.ez）
+      ansible.builtin.get_url:
+        url: "{{ rabbitmq_delayed_plugin_url }}"
+        dest: "{{ rabbitmq_plugins_dir_result.stdout | trim }}/rabbitmq_delayed_message_exchange-v{{ rabbitmq_delayed_plugin_version }}.ez"
+        owner: root
+        group: root
+        mode: "0644"
+      environment: "{{ rabbitmq_proxy_env if use_egress_proxy else {} }}"
+      register: rabbitmq_delayed_plugin_download
+      retries: "{{ rabbitmq_delayed_plugin_download_retries }}"
+      delay: "{{ rabbitmq_delayed_plugin_download_delay }}"
+      until: rabbitmq_delayed_plugin_download is succeeded
+      notify: restart rabbitmq
+
+# ---------------------------------------------------------------------------
+# 7. TLS 私鑰授權給服務帳號
+# ---------------------------------------------------------------------------
+
+# 為什麼這裡要收斂 owner/group：pki_leaf 在 10-pki 階段簽發憑證時，本機還沒
+# 安裝 rabbitmq-server、rabbitmq 帳號尚不存在，私鑰可能先落地為 root:root。
+# 套件裝好（rabbitmq 帳號誕生）後收斂為 rabbitmq:rabbitmq 0600，服務才讀得到。
+# 權限有變（例如 pki_leaf 重簽後回到 root:root）也要重啟讓節點重新載入
+- name: 授權 RabbitMQ TLS 私鑰給服務帳號（rabbitmq:rabbitmq 0600）
+  ansible.builtin.file:
+    path: "{{ pki_dir }}/rabbitmq-server.key"
+    owner: rabbitmq
+    group: rabbitmq
+    mode: "0600"
+  notify: restart rabbitmq
+
+# PKI 契約（CONVENTIONS.md §5）：pki_leaf 重簽憑證時只改 pki_dir 下的檔案並設
+# host fact pki_certs_changed=true——本 role 自己的 template/file task 看不到
+# 那個變更（重跑時全部 ok 不 changed），所以需要這個「橋接」task 把憑證更新
+# 事件轉譯成本服務的 restart（10-pki 重簽後重跑 31-rabbitmq 即自動生效）
+- name: PKI 憑證已更新時觸發 rabbitmq 重啟（pki_certs_changed 契約）
+  ansible.builtin.debug:
+    msg: 偵測到 pki_leaf 重簽憑證，RabbitMQ 將重啟以載入新憑證
+  when: pki_certs_changed | default(false)
+  changed_when: true
+  notify: restart rabbitmq
+
+# ---------------------------------------------------------------------------
+# 8. 移除安裝防護 → 依「seed 先起、其他後起」啟動
+# ---------------------------------------------------------------------------
+
+# cookie/設定/plugin 全部就位，解除啟動封印。state: absent 天然冪等
+# （檔案不存在時 0 changed）。注意：若首次部署在此之前失敗中斷，
+# policy-rc.d 會殘留並擋住本機後續其他套件的服務自動啟動——重跑本
+# playbook 到此即自動清除
+- name: 移除 policy-rc.d（解除服務啟動封印）
+  ansible.builtin.file:
+    path: /usr/sbin/policy-rc.d
+    state: absent
+
+# 為什麼「三台同時啟動」而不是 seed 先起：RabbitMQ 4.x 重寫了 peer discovery——
+# 全新（virgin）節點會先聯絡 classic_config 列出的所有同儕協商「誰當 seed」
+# （排序最前者成團、其他人等它），聯絡不上任何同儕時「無限重試」以防裂腦。
+# 若讓 seed 單獨先起，它永遠等不到同儕回應 → 卡到 systemd 啟動逾時
+# （實驗室實測：首啟卡滿 10 分鐘被 systemd 砍掉）。
+# 正確姿勢就是官方設計的姿勢：全部同時起，讓它們自己協商。
+# linear strategy 下這個 task 會在三台「並行」執行，正是我們要的。
+# 注意 systemd 模組會等 unit 進入 active——三台互等對方的協商最長數十秒，正常。
+- name: 同時啟動全部節點並設為開機自啟（4.x peer discovery 自行協商 seed）
+  ansible.builtin.systemd_service:
+    name: rabbitmq-server
+    enabled: true
+    state: started
+
+# await_startup 阻塞到本節點完全 boot（含 plugin 載入與入團）
+- name: 等待本節點完成啟動
+  ansible.builtin.command: rabbitmqctl --timeout {{ rabbitmq_startup_timeout }} await_startup
+  changed_when: false
+
+# 為什麼在這裡 flush handlers 而不是等 play 結尾：讓「設定/憑證變更 → 重啟」
+# 發生在叢集健檢與 vhost/queue 定義「之前」，後面驗的才是新設定跑出來的叢集。
+# 再次提醒：無 serial 之下三台會同時重啟 → quorum 短暫失守後自復原；
+# 計畫性變更請用 --limit 逐台跑
+- name: 立即套用待生效的設定/憑證變更
+  ansible.builtin.meta: flush_handlers
+
+# 全員到齊檢查：await_online_nodes 會阻塞到叢集內在線節點數達標，
+# 同時涵蓋「首次組團」與「flush 重啟後回穩」兩種情境。節點數取
+# groups['rabbitmq'] 長度，不硬編 3
+- name: 等待全部節點在線（叢集組建完成）
+  ansible.builtin.command: >-
+    rabbitmqctl --timeout {{ rabbitmq_startup_timeout }}
+    await_online_nodes {{ groups['rabbitmq'] | length }}
+  changed_when: false
+
+# ---------------------------------------------------------------------------
+# 9. feature flags
+# ---------------------------------------------------------------------------
+
+# feature flags 是叢集級開關：全開才能做未來的滾動升級（新版拒絕在有未啟用
+# stable flag 的叢集上啟動）。指令對「已啟用」的 flag 是 no-op 且輸出無法
+# 區分新舊，故 changed_when: false（冪等由指令本身保證）。
+# 叢集級操作跑一次即可 → run_once + delegate 到 seed
+- name: 啟用全部 feature flags（叢集級，一次即可）
+  ansible.builtin.command: rabbitmqctl enable_feature_flag all
+  changed_when: false
+  run_once: true
+  delegate_to: "{{ rabbitmq_seed_node }}"
+
+# ---------------------------------------------------------------------------
+# 10. vhost / user / queue 拓撲（叢集級定義，seed 上跑一次）
+# ---------------------------------------------------------------------------
+# community.rabbitmq 模組分兩類：vhost/user 底層呼叫本機 rabbitmqctl；
+# exchange/queue/binding 打本機 15672 management API（python3-requests）。
+# 全部是叢集級資料（存在 raft/metadata store），run_once + delegate seed 即可。
+
+- name: 建立應用 vhost
+  community.rabbitmq.rabbitmq_vhost:
+    name: "{{ rabbitmq_vhost }}"
+    state: present
+  run_once: true
+  delegate_to: "{{ rabbitmq_seed_node }}"
+
+# admin 要先於 exchange/queue 建立：後面的 API 模組用 admin 帳密登入 15672。
+# 權限同時涵蓋應用 vhost 與預設 "/"（管理 API 的部分端點預設打 "/"）。
+# update_password: always 讓 vault 輪替密碼後重跑即生效（模組先以
+# authenticate_user 驗證舊密碼，通過就不動作，不破壞冪等）
+- name: 建立 admin 管理帳號（administrator）
+  community.rabbitmq.rabbitmq_user:
+    user: admin
+    password: "{{ rabbitmq_admin_password }}"
+    tags: administrator
+    permissions:
+      - vhost: "{{ rabbitmq_vhost }}"
+        configure_priv: .*
+        read_priv: .*
+        write_priv: .*
+      - vhost: /
+        configure_priv: .*
+        read_priv: .*
+        write_priv: .*
+    update_password: always
+    state: present
+  no_log: true
+  run_once: true
+  delegate_to: "{{ rabbitmq_seed_node }}"
+
+# 應用帳號走最小權限：只拿應用 vhost 的權限、不掛任何管理 tag
+- name: 建立應用帳號（僅應用 vhost 權限）
+  community.rabbitmq.rabbitmq_user:
+    user: "{{ rabbitmq_app_user }}"
+    password: "{{ rabbitmq_app_user_password }}"
+    permissions:
+      - vhost: "{{ rabbitmq_vhost }}"
+        configure_priv: .*
+        read_priv: .*
+        write_priv: .*
+    update_password: always
+    state: present
+  no_log: true
+  run_once: true
+  delegate_to: "{{ rabbitmq_seed_node }}"
+
+# 預設帳號必刪：guest/guest 是全世界都知道的帳密。雖然 RabbitMQ 預設限制
+# guest 只能從 localhost 登入，但「限制存取」不如「不存在」——直接移除
+- name: 移除預設 guest 帳號
+  community.rabbitmq.rabbitmq_user:
+    user: guest
+    state: absent
+  run_once: true
+  delegate_to: "{{ rabbitmq_seed_node }}"
+
+# 死信 exchange 用 fanout：所有過期/被拒的訊息不分 routing key 全部
+# 廣播到綁定的 DLQ，拓撲最簡單、不會漏訊息
+- name: 建立死信 exchange（fanout、durable）
+  community.rabbitmq.rabbitmq_exchange:
+    name: "{{ rabbitmq_dlx_exchange }}"
+    exchange_type: fanout
+    durable: true
+    vhost: "{{ rabbitmq_vhost }}"
+    login_user: admin
+    login_password: "{{ rabbitmq_admin_password }}"
+    login_host: "{{ ansible_host }}"  # management 綁節點 IP（見 rabbitmq.conf.j2），loopback 連不到
+    login_port: "{{ rabbitmq_management_port }}"
+    state: present
+  no_log: true
+  run_once: true
+  delegate_to: "{{ rabbitmq_seed_node }}"
+
+# quorum queue（raft 多數複寫）是 4.x 的 HA 標準解，取代已淘汰的 classic
+# mirrored queue；x-queue-type 只能在「建立時」指定，事後不可改。
+# item.dlx 非空才附掛 x-dead-letter-exchange（dlq 自己不再掛 DLX，
+# 避免死信循環）。no_log 是因為 task 參數含 admin 密碼
+- name: 建立 quorum queues
+  community.rabbitmq.rabbitmq_queue:
+    name: "{{ item.name }}"
+    durable: true
+    arguments: >-
+      {{ {'x-queue-type': 'quorum'}
+         | combine({'x-dead-letter-exchange': item.dlx}
+                   if (item.dlx | default('') | length > 0) else {}) }}
+    vhost: "{{ rabbitmq_vhost }}"
+    login_user: admin
+    login_password: "{{ rabbitmq_admin_password }}"
+    login_host: "{{ ansible_host }}"  # management 綁節點 IP（見 rabbitmq.conf.j2），loopback 連不到
+    login_port: "{{ rabbitmq_management_port }}"
+    state: present
+  loop: "{{ rabbitmq_queues }}"
+  no_log: true
+  run_once: true
+  delegate_to: "{{ rabbitmq_seed_node }}"
+
+# fanout exchange 忽略 routing key，routing_key 用模組預設值即可
+- name: 綁定死信 exchange 到 DLQ
+  community.rabbitmq.rabbitmq_binding:
+    name: "{{ rabbitmq_dlx_exchange }}"
+    destination: "{{ rabbitmq_dlq_queue }}"
+    destination_type: queue
+    vhost: "{{ rabbitmq_vhost }}"
+    login_user: admin
+    login_password: "{{ rabbitmq_admin_password }}"
+    login_host: "{{ ansible_host }}"  # management 綁節點 IP（見 rabbitmq.conf.j2），loopback 連不到
+    login_port: "{{ rabbitmq_management_port }}"
+    state: present
+  no_log: true
+  run_once: true
+  delegate_to: "{{ rabbitmq_seed_node }}"

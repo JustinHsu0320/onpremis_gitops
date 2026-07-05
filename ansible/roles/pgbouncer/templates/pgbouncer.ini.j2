@@ -1,0 +1,92 @@
+; =============================================================================
+; /etc/pgbouncer/pgbouncer.ini — {{ ansible_managed }}
+;
+; 本檔由 Ansible role `pgbouncer` 管理，手改必被覆蓋。
+;
+; 【架構定位】（junior 必讀）
+;   app ──TLS──> HAProxy(VIP {{ pgbouncer_vip }}:6432/6433 TCP passthrough)
+;       ──TLS──> 本機 PgBouncer({{ pgbouncer_port }}) ──明文迴環──> 本機 PG(5432)
+;
+;   分層原則：HAProxy 管「路由到誰」（用 Patroni REST /primary、/replica
+;   健檢決定把 RW 流量丟給 leader 節點、RO 丟給 replica 節點的 PgBouncer）；
+;   PgBouncer 管「連線池」（把上千個短命 app 連線壓成少量長命 PG 連線）。
+;   所以下面 [databases] 永遠只指向 127.0.0.1——本機 PG 是什麼角色，
+;   PgBouncer 不知道、也不需要知道。
+; =============================================================================
+
+[databases]
+; 只連「本機」PostgreSQL。若本機是 replica，HAProxy 的 RW 健檢自然不會把
+; 寫入流量送進來；千萬不要在這裡寫 VIP 或別台主機（會造成路由迴圈/腦裂風險）。
+{{ pg_app_db }} = host={{ pgbouncer_backend_host }} port={{ pgbouncer_backend_port }} dbname={{ pg_app_db }}
+
+[pgbouncer]
+; ---------- 監聽 ----------
+; 0.0.0.0：HAProxy 從節點 IP 打進來 + 本機健檢走迴環，兩者都要通
+listen_addr = {{ pgbouncer_listen_addr }}
+listen_port = {{ pgbouncer_port }}
+; unix socket 與 PostgreSQL 共用目錄（PgBouncer 會建 .s.PGSQL.{{ pgbouncer_port }}，
+; 與 PG 的 .s.PGSQL.5432 不衝突）；本機管理/除錯可 psql -p {{ pgbouncer_port }} 直連
+unix_socket_dir = /var/run/postgresql
+
+; ---------- 客戶端驗證 ----------
+; SCRAM：與 PG18 的預設密碼雜湊法一致，杜絕 md5 弱雜湊
+auth_type = scram-sha-256
+; userlist.txt 只放 pgbouncer_auth / pgbouncer_admin 兩個「內部帳號」；
+; 一般使用者（如 {{ pg_app_user }}）改由下面的 auth_query 動態查——
+; 好處：app 使用者改密碼只要改 PG，不用重佈 userlist（少一個機密散佈點）
+auth_file = /etc/pgbouncer/userlist.txt
+; auth_query 用這個低權身分連 PG 執行（僅有 EXECUTE pgbouncer.get_auth 的權限）
+auth_user = {{ pgbouncer_auth_user }}
+; auth_query 固定打這個 db（而不是跟著客戶端要連的 db 跑）
+auth_dbname = {{ pg_app_db }}
+; SECURITY DEFINER 函式：只回傳「單一使用者」的驗證資訊，
+; 避免 auth_user 需要讀整張 pg_shadow 的過大權限（函式由 patroni role 佈建）
+auth_query = SELECT username, password FROM pgbouncer.get_auth($1)
+
+; ---------- 連線池 ----------
+; transaction pooling：交易一結束連線即歸還池子，利用率最高。
+; 【代價/限制，app 開發者必知】任何「跨交易的 session 狀態」都不可靠：
+;   - 具名 prepared statements（協定層 PREPARE）：下一個交易可能拿到別條連線
+;   - advisory locks（session 級）：鎖在哪條連線上根本說不準
+;   - SET/SET SESSION、LISTEN/NOTIFY、暫存表（session 級）同理
+; app 端請用 SET LOCAL / 交易內 advisory lock（pg_advisory_xact_lock）替代。
+pool_mode = {{ pgbouncer_pool_mode }}
+; 收多少客戶端連線（前門，便宜：每條只是 fd + 少量記憶體）
+max_client_conn = {{ pgbouncer_max_client_conn }}
+; 對後端 PG 的常態池大小（後門，昂貴：每條是一個 PG backend process）
+default_pool_size = {{ pgbouncer_default_pool_size }}
+; 常駐熱連線下限：離峰後第一波請求不吃 TCP+SCRAM 建連延遲
+min_pool_size = {{ pgbouncer_min_pool_size }}
+; 池滿時可再借用的緩衝連線（撐突發尖峰）
+reserve_pool_size = {{ pgbouncer_reserve_pool_size }}
+; 【刻意留空】server_reset_query 預設是 DISCARD ALL，但那是給 session pooling
+; 用的（客戶端斷線時清 session 狀態）。transaction pooling 下：
+;   1) 官方文件明言 reset query 在 transaction 模式沒有意義——
+;      app 本來就「不可以」依賴任何 session 狀態（見上面 pool_mode 註解）；
+;   2) 若真的每次歸還都 DISCARD ALL，等於每個交易多一個 round-trip，
+;      把 pooling 省下來的延遲又吐回去。
+; 所以留空 = 明確宣告「我們走 transaction 語意，不假裝能清乾淨 session」。
+server_reset_query =
+; 各家驅動（JDBC/psycopg/Npgsql）愛送 extra_float_digits 這個 startup 參數，
+; PgBouncer 不認得就會拒連——忽略它（PG 端行為不受影響）
+ignore_startup_parameters = extra_float_digits
+
+; ---------- 管理/統計 ----------
+; 只有 pgbouncer_admin 能連管理 console（psql -p {{ pgbouncer_port }} pgbouncer）
+; 下 SHOW POOLS / SHOW STATS / RELOAD；一般 app 帳號進不來
+admin_users = {{ pgbouncer_admin_user }}
+stats_users = {{ pgbouncer_admin_user }}
+
+; ---------- TLS ----------
+; 【客戶端側：強制 TLS】流量從 app 跨 VLAN 20→30 而來，線路上必須加密。
+; require：客戶端必須用 TLS，但不強制客戶端憑證（app 用帳密+SCRAM 驗身分；
+; 99-verify 以 sslmode=verify-full 驗我們的伺服器憑證鏈與主機名）。
+client_tls_sslmode = require
+; 憑證 SAN 涵蓋 pgbouncer-vip.{{ domain }} / VIP IP / 本機名（pki_leaf 簽發）
+client_tls_cert_file = {{ pki_dir }}/pgbouncer-server.crt
+client_tls_key_file = {{ pki_dir }}/pgbouncer-server.key
+client_tls_ca_file = {{ pki_dir }}/ca.crt
+; 【伺服器側：刻意不開 TLS】PgBouncer→PG 走 127.0.0.1 迴環，封包不出網卡、
+; 不過交換器，竊聽面 = 已經 root 的本機——TLS 在這裡只剩 CPU 開銷沒有安全增益。
+; 安全取捨記錄：若未來 PgBouncer 與 PG 拆到不同主機，此假設立刻失效，
+; 必須補 server_tls_sslmode = verify-full。

@@ -1,0 +1,89 @@
+---
+# =============================================================================
+# pki_leaf — 全站葉憑證簽發 + 內部 CA 信任派送（所有主機都跑）
+#
+# 安全模型（規劃書 §5，本 role 最重要的設計）：
+#   - 私鑰在目標主機本地生成，「永不離開」該主機——不經 controller、不經 mgmt-01
+#   - mgmt-01 只經手兩種公開資訊：CSR（去程）與簽好的憑證（回程），
+#     皆以 slurp/copy 內容傳遞、不落地 controller 磁碟
+#   - 這樣就算 mgmt-01 或 Ansible 主機被入侵，攻擊者也拿不到任何服務私鑰，
+#     只能拿到「本來就會公開派送」的憑證
+#
+# 跨 role 契約（CONVENTIONS.md §5）：
+#   - 憑證/私鑰/bundle 任一有 changed → set_fact pki_certs_changed=true，
+#     各 TLS 服務 role 據此 notify 自己的 restart/reload handler
+# =============================================================================
+
+# pki_dir 0755：目錄本身要讓各服務帳號（postgres/etcd/rabbitmq…）能進來讀
+# 自己的憑證；機密保護做在「檔案」層級（key 0640/0600），不是目錄層級
+- name: 建立 PKI 目錄
+  ansible.builtin.file:
+    path: "{{ pki_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+# ---------------------------------------------------------------------------
+# CA chain 派送（每台主機都要，無論有沒有要簽的葉憑證）
+# ---------------------------------------------------------------------------
+# run_once + delegate：chain 全站同一份，只需向簽發主機讀一次，
+# register 的結果在同一個 play 的所有主機上都可引用（linear strategy 的特性）
+- name: 從簽發主機讀取 CA chain
+  ansible.builtin.slurp:
+    src: "{{ pki_leaf_ca_chain_src }}"
+  delegate_to: "{{ internal_ca_host }}"
+  run_once: true
+  register: pki_leaf_ca_chain
+
+# ca.crt 是各服務設定檔（postgresql.conf ssl_ca_file、etcd trusted-ca-file、
+# HAProxy ca-file…）統一引用的驗證錨點（CONVENTIONS.md §4 路徑契約）
+- name: 派送 CA chain 至 pki_dir/ca.crt
+  ansible.builtin.copy:
+    content: "{{ pki_leaf_ca_chain.content | b64decode }}"
+    dest: "{{ pki_dir }}/ca.crt"
+    owner: root
+    group: root
+    mode: "0644"
+  register: pki_leaf_ca_crt_result
+
+# 放進 /usr/local/share/ca-certificates/ 再跑 update-ca-certificates，
+# 內部 CA 就進了系統信任庫（/etc/ssl/certs/ca-certificates.crt）——
+# curl、psql、docker pull（內部 registry）等系統工具從此免帶 --cacert 參數
+- name: 安裝內部 CA 為系統信任錨
+  ansible.builtin.copy:
+    content: "{{ pki_leaf_ca_chain.content | b64decode }}"
+    dest: "{{ pki_leaf_trust_anchor }}"
+    owner: root
+    group: root
+    mode: "0644"
+  register: pki_leaf_trust_result
+
+# 只有信任錨檔案真的變了才需要重建信任庫（changed 狀態依前一步而定 → 冪等）。
+# noqa 理由：不能用 handler——handler 到 play 結尾才 flush，但同一次執行中
+# 後續的簽發/驗證 task 可能立刻就要依賴系統信任庫，必須「當下」更新
+- name: 更新系統 CA 信任庫 # noqa: no-handler
+  ansible.builtin.command:
+    cmd: update-ca-certificates
+  when: pki_leaf_trust_result is changed
+  changed_when: true
+
+# ---------------------------------------------------------------------------
+# 逐張簽發葉憑證（pki_certificates 為空的主機自動略過整個迴圈）
+# ---------------------------------------------------------------------------
+- name: 逐張簽發葉憑證
+  ansible.builtin.include_tasks: issue_cert.yml
+  loop: "{{ pki_certificates | default([]) }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+# 【契約】ca.crt 內容變更（例如 Issuing CA 輪替後）也視為憑證異動：
+# 所有做雙向驗證的服務都得 reload 才會採用新 chain。
+# 「只在 true 時 set_fact、否則不定義」的寫法，讓下游 role 一律以
+# pki_certs_changed | default(false) 讀取，避免字串型布林的坑。
+# noqa 理由：pki_certs_changed 是 CONVENTIONS.md §5 的跨 role 契約 fact 名，
+# 不可加 role 前綴；set_fact 也不是 handler 能取代的（fact 要給後續 play 用）
+- name: 契約 fact：CA chain 異動視為憑證變更 # noqa: var-naming[no-role-prefix] no-handler
+  ansible.builtin.set_fact:
+    pki_certs_changed: true
+  when: pki_leaf_ca_crt_result is changed

@@ -1,0 +1,178 @@
+{#
+  prometheus.yml.j2 — Prometheus 主設定（抓誰、多久抓一次、告警送哪）
+
+  設計原則（junior 必讀）：
+    - 全部 static_configs：13 台主機、名單由 inventory 這個「唯一事實來源」
+      展開（groups[...] + hostvars[h].ansible_host），不硬編任何 IP——
+      機器增減改 hosts.yml 重跑本 playbook 即可，不需要 service discovery。
+    - 每個 target 帶 instance=<inventory 主機名> label：告警與儀表板上看到
+      「pg-02」遠比「10.20.30.12:9100」可讀。Prometheus 規則：target 已帶
+      instance label 時，不會再用 __address__ 覆寫它。
+#}
+# ===== {{ ansible_managed }} =====
+global:
+  # 15s 抓取 / 15s 規則評估：規模小、成本可忽略，又足夠餵 for: 1m~3m 的告警
+  scrape_interval: {{ monitoring_scrape_interval }}
+  evaluation_interval: {{ monitoring_evaluation_interval }}
+
+# 告警規則檔（與本檔一起唯讀掛進容器 /etc/prometheus）
+rule_files:
+  - /etc/prometheus/rules.yml
+
+# 觸發的告警送往同 compose 網路的 alertmanager（以 service 名解析）
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:{{ monitoring_alertmanager_port }}"]
+
+scrape_configs:
+  # ---------- job: prometheus —— 自我監控 ----------
+  # Prometheus 抓自己：TSDB 大小、抓取延遲、規則評估耗時。
+  # 監控系統本身死掉沒人知道是最糟的盲區，至少 up{job="prometheus"} 要有
+  # （Prometheus 整個掛掉的情境由 Grafana 連不上 datasource 兜底發現）。
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:{{ monitoring_prometheus_port }}"]
+        labels:
+          instance: {{ inventory_hostname }}
+
+  # ---------- job: node —— 全主機 OS/硬體指標（node_exporter :9100） ----------
+  # 涵蓋 groups['all'] 每一台（60-monitoring.yml 已把 node_exporter 佈到全站）；
+  # CPU / 記憶體 / 磁碟 / 網路的基礎盤，NodeFilesystemAlmostFull 等規則的資料源
+  - job_name: node
+    static_configs:
+{% for h in groups['all'] | sort %}
+      - targets: ["{{ hostvars[h].ansible_host }}:{{ monitoring_node_exporter_port }}"]
+        labels:
+          instance: {{ h }}
+{% endfor %}
+
+  # ---------- job: patroni —— PG HA 拓撲指標（Patroni REST :8008 /metrics） ----------
+  # GET 端點免認證（CONVENTIONS.md §3）；patroni_master / patroni_replica 等
+  # gauge 由此而來，是 PatroniClusterNoLeader 告警的資料源
+  - job_name: patroni
+    metrics_path: /metrics
+    static_configs:
+{% for h in groups['postgres'] | sort %}
+      - targets: ["{{ hostvars[h].ansible_host }}:{{ patroni_rest_port }}"]
+        labels:
+          instance: {{ h }}
+{% endfor %}
+
+  # ---------- job: rabbitmq —— 佇列/節點指標（rabbitmq_prometheus plugin :15692） ----------
+  # RabbitMQ 4.x 內建 prometheus plugin，queue 深度、連線數、記憶體 watermark
+  # 全在這；rabbitmq_identity_info 是 RabbitNodeDown 告警的資料源
+  - job_name: rabbitmq
+    metrics_path: /metrics
+    static_configs:
+{% for h in groups['rabbitmq'] | sort %}
+      - targets: ["{{ hostvars[h].ansible_host }}:{{ monitoring_rabbitmq_metrics_port }}"]
+        labels:
+          instance: {{ h }}
+{% endfor %}
+
+  # ---------- job: haproxy —— 三組 LB 的後端健康（內建 :8404 /metrics） ----------
+  # HAProxy 跑在三個地方（CONVENTIONS.md §1）：lb（邊界 443/465）、
+  # postgres（PgBouncer VIP RW/RO 分流）、rabbitmq（AMQPS VIP）——
+  # 後端 server UP/DOWN、佇列、連線數是「VIP 後面還剩幾台活的」的直接證據
+  - job_name: haproxy
+    metrics_path: /metrics
+    static_configs:
+{% for h in (groups['lb'] + groups['postgres'] + groups['rabbitmq']) | sort %}
+      - targets: ["{{ hostvars[h].ansible_host }}:{{ monitoring_haproxy_metrics_port }}"]
+        labels:
+          instance: {{ h }}
+{% endfor %}
+
+  # ---------- job: etcd —— DCS 健康與 raft 狀態（規劃書 §9） ----------
+  # 抓 etcd 的獨立 metrics 端點（明文 2381，見 etcd role 的 ETCD_LISTEN_METRICS_URLS）。
+  # 關鍵指標：etcd_server_has_leader（無 leader = quorum 出事）、
+  # etcd_server_leader_changes_seen_total（頻繁換主 = 網路/磁碟抖動）、
+  # etcd_disk_wal_fsync_duration_seconds（fsync 延遲直接決定 Patroni 穩定度，§2.1）
+  - job_name: etcd
+    metrics_path: /metrics
+    static_configs:
+{% for h in groups['etcd'] | sort %}
+      - targets: ["{{ hostvars[h].ansible_host }}:{{ monitoring_etcd_metrics_port }}"]
+        labels:
+          instance: {{ h }}
+{% endfor %}
+
+  # ---------- job: keydb —— 快取叢集健康（規劃書 §9：redis_exporter） ----------
+  # 每台 app 節點的 redis_exporter（連本機 master）。關鍵指標：
+  # redis_up（節點死活）、redis_connected_slaves（← 審查點名：master 失去 replica
+  # 備援時這個掉到 0，配合下方 rules 的 KeyDBMasterNoReplica 告警，
+  # 補上「replica 失效卻靜默運行」的偵測盲點）、redis_memory_used_bytes
+  - job_name: keydb
+    metrics_path: /metrics
+    static_configs:
+{% for h in groups['keydb'] | sort %}
+      - targets: ["{{ hostvars[h].ansible_host }}:{{ monitoring_keydb_exporter_port }}"]
+        labels:
+          instance: {{ h }}
+{% endfor %}
+
+  # ---------- job: blackbox-https —— 使用者視角的端到端 HTTPS 探測 ----------
+  # 探 https://svc-api.{{ domain }}/health：一次驗完 VIP 漂移、HAProxy TLS 終止、
+  # 憑證有效性（probe_ssl_earliest_cert_expiry → CertExpirySoon）、後端 app 分流。
+  # relabel 三步驟是 blackbox exporter 的標準接法：
+  #   1. 原 target（URL）塞進 /probe 的 ?target= 查詢參數
+  #   2. instance 改回 URL——否則全部探測的 instance 都是 blackbox:9115，告警分不清探誰
+  #   3. 實際抓取位址改成 compose 網路內的 blackbox 服務（service 名解析）
+  # blackbox 容器對 svc-api 等內部名稱的解析由 compose 的 extra_hosts 提供
+  # （與主機 /etc/hosts 相同的 VIP 條目，見 docker-compose.yml.j2）
+  - job_name: blackbox-https
+    metrics_path: /probe
+    params:
+      module: [http_2xx_internal_ca]
+    static_configs:
+      - targets: ["https://svc-api.{{ domain }}/health"]
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: "blackbox:{{ monitoring_blackbox_port }}"
+
+  # ---------- job: blackbox-amqps —— AMQPS VIP 的 TCP+TLS 探測 ----------
+  # 探 rabbitmq-vip:5671 的 TLS 握手（不講 AMQP 協定）：驗 VIP 可達 +
+  # rabbitmq-server 憑證有效；同樣產出 probe_ssl_earliest_cert_expiry，
+  # 讓 CertExpirySoon 一條規則同時覆蓋 svc-api 與 rabbitmq 兩張憑證
+  - job_name: blackbox-amqps
+    metrics_path: /probe
+    params:
+      module: [tcp_tls_internal_ca]
+    static_configs:
+      - targets: ["rabbitmq-vip.{{ domain }}:{{ rabbitmq_amqps_port }}"]
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: "blackbox:{{ monitoring_blackbox_port }}"
+
+  # ---------- job: blackbox-vip-tcp —— 其餘兩個 VIP 的可達性探測 ----------
+  # 補齊規劃書 §9 的「VIP 位置告警」：pgbouncer VIP(6432) 與 egress VIP(3128)
+  # 之前完全沒有端到端探測——VI_PG 兩側 keepalived 同亡、或 egress 全斷（§4 點名
+  # 要消除的 SPOF）時監控全靜默。這兩個都用 tcp_connect（純 TCP 可達性）：
+  #   - pgbouncer 6432 的 TLS 是 PG 協定的 STARTTLS 式（先明文 SSLRequest 再升級），
+  #     不是 implicit TLS，blackbox 的 tcp+tls 握不了手 → 只驗 TCP 可達即可
+  #   - egress 3128 是明文 HTTP proxy 埠，本就 tcp_connect
+  # 探測失敗 → 下方 rules 的 ProbeFailed 告警（涵蓋「VIP 沒人持有」的主要故障）
+  - job_name: blackbox-vip-tcp
+    metrics_path: /probe
+    params:
+      module: [tcp_connect]
+    static_configs:
+      - targets:
+          - "pgbouncer-vip.{{ domain }}:{{ pgbouncer_port }}"
+          - "egress-proxy.{{ domain }}:{{ squid_port }}"
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: "blackbox:{{ monitoring_blackbox_port }}"

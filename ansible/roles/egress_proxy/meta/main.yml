@@ -1,0 +1,20 @@
+---
+# =============================================================================
+# roles/egress_proxy/meta/main.yml
+# =============================================================================
+galaxy_info:
+  author: email-proxy-infra
+  description: >-
+    Squid 顯式白名單正向代理（規劃書 §4）：地端環境唯一合法出網通道。
+    預設拒絕、白名單放行（dstdomain 檔案由 egress_allowlist 驅動）、
+    combined access log 留稽核軌跡；VIP 漂移由 keepalived role 負責。
+  license: MIT
+  min_ansible_version: "2.16"
+  platforms:
+    - name: Ubuntu
+      versions:
+        - all
+
+# VI_EGRESS 的 keepalived 設定在 40-lb.yml 已一併套用（一台主機一份設定檔），
+# 41-egress.yml 只跑本 role；順序由 site.yml 保證，不用 meta dependencies 硬綁
+dependencies: []

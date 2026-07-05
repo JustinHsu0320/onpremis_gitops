@@ -1,0 +1,33 @@
+---
+# =============================================================================
+# group_vars/nfs.yml — 儲存層（NFSv4.1，v4-only：只需開 2049 單一 port）
+# =============================================================================
+
+# ---------- 資料碟（block_storage role；lab 因 is_container 跳過） ----------
+# 對應 terraform 的 nfs disk1-attachments（1024G）。所有 NFS 匯出（附件 + PG 備份庫）
+# 都在 /export 底下 —— 把這顆大碟掛到 /export，附件與備份才不會塞爆 40G OS 碟
+storage_volumes:
+  - { mountpoint: /export, size_gb: 1024 }
+
+# 匯出清單：clients 限定到「真正需要的網段」，這就是儲存層的防火牆第一道
+#
+# all_squash + anonuid/anongid=1000 的設計說明：
+#   不同節點上的服務帳號 UID 各不相同（root、postgres≈113、app 容器 1000…），
+#   NFSv3/4 的 AUTH_SYS 是「數字 UID 直通」——與其祈禱各機 UID 對齊，
+#   不如把所有客戶端身分統一映射成 1000:1000（附件/備份檔案的唯一擁有者）。
+#   安全上也更好：即使某台客戶端被入侵拿到 root，在 NFS 上也只是 1000。
+nfs_exports:
+  # 附件共享：只有應用層網段可掛（統一以 UID 1000 讀寫）
+  - path: "{{ nfs_attachments_export }}"
+    clients: "{{ nfs_attachments_clients }}"
+    options: "rw,sync,no_subtree_check,all_squash,anonuid=1000,anongid=1000"
+    owner: "1000"
+    group: "1000"
+    mode: "0770"
+  # PG 備份庫（pgBackRest repo）：只有資料層網段可掛
+  - path: "{{ nfs_pgbackup_export }}"
+    clients: "{{ nfs_pgbackup_clients }}"
+    options: "rw,sync,no_subtree_check,all_squash,anonuid=1000,anongid=1000"
+    owner: "1000"
+    group: "1000"
+    mode: "0770"

@@ -1,0 +1,45 @@
+---
+# =============================================================================
+# group_vars/lb.yml — 邊界層（HAProxy + Keepalived + Squid egress 同居）
+# =============================================================================
+
+# haproxy role 是「一份 role、三種面孔」：以 profile 選擇組態模板（CONVENTIONS.md §8）
+haproxy_profile: edge
+
+# ---------- PKI：443 終止用的服務憑證 ----------
+# bundle_pem=true → 額外產出 svc-api.pem（crt+chain+key 串接），HAProxy 的 crt 參數要吃這種格式
+pki_certificates:
+  - name: svc-api
+    profile: server
+    owner: root
+    group: root
+    key_mode: "0600"
+    # 用戶端連的是 svc-api.<domain>（VIP），不是 lb-01/02 本名，
+    # 所以 SAN 必須含 VIP 名稱與 VIP IP，否則 TLS 驗證會失敗
+    cn: "svc-api.{{ domain }}"
+    extra_sans:
+      - "DNS:svc-api.{{ domain }}"
+      - "DNS:svc-api"
+      - "IP:{{ service_vip }}"
+    bundle_pem: true
+
+# ---------- Keepalived：一台主機一份設定檔，所有 VRRP instance 集中定義 ----------
+# vrid 配置表（全網段內不可重複）：VI_SVC=10 / VI_EGRESS=12 / VI_PG=30 / VI_MQ=31
+keepalived_instances:
+  - name: VI_SVC
+    vrid: 10
+    vip: "{{ service_vip }}"
+    state: "{{ keepalived_state }}"          # host_vars：lb-01=MASTER / lb-02=BACKUP
+    priority: "{{ keepalived_priority }}"    # host_vars：150 / 100
+    auth_pass: "{{ vrrp_pass_svc }}"
+    peers_group: lb                          # 單播 VRRP 的對象群組（ADR-7）
+    track_haproxy: true                      # HAProxy 死掉 → priority -50 → VIP 漂移
+  - name: VI_EGRESS
+    vrid: 12
+    vip: "{{ egress_vip }}"
+    state: "{{ keepalived_state }}"
+    priority: "{{ keepalived_priority }}"
+    auth_pass: "{{ vrrp_pass_egress }}"
+    peers_group: lb
+    track_haproxy: false                     # egress VIP 跟著 Squid，不跟 HAProxy
+    track_squid: true

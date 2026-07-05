@@ -1,0 +1,24 @@
+---
+# =============================================================================
+# roles/app_stack/handlers/main.yml
+# =============================================================================
+
+# 為什麼 recreate: always 而不是 restart？
+#   .env（env_file 只在容器「建立」時讀）與掛進去的憑證檔，內容變了
+#   docker compose 偵測不到（它只比對 image 與容器設定），單純 restart
+#   會讓容器帶著舊環境變數復活——必須 recreate 才會重讀新 .env / 新憑證。
+#
+# 為什麼 build 在 mock 模式設 always？
+#   mock 程式碼（mock_service.py / Dockerfile）變更時要先 rebuild 映像，
+#   recreate 出來的容器才是新程式；prod 走 registry pull，維持預設 policy。
+#
+# 滾動影響（junior 必讀）：本 handler 會同時重建本機的 api/worker/smtp
+#   三個容器，這台節點瞬間離線。50-app.yml 已用 serial: 1 一次只動一台，
+#   LB 健檢（fall 3）自動摘除/回掛——切勿改成全平行執行。
+- name: Restart email-proxy
+  community.docker.docker_compose_v2:
+    project_src: "{{ app_stack_home }}"
+    state: present
+    recreate: always
+    build: "{{ 'always' if app_stack_mock else 'policy' }}"
+  listen: restart email-proxy

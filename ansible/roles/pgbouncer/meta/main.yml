@@ -1,0 +1,20 @@
+---
+# =============================================================================
+# roles/pgbouncer/meta/main.yml
+# =============================================================================
+galaxy_info:
+  author: email-proxy-infra
+  description: >-
+    PgBouncer transaction-pooling 連線池（本機 PG 前置；上層 HAProxy 依
+    Patroni 角色分流 RW/RO），客戶端 TLS + SCRAM + auth_query 動態驗證。
+  license: MIT
+  min_ansible_version: "2.16"
+  platforms:
+    - name: Ubuntu
+      versions:
+        - all
+
+# 執行順序依賴（patroni 先起、pki_leaf 先簽好 pgbouncer-server 憑證）
+# 由 30-postgres.yml / site.yml 的 play 順序保證，不用 meta dependencies
+# 硬綁——硬綁會讓 --tags pgbouncer 單跑時把整個 patroni role 拖進來。
+dependencies: []

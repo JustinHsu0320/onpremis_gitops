@@ -1,0 +1,372 @@
+---
+# =============================================================================
+# .gitlab-ci.yml — email_proxy infra monorepo 的 GitOps 核心管線
+#
+# 設計原則（第一次接手的人必讀）：
+#   1. stages 固定四段：lint → validate → plan → apply
+#      - lint / validate：MR 與 main push 自動跑，快速失敗、零副作用
+#      - plan：產出「將要改什麼」的證據（terraform plan / ansible --check --diff）
+#      - apply：唯一會動到 prod 的階段——只在 main、只能手動按。
+#        GitOps 紀律：plan 的輸出沒有被人看過之前，任何自動化都不准碰生產環境。
+#   2. rules:changes 分流：terraform/**、ansible/**、argocd/** 各走各的 job，
+#      改一行 README 不會觸發整條管線（monorepo 的基本禮貌）。
+#   3. CI 盡量重用 Makefile 目標（make lint / make syntax / make deps），確保
+#      「工程師本機跑的檢查」與「CI 跑的檢查」永遠是同一份邏輯，不會分岔。
+#      例外：make tf-validate / make argocd-validate 是用 docker run 包官方
+#      image——docker executor 裡沒有 DinD（刻意不開 privileged，理由見
+#      gitlab/ci-templates/docker-build.gitlab-ci.yml 的安全註解），所以 CI
+#      直接以對應官方 image 作為 job image，執行完全相同的指令。
+#
+# Runner：docker executor、tag `onprem-docker`（VLAN 50 的 runner-01）。
+# 對外套件來源（PyPI / Ansible Galaxy）需經 Squid egress 白名單（CONVENTIONS.md
+# §3）放行 pypi.org / files.pythonhosted.org / galaxy.ansible.com，
+# 或改指內部 mirror（devpi / Nexus）——離線環境的正解。
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# workflow：整條 pipeline 的准入規則（避免 MR pipeline + branch pipeline 重複跑）
+#   - merge_request_event：MR 管線（lint / validate / plan 供 review）
+#   - push 到 main：完整管線（含 manual 的 apply 階段）
+#   - trigger：email_proxy app repo 透過 Pipeline Trigger API 觸發的
+#     「部署新映像」管線（ADR-6，見檔尾 ansible-deploy-app）
+#   - web：允許從 GitLab UI 手動起管線（維運救火 / 重跑 apply 的通道）
+# -----------------------------------------------------------------------------
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == "trigger"
+    - if: $CI_PIPELINE_SOURCE == "web"
+
+stages: [lint, validate, plan, apply]
+
+default:
+  # 全部 job 綁地端 docker runner；不加 tag 的 job 會卡在 pending（沒有 shared runner）
+  tags: [onprem-docker]
+
+variables:
+  # pip 輸出乾淨一點（CI log 可讀性）
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+  # Terraform 工作目錄（與 Makefile 的 tf-validate 目標一致）
+  TF_DIR: terraform/environments/prod
+
+  # ===========================================================================
+  # GitLab-managed Terraform state（http backend）的 CI 變數注入
+  #
+  # terraform/environments/prod 的 backend 只需宣告「空的」http backend：
+  #     terraform { backend "http" {} }
+  # 其餘連線參數全部由下列 TF_HTTP_* 環境變數注入（terraform 原生支援
+  # http backend 的 TF_HTTP_* 環境變數覆寫）。好處：
+  #   - repo 內零機密、零寫死 URL：state 位址跟著 CI_PROJECT_ID 走
+  #   - state 集中在 GitLab（有版本、有鎖、有 UI：Operate → Terraform states）
+  #   - 認證用一次性的 CI_JOB_TOKEN，不需要長期憑證
+  # 本機要操作同一份 state 時（除錯用，平常不建議）：
+  #   terraform init -backend-config="address=https://gitlab.ptc-nec.com.tw/api/v4/projects/<id>/terraform/state/prod" \
+  #     -backend-config="username=<user>" -backend-config="password=<PAT>"
+  # ===========================================================================
+  TF_HTTP_ADDRESS: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/terraform/state/prod"
+  # 鎖端點：GitLab 以 POST /lock 取鎖、DELETE /lock 放鎖，防止兩條 pipeline
+  # 同時 plan/apply 打架（搭配下方 resource_group 雙保險）
+  TF_HTTP_LOCK_ADDRESS: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/terraform/state/prod/lock"
+  TF_HTTP_UNLOCK_ADDRESS: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/terraform/state/prod/lock"
+  TF_HTTP_LOCK_METHOD: "POST"
+  TF_HTTP_UNLOCK_METHOD: "DELETE"
+  # gitlab-ci-token + CI_JOB_TOKEN：job 存活期間有效的內建憑證，離開 job 即失效
+  TF_HTTP_USERNAME: "gitlab-ci-token"
+  TF_HTTP_PASSWORD: "${CI_JOB_TOKEN}"
+  # 撞鎖時的重試間隔（秒）：state 被別條 pipeline 鎖住時不要立刻放棄
+  TF_HTTP_RETRY_WAIT_MIN: "5"
+  # CI 模式：關互動、關彩色跳脫碼（artifact 的 plan 文字檔才乾淨）
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "0"
+
+# -----------------------------------------------------------------------------
+# rules:changes 的路徑清單（YAML anchor 重用；GitLab 的 changes glob 需要 **/*）
+# 以「.」開頭的頂層 key 是 hidden key，GitLab 不會把它當 job
+# -----------------------------------------------------------------------------
+.paths-ansible: &paths-ansible
+  - "ansible/**/*"
+  - "gitlab/**/*"        # CI 模板也是 YAML，改了要一起過 lint
+  - ".gitlab-ci.yml"
+  - ".yamllint"
+  - "Makefile"
+
+.paths-terraform: &paths-terraform
+  - "terraform/**/*"
+  - ".gitlab-ci.yml"
+
+.paths-argocd: &paths-argocd
+  - "argocd/**/*"
+  - ".gitlab-ci.yml"
+
+# 共用 rules（extends 用）：MR 與 main push 都要跑的自動檢查
+.rules-ansible-auto:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes: *paths-ansible
+    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes: *paths-ansible
+
+.rules-terraform-auto:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes: *paths-terraform
+    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes: *paths-terraform
+    # web 手動起管線也要有 plan——不然 apply 的 needs 會找不到上游 job
+    - if: $CI_PIPELINE_SOURCE == "web"
+
+.rules-argocd-auto:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes: *paths-argocd
+    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes: *paths-argocd
+
+# -----------------------------------------------------------------------------
+# Ansible 工具鏈基底：python:3.12 + pip 安裝 + collections
+# （anchor 讓部署 job 可以「先做這些、再加 SSH/vault 設定」，見 .ansible-deploy-base）
+# -----------------------------------------------------------------------------
+.ansible-base:
+  image: python:3.12
+  before_script: &ansible-toolchain
+    # 生產建議把版本釘進 constraints 檔或改用內部 devpi，避免 CI 工具鏈漂移；
+    # 這裡跟著上游走是為了範例簡潔
+    - pip install --quiet ansible-core ansible-lint yamllint
+    # collections 裝進 repo 內的 ansible/collections/（ansible.cfg 的
+    # collections_path），與本機 `make deps` 完全同路徑
+    - make deps
+    # ansible.cfg 的 vault_identity_list 引用 prod@.vault_pass；lint / syntax
+    # 不需要解密任何東西，但檔案不存在會出現警告噪音——放一個佔位檔。
+    # 真正的密碼只在部署 job 由 file variable 覆蓋（見 .ansible-deploy-base）
+    - '[ -f ansible/.vault_pass ] || echo "ci-placeholder" > ansible/.vault_pass'
+
+# =============================================================================
+# stage: lint —— 靜態風格檢查（最便宜、最快失敗）
+# =============================================================================
+
+# yamllint（全 repo）+ ansible-lint（playbooks/，會遞迴到 roles）
+# 完全重用 `make lint`：規則以 repo 根的 .yamllint 為準
+ansible-lint:
+  stage: lint
+  extends: [.ansible-base, .rules-ansible-auto]
+  script:
+    - make lint
+
+# =============================================================================
+# stage: validate —— 語法 / 結構驗證（比 lint 深一層，仍零副作用）
+# =============================================================================
+
+# playbook 語法檢查：prod 與 lab 兩套 inventory 都要過（= make syntax）
+ansible-syntax-check:
+  stage: validate
+  extends: [.ansible-base, .rules-ansible-auto]
+  script:
+    - make syntax
+
+# terraform fmt + validate（等價於 make tf-validate，只是不經 docker run——
+# 見檔頭原則 3 的說明）。hashicorp 官方 image 的 entrypoint 是 terraform
+# 本體，必須清空才能跑 shell script
+terraform-validate:
+  stage: validate
+  image:
+    name: hashicorp/terraform:1.9
+    entrypoint: [""]
+  extends: .rules-terraform-auto
+  script:
+    # validate 不需要 backend / state：-backend=false 讓 MR 檢查完全離線
+    - terraform -chdir="${TF_DIR}" init -backend=false -input=false
+    - terraform fmt -check -recursive terraform/
+    - terraform -chdir="${TF_DIR}" validate
+
+# K8s / ArgoCD manifests 結構驗證（等價於 make argocd-validate）。
+# kubeconform 的 -ignore-missing-schemas：ArgoCD 的 Application/AppProject 是
+# CRD，官方 schema 庫沒有；-strict 拒絕未知欄位（打錯字最常見的救命網）
+kubeconform-argocd:
+  stage: validate
+  image:
+    # 必須用 -alpine 變體：純 scratch 版沒有 shell，GitLab CI 的 script 跑不起來
+    name: ghcr.io/yannh/kubeconform:latest-alpine
+    entrypoint: [""]
+  extends: .rules-argocd-auto
+  script:
+    - /kubeconform -strict -ignore-missing-schemas -summary argocd/
+
+# =============================================================================
+# stage: plan —— 產出「將要改什麼」的證據，供人審閱
+# =============================================================================
+
+# terraform plan：MR 時跑（reviewer 看 artifact 的 tfplan.txt），main push 再跑
+# 一次（產生給 apply 用的二進位 plan 檔——artifact 不跨 pipeline，所以 main
+# 必須自己 plan 一份，這也保證 apply 的 plan 是基於合併後的最終程式碼）
+terraform-plan:
+  stage: plan
+  image:
+    name: hashicorp/terraform:1.9
+    entrypoint: [""]
+  extends: .rules-terraform-auto
+  needs: [terraform-validate]
+  script:
+    # 這次 init 要接 backend：TF_HTTP_* 變數（見檔頭 variables 區塊）自動生效
+    - terraform -chdir="${TF_DIR}" init -input=false
+    - terraform -chdir="${TF_DIR}" plan -input=false -out=tfplan
+    # 人類可讀版本存成文字檔：MR reviewer 直接下載看 diff，不用本機重跑
+    - terraform -chdir="${TF_DIR}" show -no-color tfplan > "${TF_DIR}/tfplan.txt"
+  artifacts:
+    # 注意：plan 檔可能內含敏感值（provider 憑證衍生的資源屬性），
+    # 專案可見性務必維持 private、artifact 存取僅限 project members
+    paths:
+      - ${TF_DIR}/tfplan
+      - ${TF_DIR}/tfplan.txt
+    expire_in: 7 days
+
+# ansible 乾跑（--check --diff）＝ Ansible 世界的 terraform plan。
+# main + manual：部署前先按這顆，看 diff 沒問題再按真正的 ansible-deploy
+ansible-deploy-check:
+  stage: plan
+  extends: .ansible-deploy-base
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes: *paths-ansible
+      when: manual
+      allow_failure: true      # manual 預覽 job 不該卡住 pipeline 的綠燈
+    - if: $CI_PIPELINE_SOURCE == "web"
+      when: manual
+      allow_failure: true
+  script:
+    - cd ansible
+    # 判讀提醒：check 模式在「資源還不存在」時會有誤報（例如依賴前一步
+    # 產物的 task、handler 觸發鏈），首次部署前的 check 僅供參考；
+    # 對既有環境的純設定變更，這個 diff 非常可靠
+    - ansible-playbook playbooks/site.yml --check --diff
+  environment:
+    name: production
+    action: prepare            # 只是預覽，不記成一次 deployment
+
+# =============================================================================
+# stage: apply —— 唯一會動到生產環境的階段（main + 手動 + environment 紀錄）
+# =============================================================================
+
+# terraform apply：
+#   - 只吃 plan 階段產出的二進位 plan 檔（apply tfplan）——按下去的內容
+#     「保證」就是你看過的那份 plan，不會因為 apply 當下重算而漂移
+#   - when: manual = GitOps 紀律的落點：「plan 看過才按」。
+#     沒有人審過 plan 的 apply 等於閉眼開車
+terraform-apply:
+  stage: apply
+  image:
+    name: hashicorp/terraform:1.9
+    entrypoint: [""]
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes: *paths-terraform
+      when: manual
+      allow_failure: true      # 不是每個 main commit 都要 apply；不擋綠燈
+    - if: $CI_PIPELINE_SOURCE == "web"
+      when: manual
+      allow_failure: true
+  needs: [terraform-plan]      # 下載 plan artifact（tfplan）
+  # resource_group：同一時間全 GitLab 只允許一個 job 動 prod 的 TF state
+  # （http backend 的鎖是第二道保險，這裡先在排程層就擋掉並行）
+  resource_group: terraform-prod
+  script:
+    - terraform -chdir="${TF_DIR}" init -input=false
+    - terraform -chdir="${TF_DIR}" apply -input=false tfplan
+  # environment：GitLab 的部署紀錄（誰、何時、哪個 commit 動了 production），
+  # 搭配 protected environment 可以再加「部署需二人核可」
+  environment:
+    name: production
+
+# -----------------------------------------------------------------------------
+# Ansible 部署基底：工具鏈 + SSH 金鑰 + vault 密碼
+#
+# 需要預先設定的 CI/CD Variables（Settings → CI/CD → Variables）：
+#   SSH_PRIVATE_KEY          type=File、Protected、（File 變數無法 Mask）
+#     內容 = 部署帳號的 ed25519 私鑰（貼上時結尾必須保留一個換行，
+#     否則 ssh-add 會報 invalid format——file variable 最常見的坑）
+#   SSH_KNOWN_HOSTS          type=File、Protected
+#     內容 = 在 mgmt-01 執行 `ssh-keyscan -H <全部主機>` 的輸出。
+#     ansible.cfg 的 host_key_checking = True（MITM 防護）不因 CI 而妥協：
+#     CI 跟人一樣，必須事先信任主機指紋，而不是關檢查
+#   ANSIBLE_VAULT_PASS_FILE  type=File、Protected
+#     內容 = prod vault 密碼（單行）。對應 ansible.cfg 的
+#     vault_identity_list = prod@.vault_pass
+# 三個變數都勾 Protected：只有 protected branch（main）的 job 拿得到，
+# feature branch / fork 的 MR 永遠碰不到生產憑證。
+# -----------------------------------------------------------------------------
+.ansible-deploy-base:
+  image: python:3.12
+  before_script:
+    # 先跑與 lint/syntax 完全相同的工具鏈安裝（anchor 展開，GitLab 會攤平巢狀清單）
+    - *ansible-toolchain
+    # --- SSH 私鑰 → ssh-agent（金鑰只進記憶體，不落地到 workspace）---
+    - eval "$(ssh-agent -s)"
+    - chmod 600 "${SSH_PRIVATE_KEY}"
+    - ssh-add "${SSH_PRIVATE_KEY}"
+    # --- known_hosts：滿足 host_key_checking = True ---
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    - install -m 0644 "${SSH_KNOWN_HOSTS}" ~/.ssh/known_hosts
+    # --- vault 密碼：放到 ansible.cfg 期待的相對路徑（ansible/.vault_pass）---
+    - install -m 0600 "${ANSIBLE_VAULT_PASS_FILE}" ansible/.vault_pass
+
+# ansible 真部署：main + manual。按之前先看 ansible-deploy-check 的 diff——
+# 這顆按鈕與 terraform-apply 遵守同一條紀律：「看過 plan 才按」
+ansible-deploy:
+  stage: apply
+  extends: .ansible-deploy-base
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes: *paths-ansible
+      when: manual
+      allow_failure: true
+    - if: $CI_PIPELINE_SOURCE == "web"
+      when: manual
+      allow_failure: true
+  # 同一時間只允許一條 pipeline 對 prod 跑 Ansible（滾動更新 serial:1 的
+  # 前提是「只有一個指揮官」）
+  resource_group: ansible-prod
+  timeout: 2h                  # site.yml 全跑（13 台）遠超預設 1h
+  script:
+    - cd ansible
+    # 不帶 -i = ansible.cfg 預設 prod inventory（防呆方向：預設值就是 prod，
+    # 見 ansible.cfg 的註解；CI 裡沒有 lab）
+    - ansible-playbook playbooks/site.yml
+  environment:
+    name: production
+
+# -----------------------------------------------------------------------------
+# ansible-deploy-app —— ADR-6 的下半段：app repo CI 觸發的映像更新部署
+#
+# 流程全貌：
+#   email_proxy app repo：test → build → kaniko 推 registry → curl 打
+#   本 repo 的 Pipeline Trigger API，帶 APP_IMAGE_TAG=<short-sha>
+#   → 本 job（rules 僅接受 trigger 來源）跑
+#     ansible-playbook playbooks/50-app.yml -e app_image_tag=<short-sha>
+#   → group_vars/all/vars.yml 的 app_images 契約
+#     （registry_host/email-proxy/{api,worker,smtp}:{{ app_image_tag }}）
+#     渲染出新 compose → 50-app.yml 的 serial: 1 配合 HAProxy 健檢滾動更新。
+#
+# 為什麼 app repo 不自己跑 ansible？權限最小化：inventory、vault 密碼、
+# SSH 金鑰只存在本 repo 的 CI context；app repo 只拿得到一個「只能觸發
+# 這條 pipeline」的 trigger token，打穿 app repo 也拿不到生產機的鑰匙。
+#
+# 自動執行（非 manual）是刻意的：映像 tag bump 屬於低風險、高頻率變更，
+# 且上游已過測試；要人工卡點就把 when 改 manual，或在 GitLab 把
+# production 設成 protected environment（需核可者放行）。
+# -----------------------------------------------------------------------------
+ansible-deploy-app:
+  stage: apply
+  extends: .ansible-deploy-base
+  rules:
+    # 只接受 Trigger API 來的 pipeline，且必須帶 APP_IMAGE_TAG（防呆：
+    # 沒帶 tag 的誤觸發不會啟動任何 job）
+    - if: $CI_PIPELINE_SOURCE == "trigger" && $APP_IMAGE_TAG
+  resource_group: ansible-prod
+  script:
+    - cd ansible
+    # 只跑 50-app.yml（不是整個 site.yml）：映像更新不需要動資料層 / LB，
+    # 部署面積越小、爆炸半徑越小
+    - ansible-playbook playbooks/50-app.yml -e "app_image_tag=${APP_IMAGE_TAG}"
+  environment:
+    name: production

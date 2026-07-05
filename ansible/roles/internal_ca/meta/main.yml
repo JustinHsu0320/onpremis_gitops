@@ -1,0 +1,13 @@
+---
+galaxy_info:
+  author: platform-team
+  description: 兩層式內部 CA（Root offline + Issuing on mgmt-01），email_proxy 全站 PKI 的信任根
+  company: PTC-NEC
+  license: MIT
+  min_ansible_version: "2.16"
+  platforms:
+    - name: Ubuntu
+      versions: ["all"]
+  galaxy_tags: [pki, tls, security]
+
+dependencies: []

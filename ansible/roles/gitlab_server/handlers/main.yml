@@ -1,0 +1,28 @@
+---
+# =============================================================================
+# roles/gitlab_server/handlers/main.yml
+# handler 定義順序即執行順序：reconfigure（Chef converge 全部元件設定）必須
+# 先於 nginx reload——順序反了 nginx 會 HUP 到「還沒被 reconfigure 修正」的
+# 舊設定。handler 名稱依契約用小寫（CONVENTIONS.md §8.6），對 ansible-lint
+# 的 name[casing] 加 noqa
+# =============================================================================
+
+# gitlab-ctl reconfigure = 執行 omnibus 內嵌的 Chef converge：
+# 「宣告期望狀態 → 只修正偏差」，本身即冪等、可重複執行無副作用。
+# changed 判斷困難（Chef 輸出沒有機器可讀的 changed 旗標）——依規格直接跑、
+# 一律視為 changed；反正只有 gitlab.rb 真的變更時才會被 notify，
+# 不會造成「每次重跑都 reconfigure」的冪等破口。
+# 命名為 reconfigure 而非契約字面的 reload：對 omnibus 而言
+# reconfigure「就是」設定重載的唯一正規手段（gitlab-ctl 沒有 reload 子命令）
+- name: reconfigure gitlab  # noqa: name[casing]
+  ansible.builtin.command:
+    cmd: gitlab-ctl reconfigure
+  changed_when: true
+
+# 憑證輪替只需要 nginx 重讀憑證檔（HUP 訊號），不必動整套 GitLab。
+# registry 的 5050 也是同一個 omnibus nginx 程序在服務——
+# 一次 HUP，gitlab 與 registry 兩個站台同時換上新憑證
+- name: reload gitlab nginx  # noqa: name[casing]
+  ansible.builtin.command:
+    cmd: gitlab-ctl hup nginx
+  changed_when: true

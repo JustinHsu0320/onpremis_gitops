@@ -1,0 +1,85 @@
+{#
+  docker-compose.yml.j2 — 每台 app 節點各跑 1 個 KeyDB master + 1 個 replica
+
+  為什麼用 host network？
+    Redis/KeyDB cluster 的節點位址是由節點自己 gossip 出去的
+    （cluster-announce-ip），bridge NAT 下「容器看到的自己」與
+    「別人連得到的位址」不一致，還要多開 bus 埠（服務埠+10000）的映射；
+    host network 一次消滅這兩個問題，埠直接綁在節點 IP 上。
+
+  機密注意：healthcheck 內含 keydb 密碼 → 本檔佈署 mode 0600 + no_log。
+#}
+# ===== {{ ansible_managed }} =====
+services:
+  keydb-master:
+    # 上游 eqalpha/keydb 沒有 multi-arch manifest，x86_64 / arm64 是
+    # 「兩個不同的 tag」——defaults/main.yml 依 ansible_architecture 挑選
+    image: "{{ keydb_image }}"
+    container_name: keydb-master
+    network_mode: host
+    restart: unless-stopped
+    # 明確指定設定檔啟動：不吃映像內建的預設 conf（那份是明文 6379）
+    command: keydb-server /etc/keydb/keydb.conf
+    volumes:
+      # conf / tls 唯讀：容器內任何程式都不該改它們（單一事實來源在 Ansible）
+      - {{ keydb_home }}/master.conf:/etc/keydb/keydb.conf:ro
+      - {{ keydb_home }}/tls:/tls:ro
+      # data 可寫：cluster 拓撲檔 nodes.conf 在這（純快取不落 RDB/AOF）
+      - {{ keydb_home }}/data-master:/data
+    healthcheck:
+      # 用 client 憑證 + 密碼「實際 PING」：TLS-only + mTLS 之下，
+      # 不帶憑證連 TCP 是驗不出服務健康的。
+      # 必須 grep PONG——keydb-cli 收到錯誤回應（如 NOAUTH）exit code 仍是 0，
+      # 只看 exit code 會把「認證壞掉」誤判成健康。
+      test: ["CMD-SHELL", "keydb-cli --tls --cacert /tls/ca.crt --cert /tls/keydb-client.crt --key /tls/keydb-client.key -p {{ keydb_port }} -a '{{ keydb_password }}' --no-auth-warning ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  keydb-replica:
+    # replica 與 master 唯一差異 = 設定檔（tls-port 6380）與 data 目錄；
+    # 「誰是誰的 replica」不在這裡定義——由 --cluster create 分配
+    # （見 tasks/main.yml 的叢集初始化註解）
+    image: "{{ keydb_image }}"
+    container_name: keydb-replica
+    network_mode: host
+    restart: unless-stopped
+    command: keydb-server /etc/keydb/keydb.conf
+    volumes:
+      - {{ keydb_home }}/replica.conf:/etc/keydb/keydb.conf:ro
+      - {{ keydb_home }}/tls:/tls:ro
+      - {{ keydb_home }}/data-replica:/data
+    healthcheck:
+      test: ["CMD-SHELL", "keydb-cli --tls --cacert /tls/ca.crt --cert /tls/keydb-client.crt --key /tls/keydb-client.key -p {{ keydb_replica_port }} -a '{{ keydb_password }}' --no-auth-warning ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # redis_exporter（規劃書 §9：KeyDB metrics）——每台 app 節點一個，
+  # 連本機 master 取指標。KeyDB 是 TLS-only + mTLS + 密碼，exporter 也要帶齊
+  # 這三樣才連得上（rediss:// + client 憑證 + password）。
+  # 出的關鍵指標：redis_cluster_enabled / redis_connected_slaves（← 審查點名的
+  # 「replica 失去備援」偵測依據）/ redis_up / 記憶體用量 / 命中率。
+  keydb-exporter:
+    image: "{{ keydb_exporter_image }}"
+    container_name: keydb-exporter
+    network_mode: host
+    restart: unless-stopped
+    # 以 keydb 的 UID 執行：client 憑證 owner 是 999、key 為 0640，
+    # exporter 用預設 UID 會 permission denied 讀不到（實測踩過）。
+    # redis_exporter 無特權需求，降權到 999 最小權限即可
+    user: "{{ keydb_container_uid }}:{{ keydb_container_gid }}"
+    volumes:
+      - {{ keydb_home }}/tls:/tls:ro
+    environment:
+      # rediss:// = 走 TLS 連本機 master（SAN 含 IP:127.0.0.1，見 group_vars/app.yml）
+      REDIS_ADDR: "rediss://127.0.0.1:{{ keydb_port }}"
+      REDIS_PASSWORD: "{{ keydb_password }}"
+      # mTLS：KeyDB tls-auth-clients yes 要求客戶端出示內部 CA 簽的憑證
+      REDIS_EXPORTER_TLS_CLIENT_CERT_FILE: /tls/keydb-client.crt
+      REDIS_EXPORTER_TLS_CLIENT_KEY_FILE: /tls/keydb-client.key
+      REDIS_EXPORTER_TLS_CA_CERT_FILE: /tls/ca.crt
+      # exporter 自己的 /metrics 監聽埠（明文，內網由防火牆限制來源）
+      REDIS_EXPORTER_WEB_LISTEN_ADDRESS: ":{{ keydb_exporter_port }}"

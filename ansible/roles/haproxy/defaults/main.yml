@@ -1,0 +1,79 @@
+---
+# =============================================================================
+# roles/haproxy/defaults/main.yml — HAProxy 可調參數（單一服務的 knob）
+#
+# 本 role 是「一份 role、三種面孔」（規劃書 §7.5）：
+#   haproxy_profile=edge     → 邊界 443/465（lb-01/02）
+#   haproxy_profile=postgres → PgBouncer VIP 的 RW/RO 分流（pg-01..03）
+#   haproxy_profile=rabbitmq → AMQPS/管理 UI VIP（mq-01..03）
+#
+# haproxy_profile 本身是「跨 role 契約變數」，定義於
+# inventories/*/group_vars/{lb,postgres,rabbitmq}.yml，不在此檔給預設——
+# 沒設 profile 的主機根本不該跑本 role，缺變數直接爆錯比默默套錯模板安全。
+#
+# 跨 role 契約變數（pki_dir、app_http_port、app_smtp_port、pgbouncer_vip、
+# pgbouncer_port、pgbouncer_ro_port、patroni_rest_port、rabbitmq_vip、
+# rabbitmq_amqps_port）一律以 group_vars/all/vars.yml 為準，本檔只放
+# 「僅本 role 關心」的預設值。
+# =============================================================================
+
+# ---------- profile 白名單（防呆用） ----------
+# tasks/main.yml 開頭 assert 用：打錯字（如 postgre）要立刻噴明確錯誤，
+# 而不是等 template 找不到檔案才報一個難懂的 stack trace
+haproxy_supported_profiles:
+  - edge
+  - postgres
+  - rabbitmq
+
+# ---------- stats / metrics（三種 profile 共用；CONVENTIONS.md §3：8404） ----------
+haproxy_stats_port: 8404
+# stats 網頁自動重新整理的間隔（純觀測體驗，無效能影響）
+haproxy_stats_refresh: 10s
+
+# ---------- 部署後健檢 ----------
+# flush_handlers 之後 wait_for stats 埠的等待上限（秒）
+haproxy_wait_timeout: 30
+
+# ---------- profile=edge ----------
+# 全域同時連線上限：3 台 app 的入口總量，8192 對郵件代理的規模綽綽有餘；
+# 超過上限的新連線會排隊而不是把 HAProxy 撐掛（自我保護機制）
+haproxy_edge_maxconn: 8192
+# 對後端「建連」的等待上限：同 VLAN 間 5s 連不上就是後端有問題，快速失敗
+haproxy_edge_timeout_connect: 5s
+# HTTP 流量的 client/server 閒置逾時：API 請求一分鐘內一定要有來回
+haproxy_edge_timeout_client: 60s
+haproxy_edge_timeout_server: 60s
+# SMTPS 是長交談協定（DATA 傳大附件可能拖很久），逾時放寬到 30 分鐘
+haproxy_edge_smtp_timeout: 30m
+# 健檢節奏：每 5s 檢一次、連 3 次失敗才判死（fall）、連 2 次成功才復活（rise）
+# ——太敏感會因瞬間抖動踢節點，太遲鈍會把流量送給死節點
+haproxy_edge_check_inter: 5s
+haproxy_edge_check_fall: 3
+haproxy_edge_check_rise: 2
+
+# ---------- profile=postgres ----------
+# 上限對齊 PgBouncer 的 max_client_conn（1000）並留餘裕
+haproxy_pg_maxconn: 2048
+haproxy_pg_timeout_connect: 5s
+# 30m：長事務、pg_dump、報表型查詢都可能長時間無封包往返；
+# 太短會把「還活著只是慢」的連線斬斷，app 端看到的就是莫名其妙的斷線
+haproxy_pg_timeout_client: 30m
+haproxy_pg_timeout_server: 30m
+# PG 健檢比 edge 更密（3s）：failover 偵測快慢直接決定寫入中斷時間窗
+haproxy_pg_check_inter: 3s
+haproxy_pg_check_fall: 3
+haproxy_pg_check_rise: 2
+
+# ---------- profile=rabbitmq ----------
+haproxy_mq_maxconn: 2048
+haproxy_mq_timeout_connect: 5s
+# AMQP 是長連線協定：consumer 掛著等訊息是常態，靠協定層 heartbeat（預設 60s）
+# 維持活性；逾時設 1h 是「heartbeat 都停了才視為死連線」的保守值
+haproxy_mq_timeout_client: 1h
+haproxy_mq_timeout_server: 1h
+haproxy_mq_check_inter: 5s
+haproxy_mq_check_fall: 3
+haproxy_mq_check_rise: 2
+# RabbitMQ 管理 UI 埠（CONVENTIONS.md §3：15672，節點 IP 上由 RabbitMQ 自己聽，
+# VIP 上由 HAProxy 聽再分流——同埠不同 IP，不衝突）
+haproxy_mq_mgmt_port: 15672

@@ -1,0 +1,14 @@
+---
+# =============================================================================
+# roles/etcd/handlers/main.yml
+# =============================================================================
+
+# 為什麼是 restart 而非 reload：etcd 的 ETCD_* 環境變數（含 TLS 憑證路徑）只在
+# 行程啟動時讀取一次，官方不提供設定/憑證的熱重載 → 唯一生效方式就是 restart。
+# tasks/main.yml 會在健康檢查前 flush，重啟後叢集健康才算部署成功。
+# noqa name[casing]：CONVENTIONS.md §8 規定 handler 名稱格式為小寫「restart <service>」，
+# 全 repo 的 notify 都依賴這個確切字串，不可為了 lint 規則改大小寫
+- name: restart etcd # noqa: name[casing]
+  ansible.builtin.systemd_service:
+    name: etcd
+    state: restarted

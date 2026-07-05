@@ -1,0 +1,21 @@
+---
+# =============================================================================
+# 31-rabbitmq.yml — 訊息佇列層（RabbitMQ 4.x quorum queue）
+#
+# rabbitmq role 內部處理叢集組建順序（seed 先起，其餘 join）；
+# vhost / user / queue 由 role 冪等建立（規劃書 §7.7）。
+# VIP 層與 PG 相同模式：HAProxy TCP 分流 + Keepalived 漂移。
+# =============================================================================
+- name: RabbitMQ 三節點叢集 + quorum queues
+  hosts: rabbitmq
+  tags: [rabbitmq]
+  roles:
+    - role: rabbitmq
+
+- name: MQ 節點本地 HAProxy + Keepalived（AMQPS VIP）
+  hosts: rabbitmq
+  tags: [rabbitmq, mq-lb]
+  serial: 1
+  roles:
+    - role: haproxy
+    - role: keepalived

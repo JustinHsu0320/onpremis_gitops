@@ -1,0 +1,19 @@
+---
+# =============================================================================
+# roles/node_exporter/meta/main.yml
+# =============================================================================
+galaxy_info:
+  author: email-proxy-infra
+  description: >-
+    Prometheus node_exporter（Ubuntu 官方 archive 套件、全主機部署、
+    監聽 :9100 供 mgmt-01 的 Prometheus 抓取）。
+  license: MIT
+  min_ansible_version: "2.16"
+  platforms:
+    - name: Ubuntu
+      versions:
+        - all
+
+# 無前置依賴：本 role 只需要 apt 與 systemd，任何階段都能單獨重跑
+# （--tags node-exporter），所以不設 meta dependencies。
+dependencies: []

@@ -1,0 +1,140 @@
+---
+# =============================================================================
+# roles/patroni/defaults/main.yml — Patroni / PostgreSQL 18 HA 可調參數
+#
+# 分工原則（同 group_vars/all/vars.yml 檔頭）：
+#   - 跨 role 契約變數「不在」這裡定義，只引用：
+#       pg_version / pg_cluster_scope / pg_app_db / pg_app_user
+#         → inventories/*/group_vars/postgres.yml
+#       pki_dir / patroni_rest_port / vlan_data_cidr / 各密碼別名
+#         → inventories/*/group_vars/all/vars.yml
+#   - 這裡只放「本 role 自己的 knob」，全部可被 inventory 覆寫
+#   - lab 降規靠 patroni_pg_parameters_extra（zz_lab_overrides.yml），
+#     template 內用 combine 蓋到 patroni_pg_parameters 上，不必整份 dict 重抄
+# =============================================================================
+
+# ---------- 套件 ----------
+# Ubuntu 26.04 官方 archive 的 distro 套件（規劃書鐵律：不加第三方 apt repo）：
+#   postgresql-18 (18.4) / patroni (4.1.0)。
+# python3-psycopg2 是給 community.postgresql 模組（建 app db / user）用的，
+# 順手跟主套件一起裝，省一次 apt 交易
+patroni_packages:
+  - "postgresql-{{ pg_version | default('18') }}"
+  - "postgresql-client-{{ pg_version | default('18') }}"
+  - patroni
+  # Debian/Ubuntu 把 Patroni 的 DCS 後端 Python 依賴拆包：不裝 python3-etcd 的話
+  # Patroni 啟動直接 fatal「Can not find suitable configuration of DCS」
+  # （etcd3 協定的實作也需要這個套件，實驗室實測踩過）
+  - python3-etcd
+  # patroni.service 是 Type=notify：Patroni 靠 sd_notify 回報「我 ready 了」，
+  # 沒裝 python3-systemd 就永遠通知不到 → systemd 判啟動逾時 → 無限重啟循環
+  # （服務明明健康卻被 systemd 反覆砍掉，實驗室實測踩過的雷）
+  - python3-systemd
+  - python3-psycopg2
+
+# ---------- 路徑 ----------
+# 資料目錄契約（CONVENTIONS.md §4）：對外契約名是 pg_data_dir；
+# 這裡包一層 default，讓 inventory 沒特別覆寫時也落在契約路徑上。
+# 刻意「不」直接定義 pg_data_dir：契約變數屬於 group_vars 的地盤，
+# role defaults 只做 fallback，避免兩處定義互搶
+patroni_pg_data_dir: "{{ pg_data_dir | default('/var/lib/postgresql/' ~ (pg_version | default('18')) ~ '/email-proxy') }}"
+
+# PG 二進位目錄：Debian/Ubuntu 多版本並存的固定佈局（/usr/lib/postgresql/<ver>/bin）。
+# Patroni 需要明確指定，否則會拿 PATH 上碰運氣找到的版本跑 initdb
+patroni_pg_bin_dir: "/usr/lib/postgresql/{{ pg_version | default('18') }}/bin"
+
+patroni_config_dir: /etc/patroni
+# Ubuntu patroni 套件的 systemd unit ExecStart 寫死讀這個路徑——改了服務就找不到設定
+patroni_config_file: /etc/patroni/config.yml
+
+# ---------- 埠號（CONVENTIONS.md §3 埠號總表是唯一事實來源，這裡只是引用點） ----------
+patroni_pg_port: 5432
+patroni_etcd_client_port: 2379
+
+# ---------- DCS（etcd）鍵前綴 ----------
+# Patroni 以 /<namespace>/<scope>/ 為前綴讀寫 etcd；CONVENTIONS 約定 /service/
+patroni_namespace: /service/
+
+# ---------- 叢集心跳 / failover 行為（寫進 bootstrap.dcs，僅首次 initdb 生效） ----------
+# ttl：leader lock 的壽命（秒）。leader 失聯超過 ttl 才觸發 failover——
+# 這是「誤判切換」與「停機時間」之間的權衡，30 秒是 Patroni 官方建議值
+patroni_ttl: 30
+# loop_wait：Patroni 主迴圈間隔（秒），每圈做一次健檢 + 續 lock
+patroni_loop_wait: 10
+# retry_timeout：DCS / PG 操作的重試上限（秒）；需滿足 ttl >= loop_wait + 2*retry_timeout
+patroni_retry_timeout: 10
+# failover 候選人允許的最大複寫落後（bytes）＝ 1MiB：
+# 落後超過此值的副本不得晉升，避免升出一個「缺一大段資料」的 leader
+patroni_maximum_lag_on_failover: 1048576
+
+# ---------- 同步複寫（RPO=0 的核心開關；取捨詳見 templates/config.yml.j2 註解） ----------
+patroni_synchronous_mode: true
+# strict=false：sync standby 全滅時「自動降級為非同步」維持可寫；
+# 若法遵要求絕對零遺失（寧可停寫），才把這個開成 true
+patroni_synchronous_mode_strict: false
+
+# ---------- 故障切換工具 ----------
+# use_pg_rewind：舊 leader 復活時用 pg_rewind 快轉回副本，免整庫重拉（需 wal_log_hints=on）
+patroni_use_pg_rewind: true
+# use_slots：用 replication slot 保證副本斷線期間 leader 不清走它還沒收的 WAL
+patroni_use_slots: true
+
+# ---------- watchdog ----------
+# automatic：有 /dev/watchdog 就用（防 Patroni 行程凍結造成雙主），沒有就略過。
+# lab 容器內沒有 watchdog 裝置，automatic 會自動退化、不需 is_container 分支
+patroni_watchdog_mode: automatic
+
+# ---------- 資料庫身分 ----------
+# Patroni 首次 initdb 後會「自動」建立這兩個身分並套用 config.yml 內的密碼：
+#   superuser：日常管理；replication：節點間串流複寫專用（密碼來自 vault 別名）
+patroni_superuser_username: postgres
+patroni_replication_username: replicator
+
+# ---------- bootstrap 等待參數 ----------
+# 30 次 × 5 秒 = 最多 150 秒：涵蓋首節點 initdb + REST API 起來，
+# 以及副本 basebackup（空叢集很快；帶資料的重建場景可用 -e 放大）
+patroni_bootstrap_retries: 30
+patroni_bootstrap_delay: 5
+
+# ---------- PostgreSQL 參數（經 bootstrap.dcs 寫進 DCS，cluster-wide 統一） ----------
+# 注意：這份 dict 只在「叢集第一次 bootstrap」時寫入 DCS；
+# 既有叢集要改參數請用 patronictl edit-config（詳見 template 註解）。
+# 每個值都刻意用字串（"on"/"512MB"），避免 YAML 1.1 把 on/off 解讀成布林
+patroni_pg_parameters:
+  # 連線上限：3 台 app 全部經 PgBouncer 收斂後，200 對後端綽綽有餘
+  max_connections: 200
+  # 共享緩衝區：prod VM 記憶體的 ~25%；lab 用 patroni_pg_parameters_extra 降到 128MB
+  shared_buffers: "512MB"
+  # replica 等級 WAL：串流複寫的最低要求（logical 目前用不到，省 WAL 量）
+  wal_level: replica
+  # 副本開放唯讀查詢：PgBouncer RO 口（6433）的前提
+  hot_standby: "on"
+  # 在 WAL 記 page hint bits：pg_rewind 的硬性前提（initdb 後不可改，一開始就開）
+  wal_log_hints: "on"
+  # WAL 傳送者上限：3 節點複寫 + pg_basebackup + 備援餘裕
+  max_wal_senders: 10
+  max_replication_slots: 10
+  # 即使 slot 不在，也至少保留 1GB WAL：副本短暫斷線回來不用整庫重拉的保險
+  wal_keep_size: "1GB"
+  # SCRAM 取代 md5：現代雜湊，pg_hba 全面配 scram-sha-256
+  password_encryption: scram-sha-256
+  # 節點間複寫與 VLAN30 內連線全部走 TLS（憑證由 10-pki 的 pki_leaf 派送）
+  ssl: "on"
+  ssl_cert_file: "{{ pki_dir }}/postgres-server.crt"
+  ssl_key_file: "{{ pki_dir }}/postgres-server.key"
+  ssl_ca_file: "{{ pki_dir }}/ca.crt"
+  # WAL 歸檔到 pgBackRest（PITR 的基礎）。
+  # 注意部署順序：pgbackrest role（30-postgres 後段）配好 stanza 前，
+  # archive_command 會失敗、WAL 在 pg_wal 累積——這是「預期行為」，
+  # stanza-create 之後歸檔自動追上，不需人工介入
+  archive_mode: "on"
+  archive_command: "pgbackrest --stanza={{ pgbackrest_stanza | default('email-proxy') }} archive-push %p"
+  # 低流量時段也強制每 60 秒切一次 WAL 段：PITR 的最壞資料視窗上限
+  archive_timeout: 60s
+  # 日誌交給 logging collector 落地（stderr → pg_log），journal 裡是 Patroni 自己的日誌
+  log_destination: stderr
+  logging_collector: "on"
+
+# lab / 特殊環境的參數覆寫口（zz_lab_overrides.yml 定義降規值）；
+# template 內 combine 蓋上去，同 key 以 extra 為準
+patroni_pg_parameters_extra: {}

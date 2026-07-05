@@ -1,0 +1,20 @@
+---
+# =============================================================================
+# roles/pgbackrest/meta/main.yml
+# =============================================================================
+galaxy_info:
+  author: email-proxy-infra
+  description: >-
+    pgBackRest 備份體系（規劃書 §9）：WAL 歸檔 + 每週日全備/每日差異備份到
+    NFS（AES-256 靜態加密），保留 2 份全備 = 兩週 PITR 窗口。
+  license: MIT
+  min_ansible_version: "2.16"
+  platforms:
+    - name: Ubuntu
+      versions:
+        - all
+
+# 依賴 patroni（PG 在跑、archive_command 已設）與 nfs_client（repo 掛載）——
+# 由 site.yml / 30-postgres.yml 的 play 順序保證，不用 meta 硬綁，
+# 避免 --tags backup 單跑時把整套 patroni 拖進來。
+dependencies: []

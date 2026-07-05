@@ -1,0 +1,110 @@
+# =============================================================================
+# web-frontend Deployment（base）
+#
+# base 只放「所有環境共通」的宣告；環境差異（副本數、資源加碼…）
+# 一律進 overlays/（目前只有 prod，之後加 staging 就是再開一個 overlay）。
+#
+# 前端容器：SPA 打包產物 + unprivileged nginx 靜態伺服，監聽 8080
+# （非 root 使用者不能綁 80，這是刻意選 8080 的原因）。
+# =============================================================================
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-frontend
+  labels:
+    app.kubernetes.io/name: web-frontend
+    app.kubernetes.io/component: frontend
+spec:
+  # base 給最小值 1；正式環境副本數由 overlays/prod/replicas-patch.yaml 拉高
+  replicas: 1
+  # 只留 5 代 ReplicaSet 歷史 —— rollback 該走 Git revert，不靠 kubectl rollout
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      # selector 建立後不可變更，只放最穩定的 name label
+      app.kubernetes.io/name: web-frontend
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # 滾動更新期間容量不打折：先長新的、確認 ready 才殺舊的
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: web-frontend
+        app.kubernetes.io/component: frontend
+    spec:
+      # 內部 registry 需要認證時的拉取憑證。
+      # Secret 由平台團隊在 namespace 建好（或用 sealed-secrets 進 Git）：
+      #   kubectl -n web-frontend create secret docker-registry regcred-platform \
+      #     --docker-server=registry.ptc-nec.com.tw:5050 \
+      #     --docker-username=<deploy-token-user> --docker-password=<token>
+      imagePullSecrets:
+        - name: regcred-platform
+      # Pod 層安全基線：非 root、預設 seccomp
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101 # nginx-unprivileged 官方映像的 nginx 使用者 UID
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: web-frontend
+          # -------------------------------------------------------------------
+          # 映像來自內部 registry。注意：這裡的 tag 只是「base 的預設值」，
+          # 實際部署 tag 以 overlays/prod/kustomization.yaml 的 images: 段為準
+          # —— 該欄位由 gitlab/ci-templates 的 bump job 用
+          # `kustomize edit set image` 自動改寫（人不手改 tag）。
+          # -------------------------------------------------------------------
+          image: registry.ptc-nec.com.tw:5050/platform/web-frontend:v1.0.0
+          # tag 固定（絕不用 latest），IfNotPresent 即可、也省 registry 流量
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http # 具名 port：Service/probe 引用名字，改號碼只動一處
+              containerPort: 8080
+              protocol: TCP
+          # -------------------------------------------------------------------
+          # 資源宣告：requests 是排程依據、limits 是失控上限。
+          # 靜態檔案伺服很輕：先給保守值，上線後看 metrics 再以 overlay 調。
+          # requests==limits(memory) 可避免 node 記憶體壓力時被優先 OOMKill
+          # （Guaranteed 等級需 cpu 也相等，這裡取折衷：memory 保守放大）。
+          # -------------------------------------------------------------------
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          # -------------------------------------------------------------------
+          # readiness：決定「要不要把流量給我」。nginx 能回 200 就算 ready；
+          # 失敗時只是被摘出 Service endpoints，不會被殺。
+          # -------------------------------------------------------------------
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          # -------------------------------------------------------------------
+          # liveness：決定「我是不是死透了該重啟」。門檻要比 readiness 寬鬆
+          # （initialDelay 較長、period 較長），避免短暫高負載被誤殺造成
+          # 重啟風暴 —— liveness 失敗的代價是 kill container。
+          # -------------------------------------------------------------------
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 2
+            failureThreshold: 3
+          # 容器層安全基線：不允許提權、丟掉所有 Linux capabilities
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL

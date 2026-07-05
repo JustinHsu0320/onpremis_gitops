@@ -1,0 +1,28 @@
+---
+# =============================================================================
+# roles/patroni/handlers/main.yml
+#
+# 為什麼是 reload 而不是 restart：
+#   systemd reload = 對 Patroni 送 SIGHUP → Patroni 重讀 /etc/patroni/config.yml、
+#   重寫 postgresql.conf / pg_hba.conf，並對 PG 做 pg_ctl reload。
+#   「reload 即生效」的類型：pg_hba 規則、restapi 密碼、etcd 端點、
+#   ssl_* 憑證路徑與憑證內容（PG 自 v10 起 SIGHUP 就重讀 TLS 檔案——
+#   所以 pki_certs_changed 契約用 reload 就夠，這正是季度換證零停機的關鍵）、
+#   多數 GUC（log_*、archive_timeout、work_mem 類）。
+#   需要「重啟 PG」的類型：shared_buffers / max_connections / wal_level /
+#   max_wal_senders 這類 postmaster 啟動參數——Patroni 會在 patronictl list
+#   標出 pending restart，由維運擇時執行 `patronictl restart <scope> --pending`
+#   逐台滾動重啟（先副本後 leader），全程不失去服務。
+#
+#   刻意「不」提供 restart patroni 的 handler：systemd restart patroni 會連帶
+#   停掉本機 PG（leader 上等同觸發一次 failover）。這種大動作不該被 notify
+#   自動化，要走 patronictl 的受控流程。
+#
+# noqa name[casing]：CONVENTIONS.md §8 規定 handler 名稱格式為小寫
+# 「reload <service>」，全 repo 的 notify 都依賴這個確切字串，不可為 lint 改大小寫
+# =============================================================================
+
+- name: reload patroni # noqa: name[casing]
+  ansible.builtin.systemd_service:
+    name: patroni
+    state: reloaded

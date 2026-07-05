@@ -1,0 +1,44 @@
+---
+# =============================================================================
+# 30-postgres.yml — 資料層 PostgreSQL 全套（規劃書 §7.7）
+#
+# 佈署順序 = 依賴順序：
+#   etcd（DCS，quorum 基礎）→ Patroni/PG18（HA 資料庫）→ PgBouncer(連線池)
+#   → pgBackRest（備份）→ 本地 HAProxy + Keepalived（RW/RO VIP 分流）
+#
+# 注意 serial 的使用：
+#   - etcd 初次 bootstrap 需要三台「同時」啟動湊 quorum → 不用 serial
+#   - patroni 首節點 bootstrap 後其餘逐台加入 → role 內部處理順序
+#   - haproxy/keepalived 滾動套用（serial: 1）→ VIP 不中斷
+# =============================================================================
+- name: 佈署 etcd 三節點叢集（Patroni 的 DCS）
+  hosts: etcd
+  tags: [postgres, etcd]
+  roles:
+    - role: etcd
+
+- name: Patroni + PostgreSQL 18 HA 叢集
+  hosts: postgres
+  tags: [postgres, patroni]
+  roles:
+    - role: patroni
+
+- name: PgBouncer 連線池
+  hosts: postgres
+  tags: [postgres, pgbouncer]
+  roles:
+    - role: pgbouncer
+
+- name: 佈署 pgBackRest 備份（每日全備/差異備 + WAL 歸檔到 NFS）
+  hosts: postgres
+  tags: [postgres, backup]
+  roles:
+    - role: pgbackrest
+
+- name: PG 節點本地 HAProxy + Keepalived（滾動、VIP 不中斷）
+  hosts: postgres
+  tags: [postgres, pg-lb]
+  serial: 1
+  roles:
+    - role: haproxy
+    - role: keepalived

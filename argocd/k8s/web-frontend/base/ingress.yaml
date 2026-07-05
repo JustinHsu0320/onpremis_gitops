@@ -1,0 +1,47 @@
+# =============================================================================
+# web-frontend Ingress（base）
+#
+# 對外入口：ingress-nginx（地端無雲 LB，controller 以 NodePort/hostNetwork
+# 露出，前面由既有 L4 設備/keepalived VIP 導流 —— 與 ArgoCD UI 同一條路）。
+#
+# TLS：憑證由「內部 CA」簽發（gitlab/registry/argocd 全公司同一條信任鏈）。
+# 目前作法：手動簽好後建 Secret（見下方指令註解）。
+# 【擴充註記】導入 cert-manager + 內部 CA ClusterIssuer 後，
+# 打開 cert-manager.io/cluster-issuer annotation，憑證即自動簽發/續期，
+# Secret 不再需要人工維護 —— 屆時刪掉手動建立的同名 Secret 即可無縫切換。
+# =============================================================================
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: web-frontend
+  labels:
+    app.kubernetes.io/name: web-frontend
+    app.kubernetes.io/component: frontend
+  annotations:
+    # 內網也不跑明文 HTTP：一律 308 轉向 HTTPS
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    # 【擴充註記】cert-manager 就緒後打開下行（issuer 名稱以平台實際為準）：
+    # cert-manager.io/cluster-issuer: internal-ca-issuer
+spec:
+  # ingress-nginx 的 IngressClass（kubectl get ingressclass 確認名稱）
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - web.ptc-nec.com.tw
+      # 內部 CA 簽發的 TLS 憑證 Secret。未導入 cert-manager 前手動建立：
+      #   kubectl -n web-frontend create secret tls web-frontend-tls \
+      #     --cert=web.ptc-nec.com.tw.crt --key=web.ptc-nec.com.tw.key
+      # （.crt 建議含完整鏈：server cert + intermediate CA）
+      secretName: web-frontend-tls
+  rules:
+    - host: web.ptc-nec.com.tw # 內部 DNS 指向 ingress VIP
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: web-frontend
+                port:
+                  name: http # 引用 Service 的具名 port（80）

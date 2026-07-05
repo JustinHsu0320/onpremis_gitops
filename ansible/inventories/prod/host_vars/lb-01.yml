@@ -1,0 +1,4 @@
+---
+# lb-01：邊界 VIP 的常態持有者（MASTER, priority 150）
+keepalived_state: MASTER
+keepalived_priority: 150

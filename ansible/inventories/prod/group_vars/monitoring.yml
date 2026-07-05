@@ -1,0 +1,19 @@
+---
+# =============================================================================
+# group_vars/monitoring.yml — 管理層 mgmt-01（Prometheus / Grafana / Alertmanager）
+# =============================================================================
+
+# 時序資料保留期：prod 30 天（200GB TSDB 碟）；lab 覆寫為 2d
+prometheus_retention: 30d
+
+# ---------- 資料碟（block_storage role；lab 因 is_container 跳過） ----------
+# 對應 terraform 的 mgmt disk1-monitoring（200G）。掛到 /var/lib/docker——
+# 監控堆疊的 Prometheus TSDB / Grafana / Alertmanager 全是 docker named volume，
+# 落在 /var/lib/docker/volumes；把整個 docker 資料根放大碟，TSDB 就不會塞爆 OS 碟，
+# 且監控 compose 完全不用改（named volume 首次建立會自動 chown 到容器 UID）。
+# 這也是 05-block-storage 排在 08-docker「之前」的原因——碟要先在，Docker 才裝上去
+storage_volumes:
+  - { mountpoint: /var/lib/docker, size_gb: 200 }
+
+# 憑證到期告警門檻（規劃書 §9：到期前 30 天告警）
+cert_expiry_alert_days: 30

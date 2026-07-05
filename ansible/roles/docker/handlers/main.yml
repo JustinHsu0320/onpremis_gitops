@@ -1,0 +1,17 @@
+---
+# =============================================================================
+# roles/docker/handlers/main.yml
+# handler 定義順序即執行順序：daemon-reload 一定要在 restart docker 之前，
+# 否則 systemd 用「舊的」unit 環境（沒讀到新 drop-in）重啟服務。
+# handler 名稱格式為契約規定的「restart/reload <service>」小寫
+# （CONVENTIONS.md §8.6），對 ansible-lint 的 name[casing] 加 noqa
+# =============================================================================
+
+- name: reload systemd  # noqa: name[casing]
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+
+- name: restart docker  # noqa: name[casing]
+  ansible.builtin.systemd_service:
+    name: docker
+    state: restarted

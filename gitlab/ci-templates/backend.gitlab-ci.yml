@@ -1,0 +1,143 @@
+---
+# =============================================================================
+# gitlab/ci-templates/backend.gitlab-ci.yml — Go 後端 app repo 範例管線
+#
+# 適用對象：公司各 Go 後端服務 repo（部署到 K8s、由 ArgoCD 同步）。
+# app repo 的 .gitlab-ci.yml 只需要：
+#   include:
+#     - project: "infra/email-proxy-infra"
+#       ref: main
+#       file: "gitlab/ci-templates/backend.gitlab-ci.yml"
+#   variables:
+#     GITOPS_KUSTOMIZE_DIR: "argocd/k8s/web-backend/overlays/prod"  # 按需覆寫
+#
+# ── 整體流程（pull-based GitOps：CI 只碰 Git，絕不碰叢集）────────────────
+#   test（go vet + go test -race）
+#     → build（編譯產物，供快速煙霧測試 / 掃描）
+#     → image（kaniko 推 registry，由 docker-build 模板提供）
+#     → deploy（把 gitops repo 裡 kustomize 的 image tag bump 成新 SHA，
+#       commit + push）→ ArgoCD 偵測到 gitops repo 變更 → 自動同步進 K8s。
+#   CI 手上沒有任何 kubeconfig / 叢集憑證——攻擊面只剩一把「只能寫一個
+#   repo」的 token；回滾 = git revert 那個 bump commit，稽核 = git log。
+#   這就是 pull-based GitOps 相對 kubectl apply 式 CI 的核心價值。
+# =============================================================================
+
+# 巢狀 include：local 路徑以「本檔所在 repo」（infra monorepo）為根解析，
+# 所以 app repo 只要 include 本檔，kaniko 建置模板就自動一起帶入
+include:
+  - local: gitlab/ci-templates/docker-build.gitlab-ci.yml
+
+stages: [test, build, image, deploy]
+
+default:
+  tags: [onprem-docker]
+
+variables:
+  # 地端沒有直連 proxy.golang.org：請經 Squid egress 白名單放行，
+  # 或（推薦）架內部 Athens / goproxy mirror 後改指內部位址——離線也能建
+  GOPROXY: "https://proxy.golang.org,direct"
+  # 把 GOPATH 收進 workspace，module cache 才能被 GitLab cache 機制保存
+  GOPATH: "${CI_PROJECT_DIR}/.go"
+  # --- gitops repo（= infra monorepo）與 kustomize overlay 位置 ---
+  GITOPS_REPO_HOST: "gitlab.ptc-nec.com.tw"
+  GITOPS_REPO_PATH: "infra/email-proxy-infra"
+  GITOPS_BRANCH: "main"
+  GITOPS_KUSTOMIZE_DIR: "argocd/k8s/web-backend/overlays/prod"
+  # kustomization.yaml 裡 images[].name 的「鍵」（deployment 引用的原始
+  # image 名）；kustomize edit set image 以此找到要覆寫的項目
+  KUSTOMIZE_IMAGE_NAME: "registry.ptc-nec.com.tw:5050/web/backend"
+
+# go module cache 跨 pipeline 重用（runner 本地 cache volume）：
+# 依賴沒變時 go test / go build 都不用重新下載整個 module graph
+cache:
+  key:
+    files: [go.sum]
+  paths:
+    - .go/pkg/mod/
+
+# ---------------------------------------------------------------------------
+# stage: test — 靜態分析 + 單元測試
+# ---------------------------------------------------------------------------
+go-test:
+  stage: test
+  image: golang:1.24
+  script:
+    # vet：官方靜態分析（printf 格式、無效比較、鎖複製等低級但致命的錯）
+    - go vet ./...
+    # -race：資料競爭偵測——多 goroutine 服務必開，慢一點也值得；
+    # -count=1 停用測試結果快取，CI 每次都要真跑
+    - go test -race -count=1 -cover ./...
+
+# ---------------------------------------------------------------------------
+# stage: build — 編譯產物
+# 若 Dockerfile 本身是 multi-stage（builder 內編譯），此 job 可省略，
+# 讓 kaniko 的 layer cache 承擔——保留它的理由是：編譯錯誤在這裡就擋下，
+# 比進到 image 階段才炸更快、log 更乾淨
+# ---------------------------------------------------------------------------
+go-build:
+  stage: build
+  image: golang:1.24
+  script:
+    # CGO_ENABLED=0：純靜態二進位，容器 base 可用 distroless/scratch；
+    # -trimpath / -s -w：去除本機路徑與符號表（減肥 + 不洩漏建置環境）
+    - CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o bin/app ./...
+  artifacts:
+    paths: [bin/]
+    expire_in: 1 day
+
+# ---------------------------------------------------------------------------
+# stage: image — 由 docker-build 模板的 build-image job 提供（kaniko）。
+# 產出 ${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHORT_SHA}（main）＋ semver（tag）
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# stage: deploy — bump gitops repo 的 kustomize image tag（GitOps 交棒點）
+#
+# ── 認證說明（重要，最常踩的坑）─────────────────────────────────────────
+# GitLab「Deploy Token」對 repository 只有 read_repository（唯讀），
+# 不能拿來 push！要寫 gitops repo，請在 gitops repo 建立
+# Project Access Token：
+#   gitops repo → Settings → Access Tokens
+#   role: Developer、scopes: write_repository、設到期日並排程輪替
+# 然後存成「本 app repo」的 CI 變數（Masked + Protected）：
+#   GITOPS_PUSH_USER  = token 名稱（如 gitops-bump-bot）
+#   GITOPS_PUSH_TOKEN = token 值
+# 若 gitops repo 的 main 是 protected branch，記得在
+# Settings → Repository → Protected branches 允許該 token（bot）push；
+# 更嚴格的變體：push 到 bump/<sha> 分支 + 自動開 MR，由人合併。
+# ---------------------------------------------------------------------------
+bump-gitops-image-tag:
+  stage: deploy
+  # alpine/k8s 內含 git + kustomize + kubectl。地端建議先 mirror 到
+  # registry.ptc-nec.com.tw:5050/mirror/alpine-k8s 再改用內部位址
+  # （CI 的可用性不該賭在 Docker Hub 的心情上）
+  image: alpine/k8s:1.31.1
+  rules:
+    # 只有 main / 正式 tag 會 bump 生產 overlay；feature branch 到 image 為止
+    - if: $CI_COMMIT_TAG
+    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  variables:
+    GIT_STRATEGY: none         # 本 job 不需要 app 原始碼，只操作 gitops repo
+  script:
+    # tag pipeline 用 semver、main pipeline 用 short SHA（與 kaniko 推的 tag 對齊）
+    - IMAGE_TAG="${CI_COMMIT_TAG:-${CI_COMMIT_SHORT_SHA}}"
+    - git clone --depth 1 --branch "${GITOPS_BRANCH}" "https://${GITOPS_PUSH_USER}:${GITOPS_PUSH_TOKEN}@${GITOPS_REPO_HOST}/${GITOPS_REPO_PATH}.git" gitops
+    - cd "gitops/${GITOPS_KUSTOMIZE_DIR}"
+    # kustomize edit set image <原始名>=<新 image>:<新 tag>
+    # <原始名> 必須等於 manifests 裡引用的 image 名（KUSTOMIZE_IMAGE_NAME），
+    # kustomize 靠它匹配 images[] 覆寫項；改名時兩邊要一起改（契約點）
+    - kustomize edit set image "${KUSTOMIZE_IMAGE_NAME}=${CI_REGISTRY_IMAGE}:${IMAGE_TAG}"
+    - git config user.name "gitops-ci"
+    - git config user.email "gitops-ci@ptc-nec.com.tw"
+    - git add kustomization.yaml
+    # 冪等：同 tag 重跑（retry）不產生空 commit
+    - |
+      if git diff --cached --quiet; then
+        echo ">> image tag 未變更，跳過 commit"
+        exit 0
+      fi
+    # commit message 帶來源 pipeline，方便從 gitops 歷史反查建置紀錄
+    - git commit -m "chore(${CI_PROJECT_NAME}): image -> ${IMAGE_TAG} (pipeline ${CI_PIPELINE_ID})"
+    - git push origin "${GITOPS_BRANCH}"
+    # 到此 CI 的工作結束。接下來：ArgoCD 輪詢/收到 webhook → 偵測 gitops repo
+    # 新 commit → 依 syncPolicy 自動同步 → K8s rollout 新版本

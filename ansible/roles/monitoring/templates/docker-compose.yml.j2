@@ -1,0 +1,111 @@
+{#
+  docker-compose.yml.j2 — mgmt-01 監控堆疊（prometheus / grafana / alertmanager / blackbox）
+
+  網路：四個 service 同一個 compose bridge network「monitoring」，
+  互連走 service 名（prometheus→alertmanager、grafana→prometheus、
+  prometheus→blackbox），不依賴容器 IP。
+
+  ports 綁 0.0.0.0：mgmt VLAN 99 的對外存取由防火牆控管（規劃書），
+  lab 驗證用 127.0.0.1 打也通。真的要收斂綁定範圍時改這裡的 host 部分即可。
+
+  機密注意：grafana 的 environment 含 admin 密碼 →
+  本檔佈署 mode 0600 + no_log（tasks/main.yml）。
+#}
+# ===== {{ ansible_managed }} =====
+services:
+  prometheus:
+    image: "{{ monitoring_prometheus_image }}"
+    container_name: email-proxy-prometheus
+    restart: unless-stopped
+    networks: [monitoring]
+    # 覆寫映像預設參數的原因：retention 要吃 group_vars 的環境差
+    # （prod 30d / lab 2d）；--web.enable-lifecycle 開 HTTP reload 端點，
+    # 讓維運可手動 curl -X POST :9090/-/reload 熱載入（Ansible 流程仍統一
+    # 走 restart handler，見 handlers/main.yml 的取捨說明）
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time={{ prometheus_retention }}
+      - --web.enable-lifecycle
+    volumes:
+      # 設定與規則唯讀：單一事實來源在 Ansible template，容器內不該改
+      - {{ monitoring_home }}/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - {{ monitoring_home }}/prometheus/rules.yml:/etc/prometheus/rules.yml:ro
+      # TSDB 放 named volume：容器重建不掉歷史數據（retention 見上方 command）
+      - prometheus-data:/prometheus
+    ports:
+      - "0.0.0.0:{{ monitoring_prometheus_port }}:9090"
+
+  grafana:
+    image: "{{ monitoring_grafana_image }}"
+    container_name: email-proxy-grafana
+    restart: unless-stopped
+    networks: [monitoring]
+    environment:
+      # admin 密碼來自 vault（經 group_vars 別名 grafana_admin_password）；
+      # 只在「首次初始化」grafana-data volume 時生效，之後改密碼要用
+      # grafana-cli admin reset-admin-password 或重建 volume
+      GF_SECURITY_ADMIN_PASSWORD: "{{ grafana_admin_password }}"
+      # 關閉自助註冊：內部監控系統，帳號一律由管理員開
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      # provisioning 唯讀掛入（datasource 由 Ansible template 管理）
+      - {{ monitoring_home }}/grafana/provisioning:/etc/grafana/provisioning:ro
+      # 儀表板 / 使用者 / 外掛等狀態放 named volume（named volume 首次建立
+      # 會繼承映像內目錄的擁有者 472，免手動 chown）
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "0.0.0.0:{{ monitoring_grafana_port }}:3000"
+
+  alertmanager:
+    image: "{{ monitoring_alertmanager_image }}"
+    container_name: email-proxy-alertmanager
+    restart: unless-stopped
+    networks: [monitoring]
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+    volumes:
+      - {{ monitoring_home }}/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      # silence 與通知去重狀態放 named volume：容器重建後既有的
+      # silence 不消失（事故處理中重佈署不會突然滿血復吵）
+      - alertmanager-data:/alertmanager
+    ports:
+      - "0.0.0.0:{{ monitoring_alertmanager_port }}:9093"
+
+  blackbox:
+    image: "{{ monitoring_blackbox_image }}"
+    container_name: email-proxy-blackbox
+    restart: unless-stopped
+    networks: [monitoring]
+    # 映像預設設定路徑是 /etc/blackbox_exporter/config.yml；
+    # 明確指定成我們掛入的路徑，避免「掛了檔案卻沒被讀」的隱性錯誤
+    command:
+      - --config.file=/etc/blackbox/blackbox.yml
+    volumes:
+      - {{ monitoring_home }}/blackbox/blackbox.yml:/etc/blackbox/blackbox.yml:ro
+      # 內部 CA chain（tasks 從 pki_dir 複製而來）：探測目標的憑證驗證用
+      - {{ monitoring_home }}/blackbox/ca.crt:/etc/blackbox/ca.crt:ro
+    # 容器內要解析 svc-api / rabbitmq-vip 等「內部名稱 → VIP」：
+    # bridge 網路的容器不吃主機 /etc/hosts，用 extra_hosts 灌入與主機
+    # 完全相同的 VIP 條目（單一事實來源：group_vars 的 extra_hosts_entries，
+    # 與 common role 寫 /etc/hosts 用的是同一份清單，永不漂移）
+    extra_hosts:
+{% for entry in extra_hosts_entries %}
+{% for name in entry.names %}
+      - "{{ name }}:{{ entry.ip }}"
+{% endfor %}
+{% endfor %}
+    ports:
+      - "0.0.0.0:{{ monitoring_blackbox_port }}:9115"
+
+networks:
+  # 固定網路名（不吃 compose 專案前綴）：除錯時 docker network inspect monitoring
+  # 一眼可尋，也避免專案目錄改名導致網路重建
+  monitoring:
+    name: monitoring
+
+volumes:
+  prometheus-data:
+  grafana-data:
+  alertmanager-data:

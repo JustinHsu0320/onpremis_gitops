@@ -1,0 +1,56 @@
+# =============================================================================
+# /etc/pgbackrest/pgbackrest.conf — {{ ansible_managed }}
+#
+# 本檔由 Ansible role `pgbackrest` 管理，手改必被覆蓋。
+# 含 repo 加密金鑰（cipher-pass）→ 檔案權限 0640 postgres:postgres。
+#
+# 【備份策略總覽】（規劃書 §9）
+#   repo：NFS（nfs-01 匯出 {{ nfs_pgbackup_export }}，pg 節點掛 {{ pgbackup_mount }}）
+#   全備：每週日 01:30；差異備：週一到週六 01:30（見 pgbackrest-backup.timer）
+#   WAL：Patroni 設 archive_command=pgbackrest archive-push（持續歸檔）
+#   PITR：全備 + diff + WAL 可還原到窗口內「任意時間點」
+# =============================================================================
+
+[global]
+# ---------- repo：備份放哪 ----------
+# NFS 掛載點下的專屬子目錄（掛載由 20-storage 完成；本 role 只建子目錄）。
+# 對 pgBackRest 而言這就是一個 posix 路徑，NFS 的可用性/快照由儲存層負責。
+repo1-path={{ pgbackrest_repo_path }}
+
+# 保留 2 份全備：配合「每週日全備」= 任何時刻 repo 內都有涵蓋約兩週的
+# 全備+diff+WAL，即兩週的 PITR 窗口。第 3 份全備完成時，最舊的全備與其
+# 依附的 diff/WAL 會被自動 expire（不用另外寫清理 cron）。
+repo1-retention-full={{ pgbackrest_retention_full }}
+
+# ---------- repo 靜態加密 ----------
+# 備份落在 NFS 上，等於資料庫內容離開了 pg 節點的磁碟控制範圍：
+# NFS 主機被入侵、NFS 線路被截、備份碟被拔走——任何一種情境下，
+# 攻擊者拿到的都只是 AES-256-CBC 密文。金鑰只存在 pg 節點的本檔（0640）
+# 與 vault；「還原時沒有這把金鑰 = 備份是磚」，金鑰遺失等同備份全毀，
+# 請確保 vault 有異地備援。
+repo1-cipher-type=aes-256-cbc
+repo1-cipher-pass={{ pgbackrest_cipher_pass }}
+
+# ---------- 效能 ----------
+# 備份/歸檔的平行工作程序數：加速有感，又不至於和生產查詢搶滿 CPU/IO
+process-max={{ pgbackrest_process_max }}
+
+# ---------- 日誌 ----------
+# console 精簡（給 systemd journal / Ansible 輸出）、檔案詳盡（給事後鑑識）
+log-level-console={{ pgbackrest_log_level_console }}
+log-level-file={{ pgbackrest_log_level_file }}
+
+# ---------- 備份行為 ----------
+# start-fast=y：備份開始時要求 PG 立刻做 checkpoint，而不是等 checkpoint_timeout
+# 慢慢輪到——否則備份可能空等數分鐘才真正開始拷貝
+start-fast=y
+
+# =============================================================================
+# stanza：pgBackRest 對「一套 PG 叢集」的命名單位。
+# 名稱必須與 Patroni 的 archive_command --stanza= 一致（跨 role 契約），
+# 三台 pg 節點的本檔完全相同——failover 後新 leader 直接無縫接手備份。
+# =============================================================================
+[{{ pgbackrest_stanza | default('email-proxy') }}]
+# 本機 PG data dir（pgBackRest 從這裡讀資料檔；連線用 libpq 預設的
+# 本機 unix socket + postgres peer auth，不需要密碼）
+pg1-path={{ pg_data_dir | default('/var/lib/postgresql/18/email-proxy') }}

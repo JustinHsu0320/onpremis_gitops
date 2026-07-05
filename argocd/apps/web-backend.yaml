@@ -1,0 +1,52 @@
+# =============================================================================
+# Application: web-backend —— 平台後端 API
+#
+# 結構與 web-frontend.yaml 同構（App-of-Apps 第二層，由 root 自動同步）。
+# 逐段詳細註解見 web-frontend.yaml，此處僅標注差異與後端特有考量。
+#
+# 【架構邊界 / ADR-4 提醒】web-backend 若需寄信，是透過「網路呼叫」
+# email_proxy VM 的 SMTP/API 端點 —— email_proxy 本體由 ansible/ 管理，
+# 不會、也不應該出現在 argocd/apps/ 之下。
+# =============================================================================
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: web-backend
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: web-backend
+    app.kubernetes.io/part-of: platform
+  # 級聯刪除 finalizer（同 web-frontend，「刪碼即下架」）
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: platform # platform AppProject 的安全邊界（見 projects/platform.yaml）
+
+  source:
+    repoURL: https://gitlab.ptc-nec.com.tw/platform/gitops.git
+    targetRevision: main
+    # prod overlay；映像 tag 由 CI bump job 以 kustomize edit set image 更新
+    # （見 overlays/prod/kustomization.yaml 的 images: 段註解）
+    path: argocd/k8s/web-backend/overlays/prod
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: web-backend
+
+  # GitOps 自癒三件套（詳解見 web-frontend.yaml）
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ApplyOutOfSyncOnly=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+
+  revisionHistoryLimit: 10

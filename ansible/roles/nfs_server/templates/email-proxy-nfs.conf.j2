@@ -1,0 +1,18 @@
+# =============================================================================
+# {{ nfs_server_conf_dropin }} — NFSv4-only 設定
+# 由 Ansible（roles/nfs_server）產生，手改必被覆蓋
+# （/etc/nfs.conf 結尾的 includedir /etc/nfs.conf.d 會自動載入本檔）
+#
+# 為什麼堅持 v4-only：
+#   - NFSv4 把 mount / lock / status 等 v3 時代的周邊協定全部收斂進
+#     「單一 TCP 2049 port」——防火牆規則從「rpcbind + 一串動態 port」
+#     簡化成一條，攻擊面也同步縮小（CONVENTIONS.md §3 只登記 2049）。
+#   - 因此完全不需要 rpcbind/portmapper 對外服務。
+#   - udp=n：NFS over UDP 在大封包分片重組上有已知的資料默默損毀風險
+#     （sequence 回繞），且 v4 規格本來就只跑 TCP，明確關掉以絕後患。
+# =============================================================================
+[nfsd]
+# 拒絕 NFSv3 client：只提供 v4.x（Ubuntu 預設 v4.0/4.1/4.2 皆開）
+vers3=n
+# 只走 TCP
+udp=n

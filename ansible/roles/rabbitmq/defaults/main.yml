@@ -1,0 +1,71 @@
+---
+# =============================================================================
+# roles/rabbitmq/defaults/main.yml — RabbitMQ role 的可調參數（單一服務 knob）
+#
+# 分工原則（group_vars/all/vars.yml 檔頭）：
+#   - 「拓撲事實」與跨 role 契約變數放 inventories/*/group_vars/
+#     （rabbitmq_vhost / rabbitmq_app_user / rabbitmq_queues /
+#      rabbitmq_delayed_plugin_enabled 定義於 group_vars/rabbitmq.yml；
+#      rabbitmq_amqps_port / pki_dir / 機密別名定義於 group_vars/all/vars.yml）
+#   - 這裡只放「單一服務自己的 knob」，全部可被 inventory 覆寫
+# =============================================================================
+
+# Ubuntu 26.04 官方 archive 的 distro 套件（RabbitMQ 4.0.5 + Erlang 27）；
+# 不加第三方 repo，縮小供應鏈攻擊面，版本跟著 distro 安全更新走。
+# python3-requests：community.rabbitmq 的 exchange/queue/binding 模組
+# 底層是打本機 15672 management HTTP API，靠 requests 函式庫發請求
+rabbitmq_packages:
+  - rabbitmq-server
+  - python3-requests
+
+# 埠號（CONVENTIONS.md §3 埠號總表是唯一事實來源，這裡只是參數化引用點；
+# AMQPS 5671 因跨 role 引用（haproxy/app）放在 group_vars/all 的 rabbitmq_amqps_port）
+rabbitmq_management_port: 15672     # management UI/API：僅 VLAN 30（防火牆擋）
+rabbitmq_prometheus_port: 15692     # rabbitmq_prometheus plugin 的 /metrics
+
+# seed 節點：叢集組建順序的「第一台」，vhost/user/queue 等叢集級定義也在它身上跑。
+# 永遠取群組第一台，不硬編主機名（CONVENTIONS.md §1）
+rabbitmq_seed_node: "{{ groups['rabbitmq'][0] }}"
+
+# 記憶體高水位（相對實體 RAM 的比例）：超過即觸發 publisher 流控。
+# 正式值 0.6；lab 由 zz_lab_overrides.yml 降規為 0.3
+rabbitmq_vm_memory_high_watermark: "0.6"
+
+# 磁碟低水位（絕對值）：可用空間低於此值即擋住 publish，防止把碟寫爆
+# 連 raft log / mnesia 都寫不進去的災難
+rabbitmq_disk_free_limit: 2GB
+
+# rabbitmqctl await_startup / await_online_nodes 的等待逾時（秒）：
+# 涵蓋首次 bootstrap（三台先後啟動 + 互相發現）與設定變更後的重啟
+rabbitmq_startup_timeout: 120
+
+# ---------- 死信拓撲名稱（與 group_vars/rabbitmq.yml 的 rabbitmq_queues.dlx 對應） ----------
+rabbitmq_dlx_exchange: email_proxy_dlx     # fanout 死信 exchange
+rabbitmq_dlq_queue: email_proxy_dlq        # 死信最終落點 queue
+
+# ---------- delayed message exchange plugin（重試機制依賴） ----------
+# 預設關閉（role 單獨使用時不強迫外網依賴）；prod/lab 由 group_vars/rabbitmq.yml 開啟
+rabbitmq_delayed_plugin_enabled: false
+rabbitmq_delayed_plugin_version: "4.0.7"
+
+# 注意：v4.0.7 這個 release 的資產檔名「帶 v 前綴」
+# （rabbitmq_delayed_message_exchange-v4.0.7.ez），與 v4.0.2 / v4.1.0 的
+# 「不帶 v」命名不同——這是上游 release 的不一致，已用 curl -sI 實測驗證。
+# 若要換版本，請連同這個 URL 一起覆寫，不要只改版本號。
+# （YAML 折行點落在 {{ }} 內，Jinja 會吞掉表達式內的空白，不影響 URL 本體）
+rabbitmq_delayed_plugin_url: >-
+  https://github.com/rabbitmq/rabbitmq-delayed-message-exchange/releases/download/v{{
+  rabbitmq_delayed_plugin_version }}/rabbitmq_delayed_message_exchange-v{{
+  rabbitmq_delayed_plugin_version }}.ez
+
+# 下載重試：GitHub release 資產經 302 轉址到 objects/release-assets.githubusercontent.com，
+# 偶發性 5xx / 逾時用重試吸收
+rabbitmq_delayed_plugin_download_retries: 3
+rabbitmq_delayed_plugin_download_delay: 5
+
+# proxy 三件套（use_egress_proxy=true 時套在 get_url 上）：
+# 值引用 group_vars/all 的 egress 契約變數，格式比照 docker/common role
+rabbitmq_proxy_env:
+  http_proxy: "{{ egress_proxy_url }}"
+  https_proxy: "{{ egress_proxy_url }}"
+  no_proxy: "{{ no_proxy_list }}"

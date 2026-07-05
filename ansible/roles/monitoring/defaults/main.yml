@@ -1,0 +1,47 @@
+---
+# =============================================================================
+# roles/monitoring/defaults/main.yml — 監控堆疊可調參數（單一服務的 knob）
+#
+# 跨 role 契約變數不放這裡（CONVENTIONS.md §7/§8）：
+#   prometheus_retention / cert_expiry_alert_days → group_vars/monitoring.yml
+#   grafana_admin_password / pki_dir / domain / extra_hosts_entries /
+#   patroni_rest_port / rabbitmq_amqps_port → group_vars/all/
+# =============================================================================
+
+# ---------- 佈署路徑（CONVENTIONS.md §4：monitoring compose 專案 = /opt/monitoring） ----------
+monitoring_home: /opt/monitoring
+
+# ---------- 容器映像（版本 pin 死，升級 = 改這裡 + 走 PR） ----------
+# 四個映像官方都發佈 multi-arch manifest（amd64/arm64），Apple Silicon 上的
+# lab 容器與 prod x86 VM 都能直接 pull，不需要像 keydb 那樣依架構挑 tag。
+monitoring_prometheus_image: prom/prometheus:v3.5.0
+monitoring_grafana_image: grafana/grafana-oss:11.6.0
+monitoring_alertmanager_image: prom/alertmanager:v0.28.0
+monitoring_blackbox_image: prom/blackbox-exporter:v0.25.0
+
+# ---------- 對外服務埠（CONVENTIONS.md §3 契約值） ----------
+monitoring_prometheus_port: 9090
+monitoring_grafana_port: 3000
+monitoring_alertmanager_port: 9093
+monitoring_blackbox_port: 9115
+
+# ---------- 抓取目標的 metrics 埠（CONVENTIONS.md §3 契約值） ----------
+# node_exporter 的 9100 與 roles/node_exporter/defaults 的 node_exporter_port
+# 互為對照；haproxy 8404 / rabbitmq 15692 亦同——改任何一個都要先改契約文件
+monitoring_node_exporter_port: 9100
+monitoring_haproxy_metrics_port: 8404
+monitoring_rabbitmq_metrics_port: 15692
+# etcd 專用 metrics 端點（對照 roles/etcd/defaults 的 etcd_metrics_port）
+monitoring_etcd_metrics_port: 2381
+# KeyDB 的 redis_exporter（對照 roles/keydb/defaults 的 keydb_exporter_port）
+monitoring_keydb_exporter_port: 9121
+
+# ---------- Prometheus 全域抓取節奏 ----------
+# 15s：13 台規模的網路/儲存負擔可忽略，又足夠餵 for: 1m~3m 的告警規則
+monitoring_scrape_interval: 15s
+monitoring_evaluation_interval: 15s
+
+# ---------- 部署後健檢 ----------
+# compose up 後等待各服務監聽埠的上限（秒）；首次 pull 映像的時間不算在內
+# （docker_compose_v2 的 state=present 會先 pull 完才返回）
+monitoring_wait_timeout: 60

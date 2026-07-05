@@ -1,0 +1,20 @@
+---
+# =============================================================================
+# roles/rabbitmq/handlers/main.yml
+# =============================================================================
+
+# 為什麼是 restart 而非 reload：rabbitmq.conf 與 Erlang cookie 只在節點「啟動時」
+# 讀取一次，RabbitMQ 不提供設定熱重載（enabled_plugins 理論上可用 rabbitmq-plugins
+# 熱啟用，但為了單一生效路徑、避免「部分設定生效」的中間態，一律 restart）。
+#
+# 維運警告（junior 必讀）：31-rabbitmq.yml 對本 role 不用 serial（叢集組建需要
+# 三台在同一個 play 裡依序帶起），因此設定/憑證變更重跑全群組時，三台會在
+# flush_handlers 處「同時」重啟 → quorum queue 短暫失去多數、暫停服務數秒。
+# 正式環境的計畫性變更請 `--limit mq-01` / `--limit mq-02` / `--limit mq-03`
+# 逐台滾動——quorum queue 容忍單節點離線，全程不中斷。
+# noqa name[casing]：CONVENTIONS.md §8 規定 handler 名稱格式為小寫「restart <service>」，
+# 全 repo 的 notify 都依賴這個確切字串，不可為了 lint 規則改大小寫
+- name: restart rabbitmq # noqa: name[casing]
+  ansible.builtin.systemd_service:
+    name: rabbitmq-server
+    state: restarted

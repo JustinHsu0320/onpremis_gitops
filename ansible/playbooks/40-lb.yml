@@ -1,0 +1,14 @@
+---
+# =============================================================================
+# 40-lb.yml — 邊界層（規劃書 §7.5：修正 config drift）
+#
+# 同一份 haproxy role + 同一個模板套 lb-01/02，backend 由 groups['app'] 動態展開
+# ——「結構上不可能」出現多台設定不同步。serial: 1 滾動套用，VIP 全程有人接。
+# =============================================================================
+- name: 邊界 HAProxy + Keepalived（443/465 → app）
+  hosts: lb
+  tags: [lb, edge]
+  serial: 1
+  roles:
+    - role: haproxy
+    - role: keepalived

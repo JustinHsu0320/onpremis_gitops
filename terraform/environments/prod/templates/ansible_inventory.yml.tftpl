@@ -1,0 +1,13 @@
+---
+# 由 Terraform 渲染的 inventory「對照稿」（terraform output -raw rendered_ansible_inventory）
+# 僅供與 ansible/inventories/prod/hosts.yml 人工比對——inventory 才是唯一事實來源（ADR-1）。
+# 注意：群組為字母序；別名群組（egress/keydb/etcd）也帶 ansible_host（hosts.yml 中為 {}）。
+all:
+  children:
+%{ for group, hosts in groups ~}
+    ${group}:
+      hosts:
+%{ for h in hosts ~}
+        ${h}: { ansible_host: ${ips[h]} }
+%{ endfor ~}
+%{ endfor ~}

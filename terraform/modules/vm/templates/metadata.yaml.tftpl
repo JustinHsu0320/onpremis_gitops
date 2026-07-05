@@ -1,0 +1,38 @@
+# cloud-init「metadata」——VMware guestinfo datasource 格式
+# （由 terraform/modules/vm/main.tf 渲染後 base64 塞進 guestinfo.metadata）
+#
+# metadata 管「開機前就必須確定的事」：機器身分（instance-id / hostname）
+# 與網路（netplan v2 靜態 IP）。帳號 / 金鑰 / sshd 設定屬於 userdata。
+#
+# instance-id 的意義：cloud-init 用它判斷「我是不是第一次開機」。
+# 用 VM 名稱當值 → 值恆定 → cloud-init 只在首次開機執行一次，之後重開機不重跑。
+instance-id: ${hostname}
+local-hostname: ${hostname}
+
+# netplan v2 格式的網路設定（cloud-init 會原封不動落到
+# /etc/netplan/50-cloud-init.yaml）。IP 對照表的唯一事實來源：
+# CONVENTIONS.md §2 + ansible/inventories/prod/hosts.yml。
+network:
+  version: 2
+  ethernets:
+%{ for idx, nic in networks ~}
+    ${nic.name}:
+      dhcp4: false
+      addresses:
+        - ${nic.ipv4}/${nic.netmask}
+%{ if nic.is_primary ~}
+      # 只有主網卡（第 0 張）掛預設路由——多網卡時兩條 default 會打架
+      routes:
+        - to: default
+          via: ${nic.gateway}
+%{ if length(dns_servers) > 0 ~}
+      nameservers:
+        addresses: [${join(", ", dns_servers)}]
+        search: [${domain}]
+%{ endif ~}
+%{ endif ~}
+%{ endfor ~}
+
+# 要求 cloud-init 等到 IPv4 就緒才繼續往下跑（避免 userdata 階段搶跑）
+wait-on-network:
+  ipv4: true

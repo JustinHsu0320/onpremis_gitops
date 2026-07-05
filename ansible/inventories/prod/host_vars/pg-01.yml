@@ -1,0 +1,6 @@
+---
+# pg-01：PgBouncer VIP 常態持有者。注意：VIP 位置與 Patroni leader 位置「無關」——
+# VIP 只決定「app 的封包進哪台的 HAProxy」，HAProxy 再依 Patroni REST 健檢把連線
+# 導向真正的 leader/replica。所以 VIP 漂移不會造成資料面切換。
+keepalived_state: MASTER
+keepalived_priority: 150

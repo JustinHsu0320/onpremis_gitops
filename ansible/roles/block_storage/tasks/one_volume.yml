@@ -1,0 +1,92 @@
+---
+# =============================================================================
+# one_volume.yml — 單顆資料碟的完整生命週期（由 main.yml 以 loop 逐顆 include）
+#
+# 冪等策略（重跑安全的關鍵）：
+#   1. 掛載點已經是掛載點 → 整顆跳過（碟早就處理好了）
+#   2. 否則從「還沒被用的裸碟」裡，用 size 認出目標碟
+#   3. filesystem 模組對「已有檔案系統的碟」不會重建（除非 force）→ 不會抹掉資料
+#   4. mount 用 UUID 寫進 fstab（裝置名 /dev/sdb 重開機可能跳號，UUID 不會變）
+# =============================================================================
+
+# ---- 冪等短路：已掛載就什麼都不用做 ----
+- name: 檢查掛載點是否已生效：{{ vol.mountpoint }}
+  ansible.builtin.command: mountpoint -q {{ vol.mountpoint }}
+  register: block_storage_mp
+  changed_when: false
+  failed_when: false
+
+- name: 格式化並掛載 {{ vol.mountpoint }}
+  when: block_storage_mp.rc != 0
+  block:
+
+    # 「認碟」：從所有 block device 中挑出——
+    #   type=disk（整顆碟，不是分割）、沒有檔案系統（fstype 為 null，代表還沒被用過）、
+    #   沒被掛載、沒有子分割（children 未定義）、容量落在目標 ±tolerance 窗口內。
+    # 前提（已寫入 CONVENTIONS/README）：同一台機器上的資料碟「容量互異」，
+    # 才能用 size 精確區分用途（本設計 pg=200/50/10、mq=100、nfs=1000 皆滿足）。
+    - name: 找出符合容量、尚未使用的裸碟
+      ansible.builtin.set_fact:
+        block_storage_candidates: >-
+          {{ block_storage_devices
+             | selectattr('type', 'equalto', 'disk')
+             | selectattr('fstype', 'equalto', none)
+             | selectattr('mountpoint', 'equalto', none)
+             | rejectattr('children', 'defined')
+             | selectattr('size', 'ge', (vol.size_gb * (1 - block_storage_size_tolerance) * 1073741824) | int)
+             | selectattr('size', 'le', (vol.size_gb * (1 + block_storage_size_tolerance) * 1073741824) | int)
+             | map(attribute='name') | list }}
+
+    # 認不到（0 顆）或認到多顆（size 撞車）都必須停下來讓人看——
+    # 這是「寧可部署失敗，也不要把檔案系統建錯碟」的安全底線
+    - name: 斷言恰好認出一顆碟
+      ansible.builtin.assert:
+        that: block_storage_candidates | length == 1
+        fail_msg: >-
+          無法為 {{ vol.mountpoint }}（{{ vol.size_gb }}GB）唯一認出資料碟：
+          符合的裸碟 = {{ block_storage_candidates }}。
+          可能原因：Terraform 未掛此碟 / 同機有多顆同容量的碟 / 碟已被別的用途佔用。
+          請檢查 lsblk 後手動指定，勿讓自動化猜。
+
+    - name: 記錄目標裝置路徑
+      ansible.builtin.set_fact:
+        block_storage_dev: "/dev/{{ block_storage_candidates[0] }}"
+
+    # 直接對整顆裸碟建檔案系統（不切分割表）：VMDK 場景下沒有多重分割的需求，
+    # 少一層分割表 = 擴容時 xfs_growfs 一步到位。filesystem 模組本身冪等：
+    # 偵測到碟上已有 xfs 就不動（除非傳 force，我們不傳）→ 絕不誤抹既有資料
+    - name: 建立資料碟檔案系統於 {{ block_storage_dev }}
+      community.general.filesystem:
+        fstype: "{{ block_storage_fstype }}"
+        dev: "{{ block_storage_dev }}"
+
+    - name: 建立掛載點目錄 {{ vol.mountpoint }}
+      ansible.builtin.file:
+        path: "{{ vol.mountpoint }}"
+        state: directory
+        mode: "0755"
+
+    # 抓檔案系統 UUID：用 UUID 而非 /dev/sdX 寫 fstab，重開機裝置跳號也掛得對
+    - name: 取得檔案系統 UUID
+      ansible.builtin.command: blkid -s UUID -o value {{ block_storage_dev }}
+      register: block_storage_uuid
+      changed_when: false
+
+    - name: 掛載並寫入 fstab（開機自動掛載）
+      ansible.posix.mount:
+        path: "{{ vol.mountpoint }}"
+        src: "UUID={{ block_storage_uuid.stdout | trim }}"
+        fstype: "{{ block_storage_fstype }}"
+        opts: "{{ block_storage_mount_opts }}"
+        state: mounted
+
+    # 掛載點根目錄的擁有者：預設交給對應服務 role 收斂（block_storage_apply_owner=false）。
+    # 服務 role（patroni/etcd/rabbitmq）比本階段晚跑、屆時帳號才存在，
+    # 它們建自己的資料目錄時會設對 owner。這裡只在明確要求時才設。
+    - name: 設定掛載點權限與擁有者
+      ansible.builtin.file:
+        path: "{{ vol.mountpoint }}"
+        state: directory
+        owner: "{{ vol.owner | default('root') if block_storage_apply_owner else 'root' }}"
+        group: "{{ vol.group | default('root') if block_storage_apply_owner else 'root' }}"
+        mode: "{{ vol.mode | default('0755') }}"

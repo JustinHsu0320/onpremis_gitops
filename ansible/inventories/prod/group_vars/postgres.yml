@@ -1,0 +1,76 @@
+---
+# =============================================================================
+# group_vars/postgres.yml — 資料層 PostgreSQL（Patroni + etcd + PgBouncer +
+#                            本地 HAProxy + Keepalived，全部同居 pg-01/02/03）
+# =============================================================================
+
+# ---------- Patroni / PostgreSQL ----------
+pg_version: "18"
+pg_cluster_scope: email-proxy-pg          # Patroni scope：整個叢集的識別名
+pg_app_db: email_proxy
+pg_app_user: email_proxy
+
+# 跨 role 共用的「單一事實來源」（patroni / pgbouncer / pgbackrest 都引用，
+# 不放 role defaults——兩個 role 各自 default 同一件事，遲早分叉）
+pg_data_dir: /var/lib/postgresql/18/email-proxy
+# WAL 獨立碟（規劃書 §2.3：WAL 順序寫，與 data 隨機讀寫分開，避免 IO 互搶）。
+# prod → 獨立 50G VMDK 掛到此路徑；lab（容器無獨立碟）→ 空字串 = WAL 與 data 同碟。
+# 用 is_container 自動切換，確保 lab 的 Patroni initdb 不會 --waldir 到未掛載的路徑
+pg_wal_dir: "{{ '' if (is_container | default(false)) else ('/var/lib/postgresql/' ~ pg_version ~ '/wal') }}"
+pgbackrest_stanza: email-proxy            # patroni 的 archive_command 與 pgbackrest 設定共用
+pgbouncer_auth_user: pgbouncer_auth       # patroni 建帳號、pgbouncer 拿來連 —— 必須同名
+
+# ---------- 資料碟掛載（block_storage role，規劃書 §2.3；lab 因 is_container 跳過） ----------
+# 對應 terraform/environments/prod/main.tf 的 pg_extra_disks（200/50/10 GB，
+# 各自獨立 PVSCSI 控制器）。size_gb 是「認碟」依據，三顆容量互異可精確區分用途。
+# owner 交給 patroni/etcd role 收斂（此階段服務帳號尚未建立，見 block_storage defaults）
+storage_volumes:
+  - { mountpoint: "{{ pg_data_dir }}", size_gb: 200, owner: postgres, group: postgres, mode: "0700" }
+  - { mountpoint: "/var/lib/postgresql/{{ pg_version }}/wal", size_gb: 50, owner: postgres, group: postgres, mode: "0700" }
+  - { mountpoint: "/var/lib/etcd", size_gb: 10, owner: etcd, group: etcd, mode: "0700" }
+
+# ---------- PKI（一台 pg 節點要領 4 張憑證，各司其職） ----------
+pki_certificates:
+  # etcd 對 client（Patroni）與對 peer（其他 etcd）都收 TLS，用 peer profile 一張搞定
+  - name: etcd
+    profile: peer
+    owner: root
+    group: etcd
+    key_mode: "0640"
+    extra_sans: ["IP:127.0.0.1"]          # etcdctl 走 localhost 健檢
+  # Patroni 作為 etcd 的 client（DCS 連線）
+  - name: patroni-etcd-client
+    profile: client
+    owner: postgres
+    group: postgres
+    key_mode: "0600"
+  # PostgreSQL 本體 ssl=on 用
+  - name: postgres-server
+    profile: server
+    owner: postgres
+    group: postgres
+    key_mode: "0600"
+  # PgBouncer 對 app 提供 TLS 用
+  - name: pgbouncer-server
+    profile: server
+    owner: postgres
+    group: postgres
+    key_mode: "0600"
+    # app 連的是 pgbouncer-vip 這個名字，SAN 必須涵蓋 VIP 名稱與 IP
+    extra_sans:
+      - "DNS:pgbouncer-vip.{{ domain }}"
+      - "DNS:pgbouncer-vip"
+      - "IP:{{ pgbouncer_vip }}"
+
+# ---------- 本地 HAProxy（RW/RO 分流）+ Keepalived ----------
+haproxy_profile: postgres
+
+keepalived_instances:
+  - name: VI_PG
+    vrid: 30
+    vip: "{{ pgbouncer_vip }}"
+    state: "{{ keepalived_state }}"        # host_vars：pg-01=MASTER，其餘 BACKUP
+    priority: "{{ keepalived_priority }}"  # host_vars：150 / 120 / 100
+    auth_pass: "{{ vrrp_pass_pg }}"
+    peers_group: postgres
+    track_haproxy: true

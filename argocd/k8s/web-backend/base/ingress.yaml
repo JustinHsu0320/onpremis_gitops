@@ -1,0 +1,41 @@
+# =============================================================================
+# web-backend Ingress（base）
+#
+# API 對外入口：api.ptc-nec.com.tw，同樣走 ingress-nginx + 內部 CA TLS。
+# TLS/憑證來源說明與 cert-manager 擴充註記，詳見
+# web-frontend/base/ingress.yaml（兩者同一套模式）。
+# =============================================================================
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: web-backend
+  labels:
+    app.kubernetes.io/name: web-backend
+    app.kubernetes.io/component: backend
+  annotations:
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    # API 常見需求：放大上傳限制（預設 1m 對檔案上傳 API 太小）
+    nginx.ingress.kubernetes.io/proxy-body-size: "16m"
+    # 【擴充註記】cert-manager + 內部 CA ClusterIssuer 就緒後打開：
+    # cert-manager.io/cluster-issuer: internal-ca-issuer
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - api.ptc-nec.com.tw
+      # 內部 CA 簽發；未導入 cert-manager 前手動建立：
+      #   kubectl -n web-backend create secret tls web-backend-tls \
+      #     --cert=api.ptc-nec.com.tw.crt --key=api.ptc-nec.com.tw.key
+      secretName: web-backend-tls
+  rules:
+    - host: api.ptc-nec.com.tw
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: web-backend
+                port:
+                  name: http

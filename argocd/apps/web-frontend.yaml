@@ -1,0 +1,72 @@
+# =============================================================================
+# Application: web-frontend —— 平台前端（SPA，nginx 靜態伺服）
+#
+# 本檔由 root Application 自動同步（App-of-Apps 第二層）。
+# 它宣告「web-frontend 這個應用 = 本 repo argocd/k8s/web-frontend/overlays/prod
+# 的 Kustomize 輸出，部署到 web-frontend namespace」。
+#
+# 部署流（與 gitlab/ci-templates 的 bump 流程銜接）：
+#   應用 repo 出新版 → CI build/push 映像到 registry.ptc-nec.com.tw:5050
+#   → CI bump job 對本 repo 執行 kustomize edit set image（改 overlays/prod
+#     的 tag）並 commit push → ArgoCD 偵測新 commit → 自動同步上線。
+#   人不碰 kubectl，Git log 即部署史。
+# =============================================================================
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: web-frontend
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: web-frontend
+    app.kubernetes.io/part-of: platform
+  # finalizer：刪除此 Application（或從 apps/ 目錄移除本檔且 root 開 prune）時，
+  # 級聯刪除其管理的所有 K8s 資源 ——「刪碼即下架」，不留殭屍工作負載
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  # 套用 platform AppProject 的安全邊界（來源 repo / 目的地 / 資源種類白名單）
+  project: platform
+
+  source:
+    repoURL: https://gitlab.ptc-nec.com.tw/platform/gitops.git
+    # 跟 main 分支走（而非釘死 commit）：main 上的每個 merge 都是「可部署」的
+    # 宣告 —— 這正是 trunk-based GitOps 的精神；權限由 GitLab protected branch 把關
+    targetRevision: main
+    # 指向 prod overlay（base + 正式環境 patch）；ArgoCD 看到目錄下有
+    # kustomization.yaml 會自動用 Kustomize render，不需額外設定
+    path: argocd/k8s/web-frontend/overlays/prod
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: web-frontend
+
+  # ---------------------------------------------------------------------------
+  # GitOps 自癒三件套：automated + prune + selfHeal
+  # ---------------------------------------------------------------------------
+  syncPolicy:
+    automated:
+      # prune: Git 裡刪掉的資源，叢集上也同步刪除。
+      # 不開 prune 的話，改名/移除資源會在叢集留下無人管理的殭屍物件。
+      prune: true
+      # selfHeal: 有人 kubectl edit/delete 手改叢集（drift），ArgoCD 會自動
+      # 擰回 Git 宣告的狀態。這是「Git 是唯一事實來源」的強制執行機制 ——
+      # 要改正式環境，唯一入口是發 MR。
+      selfHeal: true
+    syncOptions:
+      # 首次同步自動建立 web-frontend namespace
+      # （platform AppProject 的 clusterResourceWhitelist 已放行 Namespace）
+      - CreateNamespace=true
+      # 只 apply 有差異的資源，降低大量資源時 API server 的壓力
+      - ApplyOutOfSyncOnly=true
+    retry:
+      # 暫時性失敗（映像還在 push、webhook 比 registry 快一步）自動重試
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+
+  # 保留最近 10 筆同步歷史（UI 可一鍵 rollback —— rollback 本質也是回到
+  # 某個 Git revision，不是黑魔法）
+  revisionHistoryLimit: 10

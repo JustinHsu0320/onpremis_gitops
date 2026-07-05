@@ -1,0 +1,17 @@
+%% =============================================================================
+%% /etc/rabbitmq/enabled_plugins — {{ ansible_managed }}
+%%
+%% Erlang term 格式：單一 list、結尾句點必要；% 開頭是 Erlang 註解。
+%% 這份檔是「顯式啟用」清單，相依 plugin（如 rabbitmq_management 依賴的
+%% rabbitmq_management_agent / rabbitmq_web_dispatch）由 RabbitMQ 啟動時自動補齊。
+%% 改動後需 restart rabbitmq-server（role 以 notify 觸發，不熱啟用，
+%% 避免「檔案與執行中狀態不一致」的中間態）。
+%%
+%%   - rabbitmq_management：15672 管理 UI/API（vhost/user/queue 的冪等管理與
+%%     99-verify 的訊息收發驗證都靠它）
+%%   - rabbitmq_prometheus：15692 /metrics（mgmt-01 Prometheus 抓取）
+%%   - rabbitmq_delayed_message_exchange：延遲訊息（現有系統重試機制依賴；
+%%     .ez 由 role 從 GitHub release 下載進 plugins 目錄，
+%%     rabbitmq_delayed_plugin_enabled=true 時才列入）
+%% =============================================================================
+[rabbitmq_management,rabbitmq_prometheus{% if rabbitmq_delayed_plugin_enabled %},rabbitmq_delayed_message_exchange{% endif %}].

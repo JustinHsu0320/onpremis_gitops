@@ -1,0 +1,15 @@
+{# =========================================================================
+   userlist.txt — PgBouncer 本地驗證檔（僅兩個內部帳號）
+
+   【為什麼只有兩筆】一般使用者（{{ pg_app_user }} 等）不進這個檔：
+   PgBouncer 收到未知使用者時，會以 auth_user 連 PG 執行 auth_query
+   動態查驗證資訊。app 帳號改密碼只要改 PG 一處，不用重佈此檔。
+
+   【格式】"使用者" "密碼"，一行一筆。auth_type=scram-sha-256 時
+   PgBouncer 可用明文值對客戶端完成 SCRAM 交換（值不會在線路上明文傳輸）。
+
+   注意：本段是 Jinja 註解，render 後的檔案只會有下面兩行——
+   PgBouncer 的 userlist 解析器不吃註解行，別在產出檔裡加任何註解。
+   ========================================================================= -#}
+"{{ pgbouncer_auth_user }}" "{{ pgbouncer_auth_password }}"
+"{{ pgbouncer_admin_user }}" "{{ pgbouncer_admin_password }}"

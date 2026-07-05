@@ -1,0 +1,91 @@
+---
+# =============================================================================
+# roles/pgbouncer/tasks/main.yml — PgBouncer 連線池（規劃書 §7.7）
+#
+# 分層職責（junior 必讀）：
+#   HAProxy 管「路由到誰」（依 Patroni /primary /replica 健檢挑節點）
+#   PgBouncer 管「連線池」（把上千個 app 連線壓成 20 條後端 PG 連線）
+# 所以 PgBouncer 只連本機 127.0.0.1:5432，完全不感知叢集拓撲。
+# =============================================================================
+
+# Ubuntu 官方 archive 的 pgbouncer 1.25：不加第三方 repo（規劃書鐵律）。
+# cache_valid_time 避免每次重跑都 apt update（冪等 + 提速）。
+- name: 安裝 PgBouncer 套件
+  ansible.builtin.apt:
+    name: pgbouncer
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+# pki_leaf 產出的私鑰預設 root:root 0640，但 Debian 的 pgbouncer 服務以
+# postgres 身分執行（systemd unit User=postgres），讀不到就起不來。
+# 注意收斂目標必須與 group_vars/postgres.yml 的 pki_certificates 宣告「完全一致」
+# （postgres:postgres 0600）——pki_leaf 重跑時會落在宣告值上，
+# 兩邊目標不同就會每次互改（所有權乒乓、假 changed）
+- name: 收斂 pgbouncer-server 憑證擁有權（與 pki_certificates 宣告一致）
+  ansible.builtin.file:
+    path: "{{ pki_dir }}/pgbouncer-server.{{ item.ext }}"
+    owner: postgres
+    group: postgres
+    mode: "{{ item.mode }}"
+  loop:
+    - { ext: key, mode: "0600" }
+    - { ext: crt, mode: "0644" }
+  loop_control:
+    label: "pgbouncer-server.{{ item.ext }}"
+
+# PKI 契約：10-pki 重簽憑證時 pki_leaf 會設 host fact pki_certs_changed=true。
+# 憑證檔內容變了但 ini/userlist 沒變 → template task 不會觸發 handler，
+# 所以需要這個「橋接 task」把憑證輪替事件轉成 reload（SIGHUP 會重讀 TLS 憑證）。
+# /bin/true 只是掛 notify 的載體，本身無副作用。
+- name: 偵測 PKI 憑證輪替並排程 reload
+  ansible.builtin.command: /bin/true
+  changed_when: true
+  when: pki_certs_changed | default(false)
+  notify: reload pgbouncer
+
+# 主設定檔：owner postgres 是因為服務以 postgres 執行；0640 是因為
+# ini 內含 auth_query 等內部細節，不給 other 讀（機密本身在 userlist.txt）。
+- name: 佈署 pgbouncer.ini
+  ansible.builtin.template:
+    src: pgbouncer.ini.j2
+    dest: /etc/pgbouncer/pgbouncer.ini
+    owner: postgres
+    group: postgres
+    mode: "0640"
+  notify: reload pgbouncer
+
+# userlist.txt 含明文密碼 → 0600 + no_log（機密規範 CONVENTIONS.md §8.5）。
+# 只放 pgbouncer_auth / pgbouncer_admin 兩筆；一般使用者（email_proxy 等）
+# 靠 auth_query 動態向 PG 查驗證資訊，不進這個檔（見 template 內註解）。
+- name: 佈署 userlist.txt（僅 auth/admin 兩個內部帳號）
+  ansible.builtin.template:
+    src: userlist.txt.j2
+    dest: /etc/pgbouncer/userlist.txt
+    owner: postgres
+    group: postgres
+    mode: "0600"
+  no_log: true
+  notify: reload pgbouncer
+
+# enabled=true：開機自啟；state=started 只保證「有在跑」，
+# 設定變更的生效交給 reload handler（不斷線）。
+- name: 啟用並啟動 pgbouncer 服務
+  ansible.builtin.systemd_service:
+    name: pgbouncer
+    enabled: true
+    state: started
+
+# 先把排隊中的 reload 立刻執行掉，再驗埠——否則首次部署時
+# apt 裝完就以「Debian 預設 ini」起了服務，埠通了但設定還是舊的，
+# 下面的 wait_for 會給出「假通過」。
+- name: 立即套用尚未生效的設定變更
+  ansible.builtin.meta: flush_handlers
+
+# 部署自驗：確認 PgBouncer 真的在聽 6432（listen_addr=0.0.0.0，
+# 本機迴環驗得到就代表 socket 已就緒；跨網段可達性由 99-verify 驗）。
+- name: 等待 PgBouncer 監聽 {{ pgbouncer_port }}
+  ansible.builtin.wait_for:
+    host: 127.0.0.1
+    port: "{{ pgbouncer_port }}"
+    timeout: "{{ pgbouncer_wait_timeout }}"

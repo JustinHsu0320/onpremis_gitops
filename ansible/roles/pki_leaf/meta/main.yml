@@ -1,0 +1,13 @@
+---
+galaxy_info:
+  author: platform-team
+  description: 葉憑證簽發（CSR 於目標主機、delegate 至 Issuing CA 簽發）與內部 CA 信任派送
+  company: PTC-NEC
+  license: MIT
+  min_ansible_version: "2.16"
+  platforms:
+    - name: Ubuntu
+      versions: ["all"]
+  galaxy_tags: [pki, tls, security]
+
+dependencies: []

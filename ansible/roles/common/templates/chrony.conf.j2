@@ -1,0 +1,35 @@
+# =============================================================================
+# /etc/chrony/chrony.conf — 由 Ansible（common role）管理，手動修改必被覆蓋
+#
+# 為什麼地端所有主機必須統一時源（規劃書 §7.1）：
+#   1. TLS 驗證：憑證有效期（notBefore/notAfter）用「本機時鐘」比對。
+#      本專案全鏈 mTLS（etcd / Patroni / PG / PgBouncer / KeyDB / RabbitMQ），
+#      任何一台時鐘漂移過大 = 該台的 TLS handshake 全部失敗 = 該台等同離線。
+#   2. 日誌關聯：13 台主機的事故排查靠時間軸串接（LB → app → MQ → DB）；
+#      時鐘不一致時「先發生什麼、後發生什麼」根本無法還原。
+#   3. Patroni / etcd 的 leader TTL：leader lease 的存續判斷依賴各節點
+#      時鐘速率一致；漂移過大可能誤判 leader 失聯 → 非必要 failover。
+# =============================================================================
+
+{# 時源清單來自 group_vars/all 的 ntp_servers；接公司內部 NTP 時只改該變數 #}
+{% for server in ntp_servers %}
+server {{ server }} iburst
+{% endfor %}
+
+# 記錄本機時鐘漂移率：重啟後立刻以歷史漂移補償，縮短收斂時間
+driftfile /var/lib/chrony/chrony.drift
+
+# 開機初期（前 3 次量測）偏差超過 1 秒時允許直接「跳時」對齊；
+# 之後只用 slew（漸進調速）修正——執行中的資料庫最怕看到時間倒退
+makestep 1.0 3
+
+# 定期把系統時間寫回硬體時鐘（RTC），下次冷開機不會帶著大偏差起來
+rtcsync
+
+# 閏秒用時區資料庫平滑處理（slew），避免瞬間 +1s 衝擊 DB 與叢集心跳
+leapsectz right/UTC
+
+# 只當 NTP 用戶端、不對外提供授時服務（縮小攻擊面；主機們各自對上游同步）
+port 0
+
+logdir /var/log/chrony

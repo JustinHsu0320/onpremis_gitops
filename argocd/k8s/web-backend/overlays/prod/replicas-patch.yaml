@@ -1,0 +1,29 @@
+# =============================================================================
+# 正式環境副本數 patch（strategic merge patch）
+#
+# 意圖上只覆蓋 spec.replicas，其餘全部繼承 base（patch 原理與
+# kubeconform 必填欄位的說明，見 web-frontend 的 replicas-patch.yaml）。
+#
+# 後端給 3 副本：API 是關鍵路徑，比前端多留一份冗餘；
+# 搭配 maxUnavailable: 0，更新期間容量不打折。
+# 之後導入 HPA 時移除本 patch（replicas 與 HPA 不可並存）。
+#
+# 註：selector / template 與 base 完全相同（merge 後 no-op），
+# 僅為通過 kubeconform -strict 的 DeploymentSpec 必填驗證；
+# 改動時務必與 base 同步。
+# =============================================================================
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-backend
+spec:
+  replicas: 3 # ← 本 patch 唯一有意義的覆蓋值
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: web-backend # 與 base 一致（僅為 schema 驗證）
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: web-backend # 與 base 一致（僅為 schema 驗證）
+        app.kubernetes.io/component: backend

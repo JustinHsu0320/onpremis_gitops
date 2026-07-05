@@ -1,0 +1,40 @@
+# =============================================================================
+# web-frontend 正式環境 overlay
+#
+# ArgoCD Application（argocd/apps/web-frontend.yaml）指向的就是「本目錄」。
+# base 疊上這裡的 patch，就是正式環境的完整宣告。
+# 之後要加 staging，複製本目錄改參數即可 —— base 一行不用動。
+# =============================================================================
+---
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# 正式環境的目標 namespace（Application 開了 CreateNamespace=true，
+# 首次同步會自動建立；platform AppProject 已放行 Namespace 資源）
+namespace: web-frontend
+
+resources:
+  - ../../base
+
+patches:
+  # 正式環境副本數（base 只給 1）
+  - path: replicas-patch.yaml
+
+# =============================================================================
+# 【CI bump 流程的接縫 —— 全 repo 最常被機器改動的一段】
+#
+# 映像 tag「不由人手改」。應用 repo 出新版時，gitlab/ci-templates 的
+# bump job 會對本 repo 執行：
+#
+#   cd argocd/k8s/web-frontend/overlays/prod
+#   kustomize edit set image \
+#     registry.ptc-nec.com.tw:5050/platform/web-frontend:v1.1.0
+#   git commit -am "chore(web-frontend): bump image to v1.1.0" && git push
+#
+# `kustomize edit set image` 改的就是下方 images: 段的 newTag。
+# push 之後 ArgoCD 偵測到新 commit → 自動同步 → 滾動更新上線。
+# 好處：部署史 = git log，回滾 = git revert 這一個 commit。
+# =============================================================================
+images:
+  - name: registry.ptc-nec.com.tw:5050/platform/web-frontend # 對應 base deployment 的 image（不含 tag）
+    newTag: v1.0.0 # ← CI bump job 自動改寫此行，人不手改

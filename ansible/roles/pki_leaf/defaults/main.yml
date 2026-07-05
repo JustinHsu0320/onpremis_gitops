@@ -1,0 +1,60 @@
+---
+# =============================================================================
+# pki_leaf / defaults — 葉憑證簽發與 CA 信任派送的可調參數
+#
+# 驅動變數 pki_certificates 由各群組 group_vars 定義（CONVENTIONS.md §5），
+# 每個項目的欄位：
+#   name        檔名基底 → {{ pki_dir }}/<name>.{key,csr,crt[,pem]}
+#   profile     server / client / peer → 對應 EKU（見 pki_leaf_profile_eku）
+#   cn          預設 <inventory_hostname>.<domain>，可覆寫（如 VIP 名稱）
+#   extra_sans  在預設 SAN（fqdn/短名/ansible_host）之外追加
+#   key_mode    私鑰檔權限（預設 pki_leaf_key_mode）
+#   bundle_pem  true 時額外產出 <name>.pem（葉+chain+私鑰，HAProxy 格式）
+#
+# 【簡化決策：檔案擁有者一律 root:root】
+# 契約 §5 的 owner/group 欄位（postgres/etcd/rabbitmq 等服務帳號）在本 role
+# 「刻意不套用」：10-pki 比服務 playbook 先跑，這些帳號要等服務 role 裝完
+# apt 套件才存在，簽發當下 chown 必定失敗。因此本 role 一律落地 root:root，
+# 由各服務 role 在安裝套件後，用 ansible.builtin.file 把自己在 pki_dir 下的
+# key/crt chown 給服務帳號（或用 group+0640 授權讀取）。
+# =============================================================================
+
+# 各群組要簽的憑證清單；預設空 = 該主機只安裝 CA 信任（如 nfs、mgmt）
+pki_certificates: []  # noqa: var-naming[no-role-prefix] CONVENTIONS.md §5 契約變數名，跨 role 介面不可加前綴
+
+# 葉憑證私鑰長度：2048 就好——效期僅 397 天、講究 TLS 握手效能；CA 才用 4096
+pki_key_size: 2048  # noqa: var-naming[no-role-prefix] CONVENTIONS.md §5 契約變數名，跨 role 介面不可加前綴
+
+# 私鑰檔預設權限：root:root + 0640，服務 role 之後自行 chown/chgrp 調整
+pki_leaf_key_mode: "0640"
+
+# 葉憑證效期：397 天（規劃書 §5；對齊公網 CA 的最長效期慣例，強迫年度輪替）
+pki_leaf_validity: "+397d"
+
+# x509_certificate 對「既存有效憑證」不會重簽（冪等）。
+# 到期前的主動輪替：ansible-playbook playbooks/10-pki.yml -e pki_leaf_force_renew=true
+pki_leaf_force_renew: false
+
+# 預設 SAN：fqdn + 短名 + 本機 IP（延遲展開，各主機各自求值）
+pki_leaf_default_sans:
+  - "DNS:{{ inventory_hostname }}.{{ domain }}"
+  - "DNS:{{ inventory_hostname }}"
+  - "IP:{{ ansible_host }}"
+
+# profile → EKU 對照（CONVENTIONS.md §5）：
+#   server = 只被連（PG、PgBouncer、HAProxy 443…）
+#   client = 只去連別人（Patroni→etcd、app→KeyDB…）
+#   peer   = 互為 server/client 的 mesh（etcd peer、KeyDB cluster bus）
+pki_leaf_profile_eku:
+  server: [serverAuth]
+  client: [clientAuth]
+  peer: [serverAuth, clientAuth]
+
+# ---------- 簽發主機（mgmt-01）上的 CA 檔案介面（與 internal_ca defaults 對齊） ----------
+pki_leaf_ca_chain_src: "{{ ca_root }}/ca-chain.crt"
+pki_leaf_issuing_ca_cert: "{{ ca_root }}/issuing-ca.crt"
+pki_leaf_issuing_ca_key: "{{ ca_root }}/issuing-ca.key"
+pki_leaf_issued_dir: "{{ ca_root }}/issued"
+
+# 系統信任錨路徑（CONVENTIONS.md §4）：讓 curl / psql / docker 等系統工具信任內部 CA
+pki_leaf_trust_anchor: /usr/local/share/ca-certificates/email-proxy-internal-ca.crt

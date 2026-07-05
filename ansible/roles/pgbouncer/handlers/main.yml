@@ -1,0 +1,13 @@
+---
+# =============================================================================
+# roles/pgbouncer/handlers/main.yml
+# =============================================================================
+
+# reload = SIGHUP：PgBouncer 重讀 ini / userlist / TLS 憑證（1.16 起支援
+# SIGHUP 換憑證），「既有客戶端連線不中斷」——這正是選 reload 而非 restart
+# 的原因：資料層連線池重啟會瞬斷所有 app 的 DB 連線。
+- name: Reload pgbouncer
+  ansible.builtin.systemd_service:
+    name: pgbouncer
+    state: reloaded
+  listen: reload pgbouncer

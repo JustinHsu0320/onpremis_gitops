@@ -1,0 +1,62 @@
+# =============================================================================
+# terraform.tfvars.example — prod 環境變數示範值
+#
+# 用法：cp terraform.tfvars.example terraform.tfvars 後改成真實值。
+# terraform.tfvars 已被 .gitignore 排除（真實值不進 Git）；CI 環境不用這個檔，
+# 一律走 GitLab CI/CD variables（TF_VAR_* 環境變數）注入。
+# =============================================================================
+
+# ---- 1. vCenter 連線 -----------------------------------------------------------
+
+vcenter_server = "vcenter.ptc-nec.com.tw"
+
+# 專用服務帳號（最小權限：VM/資料夾/port group/DRS 規則 CRUD），不要用個人帳號
+vcenter_user = "svc-terraform@vsphere.local"
+
+# 密碼「不要」寫在這裡！用環境變數：
+#   export TF_VAR_vcenter_password='...'   （或 CI 的 masked variable）
+# vcenter_password = "NEVER-PUT-REAL-PASSWORD-IN-A-FILE"
+
+# vCenter 憑證由內部 CA 簽發且執行端已信任 → 維持 false（正道）；
+# 過渡期自簽憑證才暫時開 true，並在 PR 註明
+vcenter_allow_unverified_ssl = false
+
+# ---- 2. vSphere 既存物件名稱（開始前先在 vCenter 確認這些名字都存在） -------------
+
+datacenter = "DC-TPE-01"          # Datacenter
+cluster    = "CL-EMAIL-PROXY"     # 運算叢集：>= 3 台 ESXi，HA + DRS 已啟用
+vds_name   = "vds-prod-01"        # 既存分散式交換器（uplink trunk 已含 VLAN 10/20/30/40/50/99）
+
+datastore     = "ds-prod-sas-01"  # 一般碟：lb/app/mq/nfs/mgmt/gitlab/runner
+datastore_ssd = "ds-prod-nvme-01" # SSD/NVMe：pg-01..03 整台（etcd/WAL fsync 敏感）
+
+# ubuntu-26.04 cloud image 做成的 template：
+# 必含 cloud-init（VMware guestinfo datasource）+ open-vm-tools，OS 碟掛 PVSCSI
+template_name = "tpl-ubuntu-26.04-cloudimg"
+
+vm_folder = "email-proxy" # vCenter 裡收納本專案 VM 的資料夾
+
+# ---- 3. VM 共用參數 ------------------------------------------------------------
+
+domain = "ptc-nec.com.tw"
+
+# mgmt-01 上 `cat ~/.ssh/id_email_proxy.pub` 的完整一行
+ansible_public_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBOGUsExampleExampleExampleExampleExample ansible@mgmt-01"
+
+# 公司內部 DNS（只影響對外解析；主機互解走 Ansible 管的 /etc/hosts，ADR-5）
+dns_servers = ["10.1.1.53", "10.1.1.54"]
+
+# ---- 4. 網路參數 ---------------------------------------------------------------
+
+port_group_prefix  = "email-proxy" # port group 全名 = email-proxy-vlan<id>
+vlan_prefix_length = 24            # CONVENTIONS.md §2：全部 /24
+
+# 每網段閘道 .1（L3 交換器）。機房慣例不同（如 .254）時整個 map 覆寫
+vlan_gateways = {
+  "10" = "10.20.10.1"
+  "20" = "10.20.20.1"
+  "30" = "10.20.30.1"
+  "40" = "10.20.40.1"
+  "50" = "10.20.50.1"
+  "99" = "10.20.99.1"
+}

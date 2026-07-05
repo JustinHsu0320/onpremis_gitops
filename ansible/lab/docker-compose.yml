@@ -1,0 +1,206 @@
+# =============================================================================
+# lab/docker-compose.yml — 13 節點實驗室拓撲（1:1 對應 prod 的 VM 與 VLAN 規劃）
+#
+# ┌─ 網路模擬 ────────────────────────────────────────────────────────────────┐
+# │ 每個 VLAN = 一個 Docker bridge network，網段與 prod 完全相同。            │
+# │ 真實機房的「跨 VLAN 路由 + 防火牆 ACL」在這裡用「多重掛網」模擬：          │
+# │ 一台節點掛上哪些網路 = 防火牆矩陣允許它到達哪些網段（README 有對照表）。   │
+# │ mgmt-01 掛全部網路（= 防火牆規則「mgmt → 全部:22」）。                    │
+# ├─ 與 prod 的已知差異（誠實記錄）────────────────────────────────────────────┤
+# │ 1. prod 節點單網卡 + L3 路由；lab 節點多網卡直連（Docker bridge 無法互通） │
+# │    → 所以 role 內的網卡偵測不可寫死介面名（CONVENTIONS §8-8）             │
+# │ 2. gitlab/runner（VLAN 50）不在 lab：GitLab 需 4GB+ RAM                   │
+# │ 3. 容器共用宿主 kernel：is_container=true 跳過 kernel 級調校              │
+# └───────────────────────────────────────────────────────────────────────────┘
+#
+# 資源註記：13 個 systemd 容器 + 服務全開約需 5-6GB RAM（Docker Desktop 建議 8GB）
+# =============================================================================
+---
+name: email-proxy-lab
+
+# ---------- 共用節點設定（YAML anchor） ----------
+# privileged + cgroup 掛載：讓 systemd 能在容器內當 PID 1 正常管理服務
+# （已在本機 Docker Desktop / cgroupv2 驗證可開機到 running 狀態）
+x-node: &node
+  build:
+    context: .
+    target: base
+  privileged: true
+  cgroup: host
+  volumes:
+    - /sys/fs/cgroup:/sys/fs/cgroup:rw
+  tmpfs:
+    - /run
+    - /run/lock
+    - /tmp
+  stop_signal: SIGRTMIN+3
+  stop_grace_period: 15s
+  restart: unless-stopped
+
+networks:
+  vlan10:   # 邊界層：服務 VIP + egress VIP + lb
+    ipam: { config: [{ subnet: 10.20.10.0/24 }] }
+  vlan20:   # 應用層：app + KeyDB
+    ipam: { config: [{ subnet: 10.20.20.0/24 }] }
+  vlan30:   # 資料層：pg / mq 與其 VIP
+    ipam: { config: [{ subnet: 10.20.30.0/24 }] }
+  vlan40:   # 儲存層：nfs
+    ipam: { config: [{ subnet: 10.20.40.0/24 }] }
+  vlan99:   # 管理層：mgmt
+    ipam: { config: [{ subnet: 10.20.99.0/24 }] }
+
+volumes:
+  # Docker-in-Docker 的 /var/lib/docker：named volume 底層是 ext4，
+  # 讓巢狀 dockerd 能用 overlay2（容器自身 rootfs 是 overlay，疊不了第二層）
+  dind-app-01: {}
+  dind-app-02: {}
+  dind-app-03: {}
+  dind-mgmt-01: {}
+  # nfs-01 的匯出目錄：kernel nfsd 不能匯出容器的 overlayfs rootfs，
+  # named volume 底層是 ext4 —— 正好對應 prod「附件放獨立資料碟」的設計
+  nfs-export: {}
+
+services:
+  # ---------- VLAN 10 邊界層 ----------
+  # lb 同時掛 vlan20：對應防火牆規則「lb → app:8080/2525」
+  lb-01:
+    <<: *node
+    container_name: email-proxy-lb-01
+    hostname: lb-01
+    networks:
+      vlan10: { ipv4_address: 10.20.10.11 }
+      vlan20: { ipv4_address: 10.20.20.201 }
+
+  lb-02:
+    <<: *node
+    container_name: email-proxy-lb-02
+    hostname: lb-02
+    networks:
+      vlan10: { ipv4_address: 10.20.10.12 }
+      vlan20: { ipv4_address: 10.20.20.202 }
+
+  # ---------- VLAN 20 應用層 ----------
+  # app 掛 vlan30（→ pg/mq VIP）、vlan40（→ NFS）、vlan10（→ egress proxy VIP）
+  # = 防火牆矩陣的 app 列
+  app-01: &app-node
+    <<: *node
+    container_name: email-proxy-app-01
+    hostname: app-01
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      - dind-app-01:/var/lib/docker
+    networks:
+      vlan20: { ipv4_address: 10.20.20.11 }
+      vlan30: { ipv4_address: 10.20.30.111 }
+      vlan40: { ipv4_address: 10.20.40.111 }
+      vlan10: { ipv4_address: 10.20.10.111 }
+
+  app-02:
+    <<: *app-node
+    container_name: email-proxy-app-02
+    hostname: app-02
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      - dind-app-02:/var/lib/docker
+    networks:
+      vlan20: { ipv4_address: 10.20.20.12 }
+      vlan30: { ipv4_address: 10.20.30.112 }
+      vlan40: { ipv4_address: 10.20.40.112 }
+      vlan10: { ipv4_address: 10.20.10.112 }
+
+  app-03:
+    <<: *app-node
+    container_name: email-proxy-app-03
+    hostname: app-03
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      - dind-app-03:/var/lib/docker
+    networks:
+      vlan20: { ipv4_address: 10.20.20.13 }
+      vlan30: { ipv4_address: 10.20.30.113 }
+      vlan40: { ipv4_address: 10.20.40.113 }
+      vlan10: { ipv4_address: 10.20.10.113 }
+
+  # ---------- VLAN 30 資料層：PostgreSQL ----------
+  # pg 掛 vlan40（→ NFS 備份庫）；shm_size：PG 的動態共享記憶體用 /dev/shm，
+  # Docker 預設 64MB 不夠並行查詢用
+  pg-01: &pg-node
+    <<: *node
+    container_name: email-proxy-pg-01
+    hostname: pg-01
+    shm_size: 256m
+    networks:
+      vlan30: { ipv4_address: 10.20.30.11 }
+      vlan40: { ipv4_address: 10.20.40.121 }
+
+  pg-02:
+    <<: *pg-node
+    container_name: email-proxy-pg-02
+    hostname: pg-02
+    networks:
+      vlan30: { ipv4_address: 10.20.30.12 }
+      vlan40: { ipv4_address: 10.20.40.122 }
+
+  pg-03:
+    <<: *pg-node
+    container_name: email-proxy-pg-03
+    hostname: pg-03
+    networks:
+      vlan30: { ipv4_address: 10.20.30.13 }
+      vlan40: { ipv4_address: 10.20.40.123 }
+
+  # ---------- VLAN 30 資料層：RabbitMQ ----------
+  mq-01:
+    <<: *node
+    container_name: email-proxy-mq-01
+    hostname: mq-01
+    networks:
+      vlan30: { ipv4_address: 10.20.30.21 }
+
+  mq-02:
+    <<: *node
+    container_name: email-proxy-mq-02
+    hostname: mq-02
+    networks:
+      vlan30: { ipv4_address: 10.20.30.22 }
+
+  mq-03:
+    <<: *node
+    container_name: email-proxy-mq-03
+    hostname: mq-03
+    networks:
+      vlan30: { ipv4_address: 10.20.30.23 }
+
+  # ---------- VLAN 40 儲存層 ----------
+  # NFS kernel server：nfsd 模組由 Docker Desktop 的 LinuxKit kernel 提供（已驗證）
+  nfs-01:
+    <<: *node
+    container_name: email-proxy-nfs-01
+    hostname: nfs-01
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      - nfs-export:/export
+    networks:
+      vlan40: { ipv4_address: 10.20.40.11 }
+
+  # ---------- VLAN 99 管理層 ----------
+  # mgmt-01 = 實驗室的 Ansible 控制節點 + Issuing CA + 監控主機。
+  # 掛全部 VLAN（.254），repo 以 bind mount 進 /work —— 在容器裡改的是同一份程式碼
+  mgmt-01:
+    <<: *node
+    build:
+      context: .
+      target: controller
+    container_name: email-proxy-mgmt-01
+    hostname: mgmt-01
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      - dind-mgmt-01:/var/lib/docker
+      - ../..:/work
+    working_dir: /work/ansible
+    networks:
+      vlan99: { ipv4_address: 10.20.99.11 }
+      vlan10: { ipv4_address: 10.20.10.254 }
+      vlan20: { ipv4_address: 10.20.20.254 }
+      vlan30: { ipv4_address: 10.20.30.254 }
+      vlan40: { ipv4_address: 10.20.40.254 }

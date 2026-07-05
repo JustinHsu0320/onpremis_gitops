@@ -1,0 +1,21 @@
+---
+# =============================================================================
+# roles/common/handlers/main.yml
+# handler 名稱格式為契約規定的「restart <service>」小寫（CONVENTIONS.md §8.6），
+# 因此以下皆對 ansible-lint 的 name[casing] 加 noqa（契約優先於 lint 慣例）
+# =============================================================================
+
+- name: restart chrony  # noqa: name[casing]
+  ansible.builtin.systemd_service:
+    name: chrony
+    state: restarted
+
+- name: restart systemd-journald  # noqa: name[casing]
+  ansible.builtin.systemd_service:
+    name: systemd-journald
+    state: restarted
+
+- name: restart ssh  # noqa: name[casing]
+  ansible.builtin.systemd_service:
+    name: ssh
+    state: restarted

@@ -1,0 +1,5 @@
+---
+# lb-02：備援（BACKUP, priority 100）；lb-01 的 HAProxy 掛掉時（150-50=100 平手取 IP 大者）
+# 或 lb-01 整機死亡時接手 VIP
+keepalived_state: BACKUP
+keepalived_priority: 100

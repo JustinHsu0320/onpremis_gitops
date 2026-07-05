@@ -1,0 +1,81 @@
+---
+# =============================================================================
+# roles/gitlab_server/defaults/main.yml — GitLab CE Omnibus + Container Registry
+# （gitlab-01，VLAN 50；規劃書 ADR-6 的內部 Git/CI/Registry 中樞）
+#
+# 【資源需求：記憶體 ≥ 8GB】Omnibus 是全家桶（puma/sidekiq/gitaly/內嵌 PG/
+# 內嵌 redis/nginx/registry 全部同機），官方最低 4GB 只夠「開得起來」；
+# 實務上 8GB 起跳，puma 與 sidekiq 才不會互相擠到 OOM。
+# lab 實驗室「刻意」不部署本 role（lab inventory 沒有 gitlab 群組成員，
+# 70-gitlab.yml 的 hosts 匹配為空自動跳過）——容器實驗室塞不下 8GB 的 Omnibus。
+#
+# 契約變數（由 inventory 提供，本 role 直接引用、不在此重複宣告，CONVENTIONS.md §7）：
+#   gitlab_external_url / gitlab_registry_external_url（group_vars/gitlab.yml）
+#   gitlab_root_password（group_vars/all/vars.yml 的 vault 別名）
+#   domain / timezone / pki_dir
+#   use_egress_proxy / egress_proxy_url / no_proxy_list
+#   vlan_devops_cidr / vlan_mgmt_cidr（monitoring_whitelist 用）
+# =============================================================================
+
+# ---------- APT repo 來源 ----------
+# GitLab CE 是規格明列的「第三方 apt repo」例外之一（Ubuntu archive 沒有 GitLab；
+# 另一例外是 Docker Engine，見 roles/docker）。金鑰放 /etc/apt/keyrings 並以
+# signed-by 指名——信任範圍僅此一個 repo，不進全域信任（同 docker role 的理由）
+gitlab_server_apt_key_url: https://packages.gitlab.com/gitlab/gitlab-ce/gpgkey
+gitlab_server_keyring_path: /etc/apt/keyrings/gitlab.asc
+gitlab_server_apt_repo_base: https://packages.gitlab.com/gitlab/gitlab-ce/ubuntu/
+
+# 上游對「最新 Ubuntu LTS」的官方支援通常晚正式發布幾個月：26.04（resolute）
+# 頻道開通前先用 noble（24.04）的包。這是安全的——Omnibus 把所有相依
+# （ruby、內嵌 PG、redis、nginx…）全部打包在 /opt/gitlab 內，幾乎不依賴
+# distro 函式庫，跨 Ubuntu 版本安裝是官方認可的過渡做法。
+# 上游開通 resolute 目錄後，改這個變數（或 -e 覆寫）即可切換。
+# noqa 理由：與 gitlab_runner role 共用同名的 codename 開關（兩個
+# packages.gitlab.com repo 的滯後策略一致，inventory 一處覆寫兩邊生效），
+# 屬跨 role 介面變數，不加 role 前綴
+gitlab_apt_codename: noble  # noqa: var-naming[no-role-prefix]
+
+# ---------- Omnibus 前置相依 ----------
+# 官方文件的相依清單「刻意不含 postfix」：GitLab 的通知信不走本機 MTA，
+# 而是用 gitlab.rb 的 SMTP 設定直連本專案 email_proxy 自己的 svc-api SMTPS
+# （465 → app:2525 smtp-receiver）——內部服務吃自己家的服務（喝自己的香檳），
+# 順便省一個要維護、要防 open-relay 的 postfix。範例設定見 templates/gitlab.rb.j2
+gitlab_server_dependency_packages:
+  - curl
+  - openssh-server          # git-over-ssh（clone/push 的 SSH 通道）
+  - ca-certificates         # 系統信任庫（pki_leaf 已把內部 CA 加進來）
+  - tzdata
+  - perl
+
+# ---------- TLS 憑證 ----------
+# omnibus nginx 的憑證慣例路徑：/etc/gitlab/ssl/<external_url 的 host>.crt/.key。
+# 本 role 從 {{ pki_dir }}/gitlab-server.crt/.key（pki_leaf 簽發，SAN 同時涵蓋
+# gitlab.{{ domain }} 與 registry.{{ domain }}）複製過來並改成慣例檔名
+gitlab_server_ssl_dir: /etc/gitlab/ssl
+
+# ---------- 備份 ----------
+# backup_keep_time 單位是「秒」：604800 = 7 天。GitLab 只會清 backup_path 裡
+# 「自己產的」過期備份檔，異地副本的保留策略要在異地端另訂
+gitlab_server_backup_keep_time: 604800
+# omnibus 預設備份路徑；異地備份策略見 templates/gitlab.rb.j2 備份區塊的註解
+gitlab_server_backup_path: /var/opt/gitlab/backups
+
+# ---------- Puma（rails 應用伺服器） ----------
+# worker 數經驗法則：min(CPU 核心數, 可用記憶體/1.2GB)。gitlab-01 規格為
+# 4 vCPU / 8GB：4 個 worker 約吃 4×1.2GB=4.8GB，加上 sidekiq/gitaly/內嵌 PG
+# 剛好在 8GB 內。VM 規格若調整，這個值要跟著重算（設 0 = 交回 omnibus 自動計算）
+gitlab_server_puma_workers: 4
+
+# ---------- 就緒等待 ----------
+# 首次 reconfigure（Chef converge 全部元件）常要 3～5 分鐘，之後 puma 暖機
+# 還要一陣子；60 次 × 10 秒 = 最長等 10 分鐘，涵蓋最差情境（首次安裝）
+gitlab_server_readiness_retries: 60
+gitlab_server_readiness_delay: 10
+
+# ---------- get_url 模組的出網 proxy ----------
+# get_url 是 Ansible 模組自己出網（不經 apt 的 proxy 設定檔），
+# prod 需經 egress proxy 時以 environment 明確注入（同 docker role 的做法）
+gitlab_server_proxy_env:
+  HTTP_PROXY: "{{ egress_proxy_url }}"
+  HTTPS_PROXY: "{{ egress_proxy_url }}"
+  NO_PROXY: "{{ no_proxy_list }}"

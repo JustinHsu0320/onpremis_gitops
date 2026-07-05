@@ -1,0 +1,43 @@
+---
+# =============================================================================
+# site.yml — 全站總入口（規劃書 §8）
+#
+# 用法：
+#   一鍵全站：  ansible-playbook playbooks/site.yml
+#   單一階段：  ansible-playbook playbooks/30-postgres.yml
+#   實驗室：    ansible-playbook -i inventories/lab/hosts.yml playbooks/site.yml
+#
+# 順序即依賴（不可調換）：
+#   00 系統基線 → 10 PKI（一切 TLS 服務的前提）→ 20 儲存
+#   → 30/31/32 資料層三兄弟 → 40 邊界 LB → 41 egress
+#   → 50 app（要等資料層全就緒）→ 60 監控 → 99 全鏈健檢
+#   70 GitLab 獨立階段（只依賴 00/10；lab 無此群組會自動跳過）
+# =============================================================================
+- name: 階段 00：系統基線（common）
+  import_playbook: 00-bootstrap.yml
+- name: 階段 05：資料碟格式化與掛載
+  import_playbook: 05-block-storage.yml
+- name: 階段 08：Docker Engine
+  import_playbook: 08-docker.yml
+- name: 階段 10：單一信任根 PKI
+  import_playbook: 10-pki.yml
+- name: 階段 20：NFS 儲存層
+  import_playbook: 20-storage.yml
+- name: 階段 30：PostgreSQL HA 資料層
+  import_playbook: 30-postgres.yml
+- name: 階段 31：RabbitMQ 佇列層
+  import_playbook: 31-rabbitmq.yml
+- name: 階段 32：KeyDB 快取層
+  import_playbook: 32-keydb.yml
+- name: 階段 40：邊界負載平衡
+  import_playbook: 40-lb.yml
+- name: 階段 41：Egress 白名單代理
+  import_playbook: 41-egress.yml
+- name: 階段 50：應用堆疊
+  import_playbook: 50-app.yml
+- name: 階段 60：可觀測性
+  import_playbook: 60-monitoring.yml
+- name: 階段 70：GitLab DevOps 層
+  import_playbook: 70-gitlab.yml
+- name: 階段 99：全鏈驗收
+  import_playbook: 99-verify.yml

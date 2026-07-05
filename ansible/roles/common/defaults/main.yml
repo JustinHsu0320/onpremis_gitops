@@ -1,0 +1,58 @@
+---
+# =============================================================================
+# roles/common/defaults/main.yml — 系統基線可調參數（規劃書 §7.1）
+#
+# 分工提醒（CONVENTIONS.md §7）：以下「契約變數」由
+# inventories/*/group_vars/all/vars.yml 提供，本 role 直接引用、不在此重複宣告，
+# 避免兩處預設值不一致的漂移：
+#   timezone / ntp_servers / domain / extra_hosts_entries
+#   is_container / use_egress_proxy / manage_etc_hosts
+#   egress_proxy_url / no_proxy_list
+# =============================================================================
+
+# ---------- 基線套件 ----------
+# 所有主機一致的「維運工具箱」：新機納管後，任何人上任何一台機器
+# 排障時手上工具都一樣，不會出現「這台沒裝 jq」的尷尬
+common_packages:
+  - chrony                # 統一時源（見 templates/chrony.conf.j2 的完整理由）
+  - auditd                # 系統呼叫稽核軌跡：誰在何時動了什麼
+  - sysstat               # sar 歷史效能資料：事後回溯「昨晚三點發生什麼事」
+  - socat                 # 萬用 socket 排障（TCP/UDP/UNIX socket 轉接）
+  - curl                  # HTTP 排障 + 健康檢查腳本相依
+  - gnupg                 # APT 金鑰驗證相依
+  - ca-certificates       # 系統信任庫（pki_leaf 會把內部 CA 加進來）
+  - nfs-common            # app/pg 節點掛 NFS 匯出用（20-storage）
+  - unzip
+  - python3-requests      # Ansible uri 模組與自動化腳本在目標機的相依
+  - python3-cryptography  # community.crypto 模組（pki_leaf 憑證簽發）在目標機的相依
+  # acl：Ansible become_user 到非特權帳號（postgres 等）時需要 setfacl 設暫存檔權限，
+  # 缺了會報 "Failed to set permissions on temporary files"
+  - acl
+  - jq                    # 命令列 JSON 處理：驗證腳本與排障必備
+  - netcat-openbsd        # 埠連通性排障（99-verify 的 SMTP banner 檢查也用它）
+  - openssl               # 憑證檢查（99-verify 的 -checkend）與 TLS 排障
+
+# ---------- 核心參數 ----------
+# 注意：整段僅在非容器環境套用（tasks 內 when: not is_container，規格 §7.1）；
+# lab 容器共用宿主 kernel，vm.* 這類 kernel 級參數在容器內不可寫
+common_sysctl:
+  # KeyDB/Redis 的 BGSAVE 走 fork + copy-on-write：預設的保守 overcommit
+  # 檢查會在「資料集大於剩餘記憶體一半」時直接讓 fork 失敗 → 背景存檔中斷。
+  # 設 1 = 永遠允許 overcommit（KeyDB 官方要求，啟動時檢查不到會告警）
+  vm.overcommit_memory: 1
+  # TCP accept backlog 上限：HAProxy/app 遇到突發連線洪峰時，
+  # 預設 4096 以下的 backlog 會讓 kernel 默默丟 SYN，表象是「偶發連不上」
+  net.core.somaxconn: 4096
+  # 放大暫時埠（ephemeral port）範圍：LB/proxy 對後端建立大量短連線時
+  # 避免 TIME_WAIT 堆積導致本地埠耗盡
+  net.ipv4.ip_local_port_range: "1024 65000"
+
+# ---------- 檔案描述子上限 ----------
+# HAProxy/PgBouncer/KeyDB 都是「每條連線一個 fd」的模型，
+# 預設 1024 在生產流量下必然爆掉；統一拉到 1M（記憶體代價可忽略）。
+# 變數名為規格 §7.1 的契約名稱，不加 role 前綴
+nofile_limit: 1048576  # noqa: var-naming[no-role-prefix]
+
+# ---------- journald ----------
+# 持久化日誌的磁碟用量上限：防止長期運轉後日誌吃滿根碟
+common_journald_max_use: 1G

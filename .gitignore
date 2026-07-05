@@ -1,0 +1,30 @@
+# ===== Ansible =====
+*.retry
+# vault 密碼檔絕不進 Git（vault.yml 密文本身「可以」進 Git，密碼檔不行）
+.vault_pass
+ansible/collections/ansible_collections/
+# lab 執行期產物（ssh 金鑰、known_hosts 由 make lab-up 現場產生）
+ansible/lab/.ssh/
+ansible/lab/.lab-built
+
+# ===== Terraform =====
+# provider 二進位與模組快取
+**/.terraform/
+*.tfstate
+*.tfstate.*
+# 計畫檔可能內含機密值
+*.tfplan
+# 真實變數值（只進 CI variable / 手動提供），範本 terraform.tfvars.example 會進 Git
+terraform/**/terraform.tfvars
+.terraform.lock.hcl
+
+# ===== 一般 =====
+.DS_Store
+__pycache__/
+*.pyc
+*.log
+# 本機開發工具與虛擬環境（不屬於 repo）
+.venv/
+venv/
+.vscode/
+.idea/

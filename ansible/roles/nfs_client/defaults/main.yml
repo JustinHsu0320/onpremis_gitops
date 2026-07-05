@@ -1,0 +1,19 @@
+---
+# =============================================================================
+# roles/nfs_client/defaults/main.yml — NFS client 可調參數（規劃書 §7.4）
+# =============================================================================
+
+# 掛載清單：真值由 group_vars（app.yml）或 playbook vars（20-storage.yml 的
+# postgres play）提供，每個項目欄位：path（本機掛載點）/ src（server:export）。
+# 空 list 防呆：role 被單獨引用而忘了帶變數時「什麼都不掛」而非直接炸掉。
+# noqa 理由：nfs_mounts 是 CONVENTIONS/規劃書 §7.4 定義的跨 role 契約變數名，
+# 不能改成 nfs_client_ 前綴，故壓掉 var-naming[no-role-prefix]。
+nfs_mounts: []  # noqa: var-naming[no-role-prefix]
+
+# 掛載選項統一定義在這裡（全部掛載點同一套，避免各處抄寫走樣）。
+# 每個選項的抉擇理由詳見 tasks/main.yml 的註解——那是給 junior 的必讀教材。
+nfs_client_mount_opts: "rw,hard,proto=tcp,vers=4.1,timeo=600,retrans=2,_netdev,noatime"
+
+# fstype 用 nfs4：與 server 端 v4-only（vers3=n）對齊；
+# 實際協定小版本由 opts 的 vers=4.1 決定
+nfs_client_fstype: nfs4

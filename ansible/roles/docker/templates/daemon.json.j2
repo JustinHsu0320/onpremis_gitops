@@ -1,0 +1,34 @@
+{# ===========================================================================
+   /etc/docker/daemon.json — 由 Ansible（docker role）管理
+   JSON 不允許註解，因此所有「為什麼」都寫在這段 Jinja 註解裡（不會輸出）：
+
+   1. log-driver json-file + 輪替（max-size 10m × max-file 3 = 每容器上限 30MB）：
+      docker 預設 json-file「無上限」，一個進入 error 迴圈的容器就能在
+      幾小時內吃滿根碟，連 SSH 都受影響。這是地端血淚教訓的標配。
+
+   2. live-restore true：dockerd 重啟（daemon 升級、改設定、oom 重拉）時
+      「不殺運行中的容器」。這對 KeyDB 同居的 app 節點是關鍵：
+      KeyDB master 跑在容器裡，若每次 docker daemon 維護都連坐殺容器，
+      等於每次例行維護都強制觸發一輪 KeyDB failover + 全 shard 重新選主。
+      有 live-restore，daemon 短暫離線期間容器照常服務，重連後恢復管理。
+
+   3. 一般「不設」storage-driver / iptables 等進階項：交給 docker 預設值，
+      daemon.json 只放我們有明確理由偏離預設的參數，方便日後 diff 審查。
+
+   4. docker_storage_driver（預設空 = 不寫入）：唯一的已知例外是「巢狀 Docker」
+      （實驗室 DinD）——Docker 28+ 預設的 containerd snapshotter 影像存放層
+      在巢狀容器內解壓 whiteout 會 EPERM（實測），classic overlay2 graph driver
+      則沒問題。lab 覆寫 docker_storage_driver=overlay2 同時關閉
+      containerd-snapshotter feature；prod 實體 VM 維持預設。
+   =========================================================================== #}
+{
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "{{ docker_log_max_size }}",
+    "max-file": "{{ docker_log_max_file }}"
+  },
+  "live-restore": {{ docker_live_restore | bool | to_json }}{% if docker_storage_driver | default('') | length > 0 %},
+  "storage-driver": "{{ docker_storage_driver }}",
+  "features": { "containerd-snapshotter": false }
+{% endif %}
+}

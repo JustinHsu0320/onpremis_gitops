@@ -1,0 +1,157 @@
+{#
+  rules.yml.j2 — Prometheus 告警規則（規劃書 §9）
+
+  撰寫慣例（junior 必讀）：
+    - expr 裡的門檻與 for: 時長是「已消化過誤報經驗」的值，調整前先想清楚
+      放寬會漏什麼、收緊會吵什麼。
+    - annotations 裡的 {{ '{{ $labels.x }}' }} 是 Prometheus 的模板語法，
+      不是 Jinja——本檔用 {% raw %}...{% endraw %} 包住讓 Ansible 原樣輸出。
+    - severity 只分兩級：critical（半夜叫人）/ warning（上班時間處理）。
+#}
+# ===== {{ ansible_managed }} =====
+groups:
+  - name: email-proxy-alerts
+    rules:
+      # ---------- InstanceDown：任何抓取目標失聯 ----------
+      # up 是 Prometheus 對每個 target 的內建健康指標；for: 2m 濾掉重啟 /
+      # 網路抖動的瞬斷（15s 間隔 × 連續 8 次失敗才觸發）。
+      # Runbook：先 ping / ssh 該主機分辨「整機死」還是「單一 exporter 死」；
+      # 服務級目標（patroni/haproxy/rabbitmq）到該機 systemctl status 對應服務。
+      - alert: InstanceDown
+        expr: up == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{% raw %}{{ $labels.job }}/{{ $labels.instance }} 抓取失敗超過 2 分鐘{% endraw %}"
+          description: "{% raw %}Prometheus 連續 2 分鐘抓不到 {{ $labels.instance }}（job={{ $labels.job }}）。Runbook：ssh 該主機 → systemctl status 對應服務 → journalctl -u 看最後日誌。{% endraw %}"
+
+      # ---------- CertExpirySoon：TLS 憑證即將到期（規劃書 §9：30 天前告警） ----------
+      # probe_ssl_earliest_cert_expiry 來自 blackbox 探測的 TLS 握手（https 與
+      # amqps 兩個 job 都會產出），值是憑證鏈中「最早到期」者的 Unix 時間戳。
+      # 門檻 cert_expiry_alert_days 定義於 group_vars/monitoring.yml（預設 30 天）。
+      # 葉憑證效期 397 天、每季由 10-pki 輪替——這條規則是「輪替流程漏跑」的兜底。
+      # Runbook：重跑 10-pki.yml（重簽）→ 對應服務 playbook（各 role 的 PKI
+      # 橋接 task 會自動 restart/reload）→ 確認本告警消失。
+      - alert: CertExpirySoon
+        expr: probe_ssl_earliest_cert_expiry - time() < {{ cert_expiry_alert_days | default(30) }} * 86400
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "{% raw %}{{ $labels.instance }} 的 TLS 憑證即將到期{% endraw %}"
+          description: "{% raw %}{{ $labels.instance }} 的憑證將於 {{ $value | humanizeDuration }} 後到期（門檻 {% endraw %}{{ cert_expiry_alert_days | default(30) }}{% raw %} 天）。Runbook：重跑 10-pki.yml 重簽，再跑對應服務的 playbook 使新憑證生效。{% endraw %}"
+
+      # ---------- ProbeFailed：端到端探測失敗 ----------
+      # probe_success 是 blackbox 探測的總結果（0/1）：HTTPS 探測涵蓋
+      # VIP + TLS + 後端 /health，AMQPS 探測涵蓋 VIP + TLS 握手。
+      # 與 InstanceDown 的差異：這裡驗的是「使用者視角的整條鏈」，
+      # 個別後端死一台（HAProxy 已剔除）不會觸發，鏈路斷了才會。
+      # Runbook：curl -v --cacert ca.crt 手動重放探測 → 分辨 DNS / VIP /
+      # TLS / 後端哪一段斷 → 查對應層的 InstanceDown 告警交叉定位。
+      - alert: ProbeFailed
+        expr: probe_success == 0
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{% raw %}端到端探測 {{ $labels.instance }} 失敗超過 3 分鐘{% endraw %}"
+          description: "{% raw %}blackbox（job={{ $labels.job }}）對 {{ $labels.instance }} 的探測連續失敗。Runbook：以 curl/openssl 手動重放，逐段（DNS→VIP→TLS→後端）定位斷點。{% endraw %}"
+
+      # ---------- PatroniClusterNoLeader：PG 叢集失去唯一 leader ----------
+      # patroni_master 是 Patroni /metrics 的 gauge：leader=1、replica=0。
+      # sum(...) != 1 同時抓到兩種災難：=0（無 leader，寫入全停）與
+      # >1（腦裂，比無 leader 更危險）。for: 1m 容忍計畫性 switchover 的秒級空窗。
+      # 注意：三台 Patroni 全失聯時本指標整組消失、expr 無輸出不觸發——
+      # 那種情境由 InstanceDown（job=patroni × 3）負責叫人。
+      # Runbook：任一 pg 節點 `patronictl list` 看叢集視圖；先查 etcd quorum
+      # （Patroni 沒 DCS 就不會選主），再查 Patroni 日誌。
+      - alert: PatroniClusterNoLeader
+        expr: sum(patroni_master) != 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Patroni 叢集 leader 數量異常（≠1）"
+          description: "{% raw %}目前 leader 數 = {{ $value }}：0 代表無主（寫入停擺）、>1 代表腦裂。Runbook：patronictl list 看視圖，先驗 etcd quorum 再查 Patroni 日誌。{% endraw %}"
+
+      # ---------- RabbitNodeDown：RabbitMQ 叢集成員缺席 ----------
+      # rabbitmq_identity_info 是 rabbitmq_prometheus plugin 的身分指標：
+      # 每個「活著且被抓到」的節點恰好輸出 1 條 series（帶 rabbitmq_node /
+      # rabbitmq_cluster label）——count() < 3 即有節點失聯或 plugin 掛掉。
+      # quorum queue 兩票仍可用，所以 3 分鐘 + warning（掉到剩 1 台時
+      # 佇列不可寫，但那時 InstanceDown 早已 critical）。
+      # Runbook：該機 `rabbitmqctl cluster_status`；重開機後未自動歸隊常見原因
+      # 是 mnesia/khepri 等待其他節點，看 journalctl -u rabbitmq-server。
+      - alert: RabbitNodeDown
+        expr: count(rabbitmq_identity_info) < 3
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "RabbitMQ 叢集成員少於 3"
+          description: "{% raw %}目前在線節點數 = {{ $value }}（預期 3）。Runbook：rabbitmqctl cluster_status 找缺席者，檢查該機 rabbitmq-server 服務與網路。{% endraw %}"
+
+      # ---------- EtcdNoLeader：etcd 叢集失去 leader（Patroni DCS 的根基） ----------
+      # etcd_server_has_leader：該成員視角「叢集有沒有 leader」（1/0）。
+      # 全體 max()==0 = 整個 DCS 沒有 leader → Patroni 無法選主、無法續 leader lock，
+      # PG 叢集會連帶凍結。這比 PatroniClusterNoLeader 更上游（先抓根因）。
+      # Runbook：任一 pg 節點 etcdctl endpoint status --cluster 看誰是 leader、
+      # 是否有成員 unhealthy；fsync 延遲高（見 EtcdSlowFsync）常是元凶。
+      - alert: EtcdNoLeader
+        expr: max(etcd_server_has_leader) == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "etcd 叢集沒有 leader"
+          description: "{% raw %}etcd 全體成員都回報無 leader，Patroni 將無法選主。Runbook：etcdctl endpoint status --cluster 查成員健康，檢查 EtcdSlowFsync 與網路分區。{% endraw %}"
+
+      # ---------- EtcdSlowFsync：WAL fsync 延遲過高（規劃書 §2.1 點名的敏感點） ----------
+      # etcd 對磁碟 fsync 延遲極敏感——延遲一高，心跳/選舉逾時就誤觸發，
+      # 連帶 Patroni 誤判 failover。99 百分位 fsync > 500ms 持續 5 分鐘即預警，
+      # 這通常代表 datastore 不是 SSD/NVMe 或被其他負載搶 IO（§2.1 的部署前提沒滿足）。
+      - alert: EtcdSlowFsync
+        expr: histogram_quantile(0.99, rate(etcd_disk_wal_fsync_duration_seconds_bucket[5m])) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{% raw %}{{ $labels.instance }} 的 etcd WAL fsync 延遲過高{% endraw %}"
+          description: "{% raw %}etcd WAL fsync p99 = {{ $value | humanizeDuration }}（門檻 500ms）。Runbook：確認該 pg 節點的 etcd 碟在 SSD/NVMe datastore、無 IO 爭用（規劃書 §2.1）。{% endraw %}"
+
+      # ---------- KeyDBMasterNoReplica：KeyDB master 失去 replica 備援 ----------
+      # ★ 這條專門補審查點名的盲點：master 的 replica 掛掉後，叢集 cluster_state
+      # 仍是 ok、app 照常運作、原本完全無告警——直到第二台節點也故障、該 shard
+      # 的 1/3 slot 才不可用（OAuth token 快取中斷寄信）。redis_connected_slaves
+      # 是每個 master 的即時 replica 數，正常應 >=1；掉到 0 就在「單點無備援」
+      # 狀態下裸奔，必須告警。role=master 過濾掉 replica 節點自己（它們 slaves=0 正常）。
+      # Runbook：docker exec keydb-master keydb-cli ... cluster nodes 看哪個 master
+      # 的 replica 不見了；檢查該 replica 容器 / 節點；必要時 cluster failover 重整。
+      - alert: KeyDBMasterNoReplica
+        expr: redis_connected_slaves{job="keydb"} < 1 and redis_instance_info{job="keydb",role="master"} == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{% raw %}KeyDB master {{ $labels.instance }} 目前沒有 replica 備援{% endraw %}"
+          description: "{% raw %}{{ $labels.instance }} 的 connected_slaves = {{ $value }}（預期 >=1）。此 shard 正在無備援狀態運行，再掉一個節點該 slot 就不可用。Runbook：keydb-cli cluster nodes 找失聯 replica，檢查對應容器/節點。{% endraw %}"
+
+      # ---------- NodeFilesystemAlmostFull：磁碟可用空間 < 15% ----------
+      # avail（非 root 保留的 free）/ size < 0.15 持續 10 分鐘。
+      # 排除揮發性/唯讀檔案系統：tmpfs/ramfs 是記憶體、overlay 是容器層、
+      # squashfs 是 snap 唯讀映像——都不是「磁碟要滿了」的訊號，只會製造誤報。
+      # 15% 門檻的理由：PG WAL 堆積與 Prometheus TSDB 都可能在小時級吃掉
+      # 剩餘空間，留足人工介入的時間窗。
+      # Runbook：該機 df -h / du 找大戶；pg 節點優先查 WAL（複寫落後會堆積）、
+      # mgmt-01 查 TSDB retention、mq 查佇列堆積。
+      - alert: NodeFilesystemAlmostFull
+        expr: >-
+          (node_filesystem_avail_bytes{fstype!~"tmpfs|ramfs|squashfs|overlay"}
+           / node_filesystem_size_bytes{fstype!~"tmpfs|ramfs|squashfs|overlay"}) < 0.15
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{% raw %}{{ $labels.instance }} 的 {{ $labels.mountpoint }} 可用空間低於 15%{% endraw %}"
+          description: "{% raw %}{{ $labels.instance }}:{{ $labels.mountpoint }}（{{ $labels.device }}）剩餘 {{ $value | humanizePercentage }}。Runbook：df -h / du -xsh 找大戶；pg 看 WAL、mgmt 看 TSDB、mq 看佇列堆積。{% endraw %}"

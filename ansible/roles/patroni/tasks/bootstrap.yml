@@ -1,0 +1,86 @@
+---
+# =============================================================================
+# roles/patroni/tasks/bootstrap.yml — 依正確順序啟動叢集（bootstrap 正確性的關鍵）
+#
+# 為什麼要有序：三台同時第一次啟動時，Patroni 靠 DCS 的 initialize lock 保證
+# 只有一台能 initdb（不會 split-brain），但「誰搶到」是隨機的。我們用
+# 「首節點先起、副本等 leader 就緒才起」把結果變成可預期：
+#   - 首任 leader 一定是 groups['postgres'][0]（pg-01），與文件/演練腳本一致
+#   - 副本起來時 leader 已能服務 basebackup，不會空轉重試浪費時間
+#
+# 30-postgres.yml 對本 role 沒開 serial（三台「同時」進入這個檔案），
+# 所以順序不能靠 playbook 排，只能靠這裡的等待條件：
+# 副本節點用 delegate_to 首節點的 uri 探測「leader 已就緒」後才起自己。
+# =============================================================================
+
+# ---------- 第一台（groups['postgres'][0]）：initdb + 成為 leader ----------
+- name: 首節點：啟動並等待成為 leader
+  when:
+    - patroni_first_boot
+    - inventory_hostname == groups['postgres'][0]
+  block:
+    - name: 首節點：啟動 patroni（initdb + 搶 initialize lock）
+      ansible.builtin.systemd_service:
+        name: patroni
+        enabled: true
+        state: started
+
+    # GET /leader 只有「本節點就是 leader」才回 200 —— 200 同時證明了：
+    # initdb 完成、PG 起來、拿到 leader lock、REST API 可服務 HAProxy 健檢。
+    # 30 次 × 5 秒 = 最多 150 秒，涵蓋 initdb + 首次選主
+    - name: 首節點：等待 /leader 回 200（initdb 完成、取得 leader lock）
+      ansible.builtin.uri:
+        url: "http://{{ ansible_host }}:{{ patroni_rest_port }}/leader"
+        status_code: 200
+      register: patroni_leader_probe
+      until: patroni_leader_probe.status == 200
+      retries: "{{ patroni_bootstrap_retries }}"
+      delay: "{{ patroni_bootstrap_delay }}"
+
+# ---------- 其他台：等 leader 就緒 → 起自己 → 自動 basebackup 加入 ----------
+- name: 副本節點：等待 leader 就緒後加入叢集
+  when:
+    - patroni_first_boot
+    - inventory_hostname != groups['postgres'][0]
+  block:
+    # 沒有 serial，副本跟首節點「同時」跑到這裡——先把自己卡在這個探測上。
+    # delegate_to 首節點執行（uri 在 pg-01 上打 pg-01 自己的 REST API）：
+    # 探測結果只取決於首節點的狀態，不會被「本機到首節點的網路」偽陰性干擾
+    - name: 副本節點：等待首節點 leader 就緒（delegate 到首節點探測）
+      ansible.builtin.uri:
+        url: "http://{{ hostvars[groups['postgres'][0]].ansible_host }}:{{ patroni_rest_port }}/leader"
+        status_code: 200
+      delegate_to: "{{ groups['postgres'][0] }}"
+      register: patroni_leader_wait
+      until: patroni_leader_wait.status == 200
+      retries: "{{ patroni_bootstrap_retries }}"
+      delay: "{{ patroni_bootstrap_delay }}"
+
+    - name: 副本節點：啟動 patroni（自動向 leader 做 pg_basebackup 加入）
+      ansible.builtin.systemd_service:
+        name: patroni
+        enabled: true
+        state: started
+
+    # GET /health：PG 行程健在即回 200（不分 leader/replica）。
+    # 200 = basebackup 完成、副本 PG 已起來開始 streaming。
+    # 更嚴格的「1 leader + 2 replica streaming」斷言交給 99-verify
+    - name: 副本節點：等待 /health 回 200（basebackup 完成、開始 streaming）
+      ansible.builtin.uri:
+        url: "http://{{ ansible_host }}:{{ patroni_rest_port }}/health"
+        status_code: 200
+      register: patroni_health_probe
+      until: patroni_health_probe.status == 200
+      retries: "{{ patroni_bootstrap_retries }}"
+      delay: "{{ patroni_bootstrap_delay }}"
+
+# ---------- 非首次部署 / 收尾保險 ----------
+# 首次部署：上面已啟動，這裡是冪等 no-op。
+# 非首次部署（patroni_first_boot=false）：叢集早已 bootstrap 過，
+# 任何一台起來都會經 DCS 自己找到角色（leader 續任或以 replica 回歸），
+# 不需要順序——所以這個 task 不用等待條件，也修好「服務被人手動停掉」的漂移
+- name: 確保 patroni 服務運行且開機自啟
+  ansible.builtin.systemd_service:
+    name: patroni
+    enabled: true
+    state: started

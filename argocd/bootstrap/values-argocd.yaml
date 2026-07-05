@@ -1,0 +1,159 @@
+# =============================================================================
+# argo-cd Helm chart 客製 values（地端 / air-gapped 環境）
+# chart: argo/argo-cd  version: 7.7.11（對應 ArgoCD v2.13.x）
+#
+# 用法（見同目錄 README.md 安裝三步驟之步驟 2）：
+#   helm install argocd argo/argo-cd -n argocd --version 7.7.11 -f values-argocd.yaml
+#
+# 地端四大重點（本檔逐段註解）：
+#   1. 無 LoadBalancer —— 對外一律走 ingress-nginx（server.ingress）
+#   2. 內部 CA        —— GitLab 憑證鏈餵給 repo-server（configs.tls）
+#   3. repo 憑證      —— 不進 Git，安裝後用 kubectl 建 Secret（見 README）
+#   4. HA 模式        —— 預留註解，起步單副本，量大再開
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# ！非 Helm 設定！以下兩行是給 kubeconform 的「假標頭」：
+# 本檔是 Helm values，不是 K8s 資源；但 CI 的 kubeconform 會掃整個 argocd/
+# 目錄，遇到沒有 kind 的 YAML 會直接報錯（missing 'kind' key）。
+# 補上一組自訂 apiVersion/kind 後，-ignore-missing-schemas 會將本檔「跳過」
+# 而非「報錯」。Helm 端無害：這兩個 key 只會被合併進 .Values 且無人引用。
+# -----------------------------------------------------------------------------
+---
+apiVersion: helm-values.ptc-nec.com.tw/v1alpha1
+kind: ArgoCDHelmValues
+
+# =============================================================================
+# 全域設定
+# =============================================================================
+global:
+  # ArgoCD 對外網域（UI / CLI / webhook 都用它）
+  domain: argocd.ptc-nec.com.tw
+
+  # 【離線重點】映像改抓內部 mirror（搬運步驟見 README「離線環境映像搬運註記」）。
+  # 原始來源為 quay.io/argoproj/argocd；地端節點不可直連 quay.io。
+  # tag 不在此指定 —— 跟著 chart appVersion 走（v2.13.3），
+  # 升級時「先搬映像、再 helm upgrade」，順序不能反。
+  image:
+    repository: registry.ptc-nec.com.tw:5050/mirror/quay.io/argoproj/argocd
+
+# =============================================================================
+# ArgoCD 組態（configs.* 會 render 成 argocd-cm / argocd-cmd-params-cm 等）
+# =============================================================================
+configs:
+  params:
+    # 【無 LB 重點】TLS 由 ingress-nginx 終結，ArgoCD server 本身跑 HTTP。
+    # 若不開此參數，server 會自簽 TLS，Ingress ↔ server 之間形成雙重 TLS，
+    # gRPC（argocd CLI）會出現憑證驗證錯誤，除錯成本很高。
+    server.insecure: true
+
+  cm:
+    # UI / CLI 顯示與 OIDC redirect 用的正式 URL
+    url: https://argocd.ptc-nec.com.tw
+    # 預設 3 分鐘輪詢一次 Git；地端 GitLab 在內網、延遲低，可縮短到 60s
+    # 讓 CI push 後更快收斂（也可改在 GitLab 設 webhook 打 /api/webhook 即時觸發）
+    timeout.reconciliation: 60s
+    # admin 帳號起步先留著；之後接上 GitLab OIDC（dex 或原生 oidc.config）
+    # 再關閉 admin —— 留擴充註記
+    admin.enabled: true
+
+  # ---------------------------------------------------------------------------
+  # 【內部 CA 重點】repo-server 透過 HTTPS 拉 gitlab.ptc-nec.com.tw 時，
+  # 其憑證由「內部 CA」簽發，不在系統信任鏈裡，不餵 CA 憑證會直接 x509 失敗：
+  #   x509: certificate signed by unknown authority
+  # 解法：把內部 CA 憑證鏈（root + intermediate 的 PEM）填進下方區塊。
+  # 安裝前請把 <貼上內部 CA PEM> 換成真實內容（CA「公鑰憑證」非機密，可進 Git）。
+  # ---------------------------------------------------------------------------
+  tls:
+    certificates:
+      gitlab.ptc-nec.com.tw: |
+        -----BEGIN CERTIFICATE-----
+        <貼上內部 CA PEM —— 佔位字串，安裝前務必替換，
+         否則 repo-server 連 GitLab 仍會 x509 失敗>
+        -----END CERTIFICATE-----
+
+  # ---------------------------------------------------------------------------
+  # 【repo 憑證重點】gitops repo 的拉取憑證「刻意不寫在這裡」：
+  # values 檔會進 Git，token 寫進來就等於明文洩漏。
+  # 正確作法（README 步驟 2 之後有完整指令）：
+  #   kubectl -n argocd create secret generic repo-gitops ... \
+  #     --from-literal=password='<GitLab deploy token>'
+  #   kubectl -n argocd label secret repo-gitops \
+  #     argocd.argoproj.io/secret-type=repository
+  # 進階：導入 sealed-secrets / SOPS 後，密文才可回歸 Git 管理 —— 留擴充註記。
+  # ---------------------------------------------------------------------------
+  # credentialTemplates: {}   # 刻意留空（見上方說明）
+  # repositories: {}          # 刻意留空（見上方說明）
+
+# =============================================================================
+# server（UI / API gateway）
+# =============================================================================
+server:
+  # 【無 LB 重點】地端沒有雲廠商 LoadBalancer 實作，type: LoadBalancer
+  # 會永遠卡在 <pending>。維持 ClusterIP，對外交給下方 Ingress。
+  service:
+    type: ClusterIP
+
+  ingress:
+    enabled: true
+    # 叢集既有的 ingress-nginx（NodePort / hostNetwork 對外，由前置 L4 導流）
+    ingressClassName: nginx
+    hostname: argocd.ptc-nec.com.tw
+    annotations:
+      # server.insecure=true 之後，後端走純 HTTP
+      nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
+      # 一律強制導向 HTTPS（內網也不跑明文）
+      nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+      # 【擴充註記】裝好 cert-manager + 內部 CA ClusterIssuer 後打開下行，
+      # UI 憑證即可自動簽發/續期，不再手動維護 Secret：
+      # cert-manager.io/cluster-issuer: internal-ca-issuer
+    # tls: true 會引用 argocd-server-tls Secret；
+    # 未導入 cert-manager 前，先手動用內部 CA 簽的憑證建立：
+    #   kubectl -n argocd create secret tls argocd-server-tls \
+    #     --cert=argocd.ptc-nec.com.tw.crt --key=argocd.ptc-nec.com.tw.key
+    tls: true
+
+# 【HA 註記】server 是無狀態元件，要 HA 直接拉副本數即可（server 區塊內設 replicas: 2）
+
+# =============================================================================
+# 其他元件副本數 —— 起步單副本；【HA 模式】整套開法統一註解在此：
+#   1. controller.replicas: 2 並設定 ARGOCD_CONTROLLER_REPLICAS 分片（chart 自動處理）
+#   2. repoServer.replicas: 2（manifest render 的吞吐瓶頸多在這裡）
+#   3. redis-ha.enabled: true（見檔尾）—— 三節點 sentinel，另需搬運 haproxy 映像
+#   4. server.replicas: 2（上方）
+# 注意：HA 前提是叢集至少 3 個 worker node，否則 anti-affinity 排不開。
+# =============================================================================
+controller:
+  replicas: 1
+
+repoServer:
+  replicas: 1
+
+applicationSet:
+  replicas: 1
+
+# dex（SSO 中介）：尚未接 SSO 前先關，少跑一個元件、少搬一顆映像。
+# 之後接 GitLab OIDC 時，可直接用 configs.cm 的 oidc.config（不一定需要 dex）。
+dex:
+  enabled: false
+
+# notifications：告警通知（Slack/Email/Webhook）之後再開 —— 留擴充註記
+notifications:
+  enabled: false
+
+# =============================================================================
+# Redis：單機模式（快取用途，掉了會自動重建，非持久資料）
+# =============================================================================
+redis:
+  # 【離線重點】redis 映像同樣走內部 mirror（原始：public.ecr.aws/docker/library/redis）
+  image:
+    repository: registry.ptc-nec.com.tw:5050/mirror/library/redis
+
+# 【HA 模式】量大時改用 redis-ha（sentinel 三節點），並關閉上面的單機 redis：
+# redis-ha:
+#   enabled: true
+#   image:
+#     repository: registry.ptc-nec.com.tw:5050/mirror/library/redis
+#   haproxy:
+#     image:
+#       repository: registry.ptc-nec.com.tw:5050/mirror/library/haproxy

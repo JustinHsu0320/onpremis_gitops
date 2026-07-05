@@ -1,0 +1,30 @@
+---
+# yamllint 規則：對 Ansible 專案友善的設定
+# （ansible-lint 內部也會呼叫 yamllint，規則保持一致）
+extends: default
+
+ignore: |
+  .spec/
+  ansible/collections/
+  # vault 密文不是 YAML 文件（$ANSIBLE_VAULT 標頭），不適用 YAML 規則
+  ansible/inventories/*/group_vars/all/vault.yml
+
+rules:
+  # 行長放寬：Jinja 表達式與註解常超過 80
+  line-length:
+    max: 160
+    level: warning
+  # Ansible 慣例：檔案以 `---` 開頭
+  document-start:
+    present: true
+  # 允許 truthy 的 yes/no/on/off（GitLab CI 的 `on:` 等）
+  truthy:
+    allowed-values: ["true", "false"]
+    check-keys: false
+  comments:
+    min-spaces-from-content: 1
+  braces:
+    max-spaces-inside: 1
+  octal-values:
+    forbid-implicit-octal: true
+    forbid-explicit-octal: false

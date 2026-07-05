@@ -1,0 +1,159 @@
+---
+# =============================================================================
+# roles/gitlab_server/tasks/main.yml — GitLab CE Omnibus（規格 §gitlab_server）
+#
+# 前提（由 site.yml 順序保證，70-gitlab 僅依賴 00/10）：
+#   - common 已跑過：apt proxy、/etc/hosts（gitlab/registry 名稱已可解析）
+#   - pki_leaf 已簽好 gitlab-server.crt/.key（SAN 涵蓋 gitlab.* 與 registry.*）
+#     且內部 CA 已進系統信任庫（readiness 檢查 validate_certs 靠它）
+# =============================================================================
+
+# ---------- 1. Omnibus 前置相依 ----------
+# 注意清單「不含 postfix」：寄信走 gitlab.rb 的 SMTP 設定直連本專案的
+# svc-api SMTPS（見 defaults 與 templates/gitlab.rb.j2 的完整說明）
+- name: 安裝 GitLab Omnibus 前置相依套件
+  ansible.builtin.apt:
+    name: "{{ gitlab_server_dependency_packages }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+# ---------- 2. GitLab CE 官方 APT repo ----------
+- name: 建立 APT keyring 目錄
+  ansible.builtin.file:
+    path: "{{ gitlab_server_keyring_path | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+# 金鑰以 .asc（ASCII armor）原樣落地即可：apt 2.4+ 的 signed-by 直接吃
+# armored key，不必 gpg --dearmor。get_url 對「內容相同」不重下載 → 冪等
+- name: 下載 GitLab CE repo GPG 金鑰
+  ansible.builtin.get_url:
+    url: "{{ gitlab_server_apt_key_url }}"
+    dest: "{{ gitlab_server_keyring_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+  environment: "{{ gitlab_server_proxy_env if use_egress_proxy else {} }}"
+
+# register 起來給下面 apt 用：repo 剛加入/變更時必須強制 apt update，
+# 否則 apt 索引裡根本沒有 gitlab-ce 這個套件
+- name: 佈署 GitLab CE APT 來源
+  ansible.builtin.template:
+    src: gitlab-ce.list.j2
+    dest: /etc/apt/sources.list.d/gitlab-ce.list
+    owner: root
+    group: root
+    mode: "0644"
+  register: gitlab_server_repo
+
+# ---------- 3. TLS 憑證（先於安裝：首次 reconfigure 就要用） ----------
+# 憑證必須在裝 gitlab-ce「之前」就位：external_url 是 https，
+# 首次安裝的自動 reconfigure 會立刻要求憑證存在，否則 nginx 起不來
+- name: 建立 /etc/gitlab/ssl 目錄
+  ansible.builtin.file:
+    path: "{{ gitlab_server_ssl_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+# 檔名遵守 omnibus nginx 慣例：external_url 的 host + .crt/.key。
+# registry（5050）用「同一張」憑證——pki_leaf 簽的 gitlab-server SAN 已同時
+# 涵蓋 gitlab.* 與 registry.*（group_vars/gitlab.yml 的 extra_sans），
+# gitlab.rb 內把 registry_nginx 也指到同一對檔案
+- name: 佈署 GitLab HTTPS 憑證（gitlab 與 registry 共用）
+  ansible.builtin.copy:
+    src: "{{ pki_dir }}/gitlab-server.crt"
+    dest: "{{ gitlab_server_ssl_dir }}/gitlab.{{ domain }}.crt"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0644"
+  notify: reload gitlab nginx
+
+# 私鑰是機密：0600 + no_log（規範 §8.5）。內容變更（輪替）只需 nginx
+# 重讀憑證（HUP），不必整套 reconfigure
+- name: 佈署 GitLab HTTPS 私鑰
+  ansible.builtin.copy:
+    src: "{{ pki_dir }}/gitlab-server.key"
+    dest: "{{ gitlab_server_ssl_dir }}/gitlab.{{ domain }}.key"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  notify: reload gitlab nginx
+
+# PKI 契約（CONVENTIONS.md §5）：10-pki 重簽時 pki_leaf 設 pki_certs_changed=true。
+# 正常情況上面兩個 copy 的 changed 已會觸發 reload，這個橋接 task 是兜底——
+# 例如 CA chain 輪替（葉憑證檔沒變、但驗證鏈變了）時也要讓 nginx 重載。
+# /bin/true 只是掛 notify 的載體，本身無副作用
+- name: 偵測 PKI 憑證輪替並排程 nginx reload
+  ansible.builtin.command: /bin/true
+  changed_when: true
+  when: pki_certs_changed | default(false)
+  notify: reload gitlab nginx
+
+# ---------- 4. 首次安裝 gitlab-ce ----------
+# 兩個 environment 變數「只在首次安裝的自動 reconfigure 生效」（註解給 junior）：
+#   EXTERNAL_URL        → postinst 寫進 gitlab.rb 並自動跑第一次 reconfigure
+#   GITLAB_ROOT_PASSWORD → 只有「第一次」reconfigure 會拿來設 root 密碼；
+#                          之後改密碼要走 UI 或 gitlab-rails console，改這裡沒用
+# no_log：environment 含 root 密碼，任何輸出（含錯誤）都不能洩漏；
+# 若安裝失敗需要除錯，暫時在指令列加 -e ansible_no_log_debug 前先想清楚風險。
+# apt 模組對已安裝套件是 no-op → 重跑時 environment 內容根本不會被用到
+- name: 安裝 gitlab-ce（首次安裝時以環境變數帶入 URL 與 root 密碼）
+  ansible.builtin.apt:
+    name: gitlab-ce
+    state: present
+    update_cache: true
+    cache_valid_time: "{{ 0 if gitlab_server_repo.changed else 3600 }}"
+  environment:
+    EXTERNAL_URL: "{{ gitlab_external_url }}"
+    GITLAB_ROOT_PASSWORD: "{{ gitlab_root_password }}"
+  no_log: true
+
+# ---------- 5. gitlab.rb（本 role 的核心設定檔） ----------
+# 0600：日後若在 gitlab.rb 啟用 SMTP 密碼等機密欄位不必再回頭改權限；
+# 內容變更 → reconfigure（omnibus 的「reload」，見 handler 註解）
+- name: 佈署 /etc/gitlab/gitlab.rb
+  ansible.builtin.template:
+    src: gitlab.rb.j2
+    dest: /etc/gitlab/gitlab.rb
+    owner: root
+    group: root
+    mode: "0600"
+  notify: reconfigure gitlab
+
+# ---------- 6. 服務 ----------
+# omnibus 的所有元件由 runit 管理，systemd 只負責 gitlab-runsvdir 這一個
+# 總管服務；確保它開機自啟（套件裝完通常已啟用，此 task 是冪等的保險）
+- name: 啟用並啟動 gitlab-runsvdir（runit 總管）
+  ansible.builtin.systemd_service:
+    name: gitlab-runsvdir
+    enabled: true
+    state: started
+
+# 先把排隊中的 reconfigure/reload 立刻執行掉再驗就緒——
+# 否則首次部署時 readiness 等的是「還沒套用我們設定」的 GitLab（假通過）
+- name: 立即套用尚未生效的設定變更
+  ansible.builtin.meta: flush_handlers
+
+# ---------- 7. 等待就緒 ----------
+# /-/readiness 走完整鏈：nginx TLS 終止 → workhorse → puma → rails 對
+# DB/redis/gitaly 的健檢。validate_certs: true 是刻意的——pki_leaf 已把
+# 內部 CA 裝進系統信任庫，能通過驗證代表「憑證鏈 + SAN + 系統信任」
+# 整條 TLS 都正確，這正是部署自驗要驗的東西（同 99-verify 的視角）。
+# 來源 IP 需在 monitoring_whitelist 內（gitlab.rb 已加 VLAN 50/99，見 template）
+- name: 等待 GitLab readiness 端點回 200（首次安裝最長約 10 分鐘）
+  ansible.builtin.uri:
+    url: "https://gitlab.{{ domain }}/-/readiness"
+    validate_certs: true
+    status_code: 200
+  register: gitlab_server_ready
+  until: gitlab_server_ready.status == 200
+  retries: "{{ gitlab_server_readiness_retries }}"
+  delay: "{{ gitlab_server_readiness_delay }}"

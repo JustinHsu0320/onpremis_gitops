@@ -1,0 +1,14 @@
+{#
+  prometheus-node-exporter.default.j2 — /etc/default/prometheus-node-exporter
+
+  Ubuntu 套件的 systemd unit（prometheus-node-exporter.service）以
+  EnvironmentFile 載入本檔，ARGS 內容原樣附加到 node_exporter 的啟動參數。
+#}
+# ===== {{ ansible_managed }} =====
+#
+# --web.listen-address=:{{ node_exporter_port }}
+#   綁 wildcard（所有介面）：Prometheus 在 mgmt-01（VLAN 99）跨網段來抓，
+#   綁 127.0.0.1 會抓不到。埠號 9100 是 CONVENTIONS.md §3 的契約值；
+#   對外曝露範圍由各 VLAN 防火牆控管，node_exporter 本身不做存取控制
+#   （輸出的只有唯讀系統指標，無機密）。
+ARGS="--web.listen-address=:{{ node_exporter_port }}"

@@ -1,0 +1,21 @@
+---
+# =============================================================================
+# 10-pki.yml — 單一信任根 PKI（規劃書 §5）
+#
+# 兩層架構：Root CA（20 年，建立後私鑰應離線保存）→ Issuing CA（5 年，mgmt-01）
+# → 各主機葉憑證（397 天，每季由本 playbook 重跑輪替）。
+#
+# 憑證輪替 = 重跑本 playbook + 各服務 reload（handlers 已串好），
+# 監控端另有「到期前 30 天」的 blackbox 告警兜底（60-monitoring）。
+# =============================================================================
+- name: 建立 Root + Issuing CA（僅 mgmt-01）
+  hosts: monitoring
+  tags: [pki, ca]
+  roles:
+    - role: internal_ca
+
+- name: 簽發並派送各主機葉憑證 + 安裝內部 CA 信任
+  hosts: all
+  tags: [pki, leaf]
+  roles:
+    - role: pki_leaf

@@ -1,0 +1,23 @@
+# =============================================================================
+# /etc/ssh/sshd_config.d/99-hardening.conf — 由 Ansible（common role）管理
+#
+# 為什麼用 drop-in 而非改 /etc/ssh/sshd_config 主檔：
+# 主檔屬於 openssh-server 套件，升級時會觸發 conffile 衝突詢問；
+# drop-in 把「我們的強化意圖」與「發行版預設」乾淨分離。
+# 注意 sshd 是「第一個出現的值生效」：若 sshd_config.d 內有其他檔案
+# （如 cloud-init 產生的 50-*.conf）先設定了同名參數，會以先讀到的為準——
+# 新機納管時要確認沒有放寬安全性的舊 drop-in 殘留。
+# =============================================================================
+
+# 禁止 root 直接登入：所有操作一律走專用自動化帳號（ansible）或個人帳號
+# 再 sudo 提權——留下「誰、何時、做了什麼」的稽核軌跡；
+# 同時讓「root 密碼外洩」不再等於「全站淪陷」
+PermitRootLogin no
+
+# 禁止密碼驗證：只收公鑰。徹底封死密碼暴力猜測與密碼噴灑的攻擊面；
+# 金鑰由 VM template 的 cloud-init 佈署（mgmt-01 的公鑰 + sudoers NOPASSWD）
+PasswordAuthentication no
+
+# 一併關閉鍵盤互動式驗證：這是 PAM 密碼驗證的「另一條側門」，
+# 不關等於 PasswordAuthentication no 只關了正門
+KbdInteractiveAuthentication no

@@ -1,0 +1,36 @@
+---
+# =============================================================================
+# internal_ca / defaults — 兩層式內部 CA 的可調參數
+#
+# 注意：{{ ca_root }} 來自 group_vars/all/vars.yml（CONVENTIONS.md §4 路徑契約），
+# 不在這裡重複定義。以下檔名是 internal_ca 與 pki_leaf 之間的「檔案介面」：
+#   root-ca.key / root-ca.crt      Root CA（20 年；私鑰建立後應搬離線）
+#   issuing-ca.key / issuing-ca.crt Issuing CA（5 年；日常簽發用，留在 mgmt-01）
+#   ca-chain.crt                    issuing + root 串接（pki_leaf 派送全站）
+#   issued/                         簽出的葉憑證副本（稽核/重簽清單）
+# pki_leaf role 的 defaults 引用相同檔名——改名字必須兩邊一起改（先改 CONVENTIONS）。
+# =============================================================================
+
+# CA 私鑰長度：CA 壽命長（5～20 年），用 4096 給足安全餘裕；
+# 葉憑證才用 2048（一年一換、講究握手效能，見 pki_leaf 的 pki_key_size）
+internal_ca_key_size: 4096
+
+# CN 命名（規劃書 §5 指定，不建議修改：全站信任庫與稽核文件都以此名稱識別）
+internal_ca_root_cn: email-proxy Root CA
+internal_ca_issuing_cn: email-proxy Issuing CA
+
+# 效期：Root +7300d（約 20 年）、Issuing +1825d（約 5 年）
+# Root 拉長是因為「換 Root = 全站 13 台重佈信任庫」成本極高；
+# Issuing 較短，強迫團隊每 5 年演練一次「用離線 Root 重簽 Issuing」的輪替程序
+internal_ca_root_validity: "+7300d"
+internal_ca_issuing_validity: "+1825d"
+
+# ---------- 檔案路徑（統一收在 ca_root 之下，目錄 0700 僅 root） ----------
+internal_ca_root_key: "{{ ca_root }}/root-ca.key"
+internal_ca_root_csr: "{{ ca_root }}/root-ca.csr"
+internal_ca_root_crt: "{{ ca_root }}/root-ca.crt"
+internal_ca_issuing_key: "{{ ca_root }}/issuing-ca.key"
+internal_ca_issuing_csr: "{{ ca_root }}/issuing-ca.csr"
+internal_ca_issuing_crt: "{{ ca_root }}/issuing-ca.crt"
+internal_ca_chain: "{{ ca_root }}/ca-chain.crt"
+internal_ca_issued_dir: "{{ ca_root }}/issued"

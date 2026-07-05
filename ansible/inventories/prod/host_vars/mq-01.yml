@@ -1,0 +1,5 @@
+---
+# mq-01：RabbitMQ VIP 常態持有者；同時是叢集 seed 節點（groups['rabbitmq'][0]，
+# 其他節點 join 它——這由群組順序決定，不需要額外變數）
+keepalived_state: MASTER
+keepalived_priority: 150

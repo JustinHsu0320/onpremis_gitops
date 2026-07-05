@@ -1,0 +1,19 @@
+---
+# =============================================================================
+# roles/nfs_client/meta/main.yml
+# =============================================================================
+galaxy_info:
+  role_name: nfs_client
+  author: email_proxy_infra
+  description: Mount NFSv4.1 shares (attachments on app nodes, pgBackRest repo on pg nodes)
+  license: MIT
+  min_ansible_version: "2.16"
+  platforms:
+    - name: Ubuntu
+      versions:
+        - all
+  galaxy_tags:
+    - nfs
+    - storage
+
+dependencies: []

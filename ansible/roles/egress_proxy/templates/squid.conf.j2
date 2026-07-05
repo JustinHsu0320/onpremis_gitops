@@ -1,0 +1,71 @@
+# =============================================================================
+# /etc/squid/squid.conf — {{ ansible_managed }}
+#
+# 本檔由 Ansible roles/egress_proxy 整檔接管，手改必被覆蓋。
+# 刻意「不」include /etc/squid/conf.d/*.conf（Ubuntu 套件預設會 include）：
+# 白名單策略必須是「這個檔案就是全部規則」，不留任何讓套件預設值或
+# 其他工具繞過 deny all 的後門。改白名單請改 group_vars/egress.yml。
+#
+# 角色定位（規劃書 §4）：這是「安全出口」不是「加速器」——
+# 唯一合法出網通道，預設拒絕、白名單放行、全程留稽核軌跡。
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# ACL 定義（只是「命名條件」，本身不放行；放行與否看下面 http_access 的組合）
+# -----------------------------------------------------------------------------
+# 只服務內網：proxy 的服務對象是 10.20.0.0/16 的內部主機，
+# 來源不在內網的請求（例如邊界網卡被誤暴露時）連規則評估都到不了 allow
+acl localnet src {{ internal_cidr }}
+
+# 顯式白名單：一行一網域，抽成獨立檔案的原因——
+#   1. 改名單只 diff 名單檔，review 乾淨；2. reload 即生效，不用動主設定
+acl allowlist dstdomain "/etc/squid/allowlist.txt"
+
+# CONNECT（TLS 隧道）只允許目的埠 443：CONNECT 本質是「任意 TCP 轉發」，
+# 不鎖埠的話等於開了一條經 proxy 打任意服務（SSH/SMTP…）的隧道
+acl SSL_ports port 443
+
+# 一般轉發只允許 80/443：內部系統出網（API 呼叫、套件下載）沒有其他埠的正當理由
+acl Safe_ports port 80
+acl Safe_ports port 443
+acl CONNECT method CONNECT
+
+# -----------------------------------------------------------------------------
+# http_access 規則——「順序敏感」：由上往下第一條命中即定案。
+# 結構：先擋協定層的濫用（埠），再放行「內網來源 × 白名單目的」，最後全拒。
+# -----------------------------------------------------------------------------
+# 1) 目的埠不是 80/443 一律拒絕：最廉價的檢查放最前面，縮小後續規則的攻擊面
+http_access deny !Safe_ports
+# 2) CONNECT 隧道只准去 443：擋「拿 CONNECT 繞去 25/22 等任意埠」
+http_access deny CONNECT !SSL_ports
+# 3) 內網來源「且」目的網域在白名單 → 放行（同一行多個 ACL 是 AND 關係）
+http_access allow localnet allowlist
+# 4) 走到這裡的都不合法：預設拒絕（白名單精神——沒明列的就是不准），
+#    被拒者收到 403，99-verify 的 verify-egress 正是驗這個行為
+http_access deny all
+
+# -----------------------------------------------------------------------------
+# 監聽 / 快取 / 日誌
+# -----------------------------------------------------------------------------
+# 綁 *:{{ squid_port }}（所有介面）：同時服務「節點 IP」與「keepalived VIP」——
+# 不綁死特定位址，VIP 漂進來時零設定變更、也不需要 ip_nonlocal_bind
+http_port {{ squid_port }}
+
+# 純轉發不快取：這是安全出口不是加速器。出網流量幾乎全是 HTTPS/CONNECT
+# （proxy 只見密文，本來就不可快取），開快取只會徒增磁碟管理與資訊殘留風險
+cache deny all
+
+# 稽核軌跡：combined 格式（同 Apache access log），欄位含來源 IP、時間、
+# 方法、目的網址、狀態碼——可對照白名單 review「誰、何時、連了哪裡」，
+# 也是「該不該把某網域加進白名單」的資料依據。stdio: 明確指定寫本機檔案
+access_log stdio:{{ egress_proxy_access_log }} combined
+
+# 不外洩內網拓撲：
+#   forwarded_for delete —— 刪除 X-Forwarded-For，不把內網 IP 帶給外部網站
+#   via off            —— 不加 Via 標頭，不暴露 proxy 主機名與 squid 版本
+forwarded_for delete
+via off
+
+# 崩潰診斷與 pid：明確寫出（而非依賴編譯期預設值），避免升版時預設值漂移
+coredump_dir {{ egress_proxy_coredump_dir }}
+pid_filename /run/squid.pid

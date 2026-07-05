@@ -1,0 +1,59 @@
+---
+# =============================================================================
+# roles/patroni/tasks/install.yml — 套件安裝
+# 重點全在「順序」：createcluster.conf 必須趕在 postgresql-18 之前改好
+# =============================================================================
+
+# 首次部署判斷：config.yml 還沒佈署過 = 這台從來沒被本 role 收斂過。
+# 這個旗標決定兩件事：(1) 安裝後要不要立刻擋下 deb 自動啟動的 patroni；
+# (2) bootstrap.yml 要不要走「首節點 → 副本」的有序啟動。
+# 必須在「佈署 config 之前」stat，否則永遠是 true/false 錯亂
+- name: 檢查 Patroni 設定檔是否已佈署過（首次部署判斷）
+  ansible.builtin.stat:
+    path: "{{ patroni_config_file }}"
+  register: patroni_config_stat
+
+- name: 記錄首次部署旗標
+  ansible.builtin.set_fact:
+    patroni_first_boot: "{{ not patroni_config_stat.stat.exists }}"
+
+# 先裝 postgresql-common 而不是直接裝 postgresql-18——為了下一個 task 能
+# 趕在 PG 本體之前改 createcluster.conf。這是 Debian 系 PG 的經典陷阱（見下）
+- name: 安裝 postgresql-common（必須先於 postgresql-18）
+  ansible.builtin.apt:
+    name: postgresql-common
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+# ★ 經典陷阱：Debian/Ubuntu 的 postgresql-<ver> 套件在 postinst 階段會依
+# createcluster.conf 自動建立一個叫 main 的 cluster 並「立刻啟動、佔走 5432」。
+# 放著不管的後果：Patroni 之後 initdb 自己的 cluster 時埠被占用起不來，
+# 而且機器上多一套沒人管的 PG 資料目錄，日後誤連誤刪都算它的。
+# 所以先把 create_main_cluster 關掉，再裝 postgresql-18——順序就是一切
+- name: 停用 postgresql-common 的 main cluster 自動建立（防佔 5432）
+  ansible.builtin.lineinfile:
+    path: /etc/postgresql-common/createcluster.conf
+    # 同時吃「已被註解」與「已設值」兩種形態，重跑冪等
+    regexp: '^#?\s*create_main_cluster\s*='
+    line: create_main_cluster = false
+# 上面那行改的是「未來裝 PG 套件時」的行為，不影響已在跑的服務 → 不需 notify
+
+- name: 安裝 PostgreSQL 18 + Patroni + psycopg2（官方 archive 套件）
+  ansible.builtin.apt:
+    name: "{{ patroni_packages }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+# Debian 系套件 postinst 會自動 enable + start patroni——但此刻 config.yml
+# 還不存在（或不是我們的內容），讓它搶跑只會進入 fail/restart 循環，
+# 更糟的是若殘留了任何舊設定，可能以錯誤身分接觸 DCS。
+# 僅首次部署需要擋：已收斂過的機器（config 已在）讓服務保持運行，
+# 避免每次重跑 playbook 都把好端端的資料庫停掉
+- name: 首次部署時擋下 deb 自動啟動的 patroni（等 config 佈署完再照順序啟動）
+  ansible.builtin.systemd_service:
+    name: patroni
+    state: stopped
+    enabled: false
+  when: patroni_first_boot

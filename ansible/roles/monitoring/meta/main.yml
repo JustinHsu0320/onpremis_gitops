@@ -1,0 +1,21 @@
+---
+# =============================================================================
+# roles/monitoring/meta/main.yml
+# =============================================================================
+galaxy_info:
+  author: email-proxy-infra
+  description: >-
+    mgmt-01 監控堆疊：Prometheus + Grafana + Alertmanager + Blackbox
+    （docker compose、映像版本 pin 死、內部 CA 端到端 TLS 探測與
+    憑證到期告警）。
+  license: MIT
+  min_ansible_version: "2.16"
+  platforms:
+    - name: Ubuntu
+      versions:
+        - all
+
+# 執行順序依賴（00-bootstrap 先裝 Docker、10-pki 先派送 ca.crt）由 site.yml
+# 的 play 順序保證，不用 meta dependencies 硬綁——硬綁會讓 --tags prometheus
+# 單跑時把整個 bootstrap/pki 拖進來。
+dependencies: []

@@ -1,0 +1,171 @@
+# {{ ansible_managed }}
+# =============================================================================
+# /etc/patroni/config.yml — Patroni 4.1（PostgreSQL 18 HA）主設定
+# 由 roles/patroni/templates/config.yml.j2 產生，手改必被 Ansible 覆蓋。
+#
+# 全景（junior 必讀）：
+#   app ──TLS──> HAProxy(VIP :6432/:6433) ──> 各節點 PgBouncer ──> 127.0.0.1:5432
+#   Patroni ⇄ etcd(:2379, mTLS)：leader lock + 動態設定（DCS）
+#   HAProxy 以 GET http://<節點>:8008/primary、/replica 判斷誰是 leader/replica
+#
+# 「設定的兩層真相」：
+#   - bootstrap.dcs 底下的內容只在「叢集第一次 initdb」時寫入 etcd，
+#     之後叢集以 etcd（DCS）內的動態設定為準——改這個檔案的 dcs 區塊
+#     對既有叢集無效，請用 patronictl edit-config。
+#   - postgresql / restapi / etcd3 區塊是「本機」設定，改完 reload 生效。
+# =============================================================================
+{# ---------------------------------------------------------------------------
+   pg_hba 規則的單一來源：同一份列表 render 到兩處（bootstrap.dcs 與 postgresql），
+   確保「首次 bootstrap 用的」與「DCS 動態統一管理的」永遠一致、不會手抄漂移。
+   tuple = (pg_hba 規則, 為什麼)
+---------------------------------------------------------------------------- #}
+{% set _pg_hba = [
+     ("local   all             postgres                                  peer",
+      "本機 unix socket 的 postgres 系統帳號 peer 免密：patronictl / pgBackRest / Ansible（become postgres）的維運通道"),
+     ("host    all             all             127.0.0.1/32              scram-sha-256",
+      "PgBouncer 走本機 loopback 連 5432（含 auth_query 的 pgbouncer_auth 低權身分）"),
+     ("host    replication     " ~ patroni_replication_username ~ "      127.0.0.1/32              scram-sha-256",
+      "Patroni 對本機 PG 的 replication 連線檢查（promote 前健檢）走 loopback 非 TLS——缺這行 promote 時 journal 會反覆報 no pg_hba entry"),
+     ("hostssl replication     " ~ patroni_replication_username ~ "      " ~ vlan_data_cidr ~ "             scram-sha-256",
+      "節點間串流複寫 / pg_basebackup / pg_rewind：限 VLAN30 資料網段，強制 TLS + SCRAM"),
+     ("hostssl all             all             " ~ vlan_data_cidr ~ "             scram-sha-256",
+      "VLAN30 內其他 TCP 連線（Patroni 對本機 PG 的管理連線走節點 IP、跨節點維運查詢）：強制 TLS"),
+   ] %}
+{# PG 參數 = role 預設 dict + 環境覆寫 dict（lab 降規只需覆寫少數 key） #}
+{% set _pg_params = patroni_pg_parameters | combine(patroni_pg_parameters_extra | default({})) %}
+
+# scope：叢集識別名。同一個 etcd 可以住多個 PG 叢集，
+# Patroni 以 /<namespace>/<scope>/ 為 key 前綴讀寫 DCS，scope 就是「這一個叢集」
+scope: {{ pg_cluster_scope }}
+namespace: {{ patroni_namespace }}
+# name：本節點在叢集內的成員名。用 inventory_hostname 讓 patronictl list、
+# 99-verify 的斷言與 Ansible 主機名三方完全對得上（app_db.yml 的 leader 定位也靠它）
+name: {{ inventory_hostname }}
+
+# -----------------------------------------------------------------------------
+# REST API（:8008）：HAProxy 健檢、patronictl 與 99-verify 的入口
+# -----------------------------------------------------------------------------
+restapi:
+  listen: {{ ansible_host }}:{{ patroni_rest_port }}
+  connect_address: {{ ansible_host }}:{{ patroni_rest_port }}
+  # basic auth 只保護「寫入型」端點（POST/PATCH：/switchover /failover /restart
+  # /reload /config…）。GET 健康端點（/health /leader /primary /replica /cluster）
+  # 依 Patroni 設計本來就不需認證 → HAProxy 健檢與 99-verify 完全不受影響，
+  # 但 VLAN30 內的任何人都「不能」對叢集下切換指令——這正是我們要的權限語意
+  authentication:
+    username: patroni
+    password: {{ patroni_restapi_password | to_json }}
+
+# -----------------------------------------------------------------------------
+# DCS 連線：etcd v3（與 postgres 同居的三節點，全 TLS + 客戶端憑證雙向驗證）
+# -----------------------------------------------------------------------------
+etcd3:
+  protocol: https
+  # 列出「全部」etcd 端點而不是只寫 localhost：本機 etcd 掛掉時
+  # Patroni 還能經其他端點續 leader lock，不會把 etcd 單點故障放大成 PG failover
+  hosts:
+{% for h in groups['etcd'] %}
+    - {{ hostvars[h].ansible_host }}:{{ patroni_etcd_client_port }}
+{% endfor %}
+  # 憑證契約（CONVENTIONS.md §5）：patroni-etcd-client 是 client profile 葉憑證，
+  # 由 10-pki 的 pki_leaf 簽發派送；etcd 開 client-cert-auth，沒這張連不上
+  cacert: {{ pki_dir }}/ca.crt
+  cert: {{ pki_dir }}/patroni-etcd-client.crt
+  key: {{ pki_dir }}/patroni-etcd-client.key
+
+# -----------------------------------------------------------------------------
+# bootstrap：只在「叢集第一次 initdb」時讀取（寫入 DCS 後即以 DCS 為準）
+# -----------------------------------------------------------------------------
+bootstrap:
+  dcs:
+    # leader lock 壽命（秒）：leader 失聯超過 ttl 才觸發 failover。
+    # 需滿足 ttl >= loop_wait + 2 * retry_timeout（30 >= 10 + 2*10）
+    ttl: {{ patroni_ttl }}
+    # Patroni 主迴圈間隔（秒）：每圈健檢一次、續一次 lock
+    loop_wait: {{ patroni_loop_wait }}
+    # DCS / PG 操作重試上限（秒）：etcd 短暫抖動不會立刻演成降級
+    retry_timeout: {{ patroni_retry_timeout }}
+    # failover 候選人允許的最大落後（bytes，1MiB）：落後太多的副本不得晉升
+    maximum_lag_on_failover: {{ patroni_maximum_lag_on_failover }}
+    # --- 同步複寫：RPO=0 的取捨（本叢集最重要的一個決定） ---
+    # synchronous_mode=true：Patroni 動態指定一台副本為 sync standby，
+    # commit 要等它落盤才回 ACK → leader 掛掉「零資料遺失」（RPO=0）。
+    # 代價：sync standby 也掛掉的瞬間，寫入會暫停，直到 Patroni（最多一個
+    # loop_wait+ttl 的時間窗）把同步要求降級或選出新的 sync standby。
+    # 與 synchronous_mode_strict 的差異：strict=true 時「絕不」自動降級，
+    # 所有 sync 候選全滅就寧可停寫也不冒遺失風險（RPO=0 的絕對保證，
+    # 但犧牲可用性）；本專案信件 metadata 可容忍極端雙故障下的短暫降級，
+    # 故 strict 預設 false——要改法遵級保證時覆寫 patroni_synchronous_mode_strict
+    synchronous_mode: {{ patroni_synchronous_mode | bool | to_json }}
+    synchronous_mode_strict: {{ patroni_synchronous_mode_strict | bool | to_json }}
+    postgresql:
+      # 舊 leader 復活時用 pg_rewind「快轉」回副本（秒級），
+      # 不必整庫 pg_basebackup 重拉（分鐘～小時級）；前提 wal_log_hints=on
+      use_pg_rewind: {{ patroni_use_pg_rewind | bool | to_json }}
+      # replication slot：副本斷線期間 leader 保留它還沒收的 WAL，
+      # 搭配 wal_keep_size 雙保險，避免「回來發現 WAL 被清了」只能重建
+      use_slots: {{ patroni_use_slots | bool | to_json }}
+      # PG 參數（cluster-wide，經 DCS 統一下發到三台）：
+      # 內容 = patroni_pg_parameters（defaults 附詳細註解）combine 上
+      # patroni_pg_parameters_extra（lab 降規口，zz_lab_overrides.yml）。
+      # 提醒：archive_command 在 pgbackrest role 建好 stanza 前會失敗、
+      # WAL 短暫累積——預期行為，stanza-create 後自動追上
+      parameters:
+{% for k, v in _pg_params.items() %}
+        {{ k }}: {{ v | to_json }}
+{% endfor %}
+      # pg_hba 放進 DCS（而不是各節點自管）：三台永遠一致、
+      # patronictl edit-config 一處改、Patroni 自動重寫 pg_hba.conf 並 reload
+      pg_hba:
+{% for rule, why in _pg_hba %}
+        # {{ why }}
+        - "{{ rule }}"
+{% endfor %}
+  # initdb 選項：只在首節點第一次建庫時用到
+  initdb:
+    - encoding: UTF8
+    # data-checksums：頁級校驗和抓「靜默磁碟損壞」；只能在 initdb 時開，
+    # 事後要開得整庫重寫——所以第一天就開
+    - data-checksums
+{% if pg_wal_dir | default('') | length > 0 %}
+    # prod 專用：WAL 放獨立磁碟（pg_wal_dir 非空時才 render；lab 為空 = 與 data 同碟），
+    # 順序寫的 WAL 與隨機讀寫的資料檔分開，互不搶 I/O
+    - waldir: {{ pg_wal_dir }}
+{% endif %}
+
+# -----------------------------------------------------------------------------
+# postgresql：本機 PG 實例的位置與管理身分（Patroni 用這些資訊管理/重寫設定）
+# -----------------------------------------------------------------------------
+postgresql:
+  # 監聽節點 IP（複寫與 Patroni 管理連線）+ loopback（PgBouncer 走本機）。
+  # 「不」聽 0.0.0.0：其他網段本來就不該直連 5432（app 一律走 PgBouncer VIP）
+  listen: {{ ansible_host }},127.0.0.1:{{ patroni_pg_port }}
+  # 其他節點連過來複寫時用的位址（寫進 DCS 讓大家查得到）
+  connect_address: {{ ansible_host }}:{{ patroni_pg_port }}
+  data_dir: {{ patroni_pg_data_dir }}
+  # 指名 18 的二進位路徑：多版本並存時不能讓 PATH 碰運氣
+  bin_dir: {{ patroni_pg_bin_dir }}
+  # Patroni 在首次 bootstrap 時會「自動建立」這兩個身分並設好密碼；
+  # 之後拿 superuser 做管理連線、把 replication 身分發給副本拉 WAL
+  authentication:
+    superuser:
+      username: {{ patroni_superuser_username }}
+      password: {{ postgres_superuser_password | to_json }}
+    replication:
+      username: {{ patroni_replication_username }}
+      password: {{ postgres_replicator_password | to_json }}
+  # 本機側 pg_hba（與上方 DCS 內完全同一份 Jinja 來源）：
+  # 叢集「加入前」（例如 basebackup 剛完成、還沒吃到 DCS 設定）也有正確的存取規則
+  pg_hba:
+{% for rule, why in _pg_hba %}
+    # {{ why }}
+    - "{{ rule }}"
+{% endfor %}
+
+# -----------------------------------------------------------------------------
+# watchdog：防「Patroni 行程凍結但 PG 還活著」的極端雙主情境
+# -----------------------------------------------------------------------------
+watchdog:
+  # automatic：有 /dev/watchdog 就掛（VM 可載 softdog 模組），沒有就自動略過。
+  # lab 容器內沒有 watchdog 裝置 → 自動退化，不需 is_container 分支
+  mode: {{ patroni_watchdog_mode | to_json }}

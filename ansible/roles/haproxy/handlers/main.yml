@@ -1,0 +1,16 @@
+---
+# =============================================================================
+# roles/haproxy/handlers/main.yml
+# =============================================================================
+
+# reload 而非 restart：Ubuntu 的 haproxy.service 以 -Ws（master-worker）前景
+# 執行，systemd reload 會讓 master 起一組新 worker 載入新組態、舊 worker
+# 服務完手上的連線後自然退場；搭配 global 段 stats socket 的
+# `expose-fd listeners`（監聽 fd 直接交棒給新行程），reload 期間連 SYN 都
+# 不會掉——這對「邊界唯一入口」與「資料庫 VIP」是必要品質，restart 會瞬斷
+# 所有進行中的連線（app 端表現為大量 5xx / DB 斷線風暴）。
+- name: Reload haproxy
+  ansible.builtin.systemd_service:
+    name: haproxy
+    state: reloaded
+  listen: reload haproxy

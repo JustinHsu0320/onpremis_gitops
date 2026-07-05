@@ -1,0 +1,30 @@
+---
+# =============================================================================
+# roles/nfs_server/defaults/main.yml — NFSv4 檔案伺服器可調參數（規劃書 §7.4）
+#
+# 分工原則（對照 CONVENTIONS.md §7）：
+#   - 「拓撲事實」（匯出哪些目錄、給哪些網段）放 group_vars/nfs.yml 的 nfs_exports
+#   - 這裡只放「單一服務的 knob」與安全的空預設值
+# =============================================================================
+
+# 匯出清單：真值由 inventories/*/group_vars/nfs.yml 提供（跨 role 契約變數）。
+# 每個項目欄位：path / clients / options / owner / group / mode。
+# 這裡給空 list 是防呆：role 被單獨引用而忘了帶變數時，行為是「什麼都不匯出」
+# 而不是 undefined variable 直接炸掉，方便分階段測試。
+# noqa 理由：nfs_exports 是 CONVENTIONS.md 定義的跨 role 契約變數名，
+# 不能改成 nfs_server_ 前綴，故壓掉 var-naming[no-role-prefix]。
+nfs_exports: []  # noqa: var-naming[no-role-prefix]
+
+# exports 片段檔路徑：用 /etc/exports.d/ 而非直接改 /etc/exports——
+# exportfs 會自動合併兩者，片段檔讓「哪些匯出是本專案管的」一目了然，
+# 也避免與系統既有內容互踩（注意：exports.d 下的檔名必須以 .exports 結尾才會被讀取）
+nfs_server_exports_file: /etc/exports.d/email-proxy.exports
+
+# NFSv4-only 設定的 drop-in 檔（/etc/nfs.conf 結尾的 includedir 會自動載入此目錄）
+nfs_server_conf_dropin: /etc/nfs.conf.d/email-proxy.conf
+
+# systemd 單元用「正規名」nfs-server（nfs-kernel-server 套件裡
+# nfs-kernel-server.service 只是它的 Alias）：對 alias 做 enabled 檢查
+# 在部分 systemd 版本會回報 "alias" 而非 enabled，造成假性 changed，
+# 所以一律操作正規名以確保冪等。
+nfs_server_service: nfs-server

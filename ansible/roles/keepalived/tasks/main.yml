@@ -1,0 +1,80 @@
+---
+# =============================================================================
+# roles/keepalived/tasks/main.yml — Keepalived 單播 VRRP（泛用 VIP role）
+#
+# 「一份 role、多組共用」：lb（VI_SVC + VI_EGRESS）、postgres（VI_PG）、
+# rabbitmq（VI_MQ）都跑同一份 tasks，差異全部收斂在 group_vars 的
+# keepalived_instances 與 host_vars 的 state/priority——role 本身零硬編。
+#
+# 呼叫端（40-lb / 30-postgres / 31-rabbitmq）一律 serial: 1 滾動套用
+# （CONVENTIONS.md §8-7）：一次只動一台，VIP 全程有另一台接著。
+# =============================================================================
+
+# 為什麼用官方 archive 套件：Ubuntu 26.04 的 keepalived 2.3.4 完整支援
+# 單播 VRRP 與 script security；不加第三方 repo（規劃書鐵律），
+# cache_valid_time 避免每次重跑都 apt update（冪等 + 提速）
+- name: 安裝 keepalived 套件
+  ansible.builtin.apt:
+    name: keepalived
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+# 網卡自動偵測（CONVENTIONS.md §8-8：不可寫死 ens160）：
+# 逐一檢查 facts 裡的每張網卡，找出「IPv4 位址 == 本機 inventory 的 ansible_host」
+# 的那張——VRRP 心跳與 VIP 都應該綁在這張「對內服務」的網卡上。
+# 迴圈內的 when 有兩層防呆：
+#   1. keepalived_interface 已有值（使用者在 host_vars 指定、或前一輪已命中）→ 跳過
+#   2. facts 的 per-interface key 會把 - . : 轉成 _（例如 br-vlan10 → br_vlan10），
+#      直接拿 item 查表會 KeyError——先做同樣的正規化再查，且查無此 key 時
+#      default({}) 安全落空，不會炸在 lo/docker0 這類沒有 ipv4 的介面上
+- name: 自動偵測 VRRP 介面（IPv4 位址 == ansible_host 的網卡）
+  ansible.builtin.set_fact:
+    keepalived_interface: "{{ item }}"
+  vars:
+    keepalived_iface_facts: >-
+      {{ ansible_facts[item | replace('-', '_') | replace('.', '_') | replace(':', '_')]
+         | default({}) }}
+  when:
+    - keepalived_interface | length == 0
+    - keepalived_iface_facts.ipv4.address | default('') == ansible_host
+  loop: "{{ ansible_facts.interfaces | default([]) }}"
+
+# 偵測失敗就立刻停：帶著空 interface 去渲染模板，keepalived 會起不來且
+# 錯誤訊息難懂——在這裡用人話報錯，並直接給出解法（host_vars 手動指定）
+- name: 斷言：VRRP 介面已確定
+  ansible.builtin.assert:
+    that: keepalived_interface | length > 0
+    fail_msg: >-
+      無法自動偵測 VRRP 介面：沒有任何網卡的 IPv4 等於 ansible_host
+      （{{ ansible_host }}）。候選介面：
+      {{ ansible_facts.interfaces | default([]) | join(', ') }}。
+      請在 host_vars 明確設定 keepalived_interface。
+    success_msg: "VRRP 介面：{{ keepalived_interface }}"
+
+# 設定檔含 VRRP auth_pass（vault 機密）→ 0600 + no_log（CONVENTIONS.md §8-5）。
+# 用 reload 而非 restart：restart 會先釋放 VIP 造成瞬斷，reload（SIGHUP）
+# 增量套用設定、MASTER 狀態不受影響——這正是滾動變更能零中斷的關鍵
+- name: 佈署 /etc/keepalived/keepalived.conf
+  ansible.builtin.template:
+    src: keepalived.conf.j2
+    dest: /etc/keepalived/keepalived.conf
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  notify: reload keepalived
+
+# enabled=true 開機自啟；state=started 只保證「有在跑」。
+# 首次部署時序：apt 裝完因無設定檔（unit 有 ConditionFileNotEmpty）不會自啟，
+# 上面模板落地後這裡才第一次啟動——所以第一次啟動讀到的就是我們的設定
+- name: 啟用並啟動 keepalived 服務
+  ansible.builtin.systemd_service:
+    name: keepalived
+    enabled: true
+    state: started
+
+# 立刻執行排隊中的 reload，讓「本台的變更生效、VRRP 收斂完成」發生在
+# serial 窗口內——下一台開始滾動前，這一台已經回到正常狀態
+- name: 立即套用尚未生效的設定變更
+  ansible.builtin.meta: flush_handlers

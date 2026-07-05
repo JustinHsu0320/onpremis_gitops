@@ -1,0 +1,106 @@
+# =============================================================================
+# web-backend Deployment（base）
+#
+# 後端 API 服務，監聽 8000。結構與 web-frontend 同構，
+# 差異：獨立的健康端點（/healthz、/readyz）、資源配額較高、
+# 組態經由 ConfigMap/Secret 注入（見 envFrom 擴充註記）。
+#
+# 【架構邊界 / ADR-4】後端寄信是「網路呼叫」email_proxy VM 的端點
+# （SMTP relay），該 VM 由本 repo ansible/ 管理、不在 K8s ——
+# 連線位址請放 ConfigMap，不要在叢集裡找 email_proxy 的 Service（不存在）。
+# =============================================================================
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-backend
+  labels:
+    app.kubernetes.io/name: web-backend
+    app.kubernetes.io/component: backend
+spec:
+  # base 給最小值 1；正式環境副本數由 overlays/prod/replicas-patch.yaml 拉高
+  replicas: 1
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      # selector 建立後不可變更，只放最穩定的 name label
+      app.kubernetes.io/name: web-backend
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # 先長新的、ready 才殺舊的 —— API 服務更新期間零容量損失
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: web-backend
+        app.kubernetes.io/component: backend
+    spec:
+      # 內部 registry 拉取憑證（建立指令見 web-frontend/base/deployment.yaml 註解）
+      imagePullSecrets:
+        - name: regcred-platform
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000 # 應用映像內的非特權使用者（Dockerfile USER 對齊此 UID）
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: web-backend
+          # tag 由 overlays/prod/kustomization.yaml 的 images: 段決定，
+          # 該段由 gitlab/ci-templates 的 bump job 以 kustomize edit set image
+          # 自動改寫 —— 此處僅為 base 預設值（詳見 overlay 註解）
+          image: registry.ptc-nec.com.tw:5050/platform/web-backend:v1.0.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          # -------------------------------------------------------------------
+          # 【擴充註記】應用組態注入點：DB 連線、email_proxy relay 位址等
+          # 放 ConfigMap；密碼/token 放 Secret（建議 sealed-secrets 進 Git）。
+          # 就緒後打開：
+          # envFrom:
+          #   - configMapRef:
+          #       name: web-backend-config
+          #   - secretRef:
+          #       name: web-backend-secrets
+          # -------------------------------------------------------------------
+          resources:
+            requests:
+              # API 服務比靜態伺服吃資源：排程保底給足，避免擠在同一 node 上餓死
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1" # 失控上限 1 顆核；長期壓在 limit 附近就該調高並查原因
+              memory: 512Mi
+          # -------------------------------------------------------------------
+          # readiness = /readyz：「依賴就緒才收流量」—— 應用應在此檢查
+          # DB 連線池等關鍵依賴；失敗只摘流量、不殺容器。
+          # -------------------------------------------------------------------
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # -------------------------------------------------------------------
+          # liveness = /healthz：「行程還活著嗎」—— 只檢查自身事件迴圈，
+          # 千萬別在 liveness 裡查 DB：DB 抖動會演成全部 Pod 被連環重啟的雪崩。
+          # 門檻比 readiness 寬鬆（代價是 kill container）。
+          # -------------------------------------------------------------------
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL

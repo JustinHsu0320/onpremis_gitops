@@ -1,0 +1,122 @@
+# {{ ansible_managed }}
+# =============================================================================
+# haproxy-postgres.cfg — 資料層 HAProxy（profile=postgres，pg-01..03 各一份）
+#
+# 這份設定是「讀寫分流」的核心。junior 必須先弄懂一件事：
+#
+#   ★ 健檢問的埠 ≠ 流量進的埠 ★
+#
+#   健檢：HTTP GET → Patroni REST（{{ patroni_rest_port }} 埠，無認證的唯讀健康端點）
+#   流量：TCP     → 該台的 PgBouncer（{{ pgbouncer_port }} 埠）
+#
+# Patroni REST 的角色端點語意（這是整套分流的地基）：
+#   GET /primary → 我是 leader 時回 200，否則回 503
+#   GET /replica → 我是健康的 replica 時回 200，否則回 503（leader 也回 503）
+#
+# 所以：
+#   pg_rw 用 /primary 健檢 → 三台裡「恰好一台」UP（現任 leader）→ 寫入永遠進 leader
+#   pg_ro 用 /replica 健檢 → 兩台 replica UP、leader 顯示 DOWN（這是「設計如此」，
+#          不是故障！）→ 讀流量只進副本
+#
+# failover 時會發生什麼（腦內推演一次）：
+#   1. 舊 leader 掛掉 → Patroni 經 etcd 選出新 leader
+#   2. pg_rw 健檢：舊 leader 的 /primary 開始回 503（或根本連不上）→ fall 3 次判死；
+#      新 leader 的 /primary 開始回 200 → rise 2 次上線
+#   3. on-marked-down shutdown-sessions 立刻斬斷所有黏在舊 leader 上的既有連線，
+#      逼 app 重連——新連線自然落到新 leader。沒有這行，舊連線會掛在
+#      「已降級為 replica 的節點」上，寫入報 read-only 錯誤直到連線自然死亡
+#
+# 拓撲（三台 pg 節點每台都跑一份一模一樣的設定）：
+#
+#   app ──→ pgbouncer-vip {{ pgbouncer_vip }}:{{ pgbouncer_port }}（RW）──→ [健檢=/primary] ──→ leader 的 PgBouncer
+#   app ──→ pgbouncer-vip {{ pgbouncer_vip }}:{{ pgbouncer_ro_port }}（RO）──→ [健檢=/replica] ──→ replica 的 PgBouncer
+#
+#   VIP 由 keepalived 決定落在哪台；HAProxy 三台常態待命
+#   （net.ipv4.ip_nonlocal_bind=1 讓 BACKUP 也綁得住 VIP 埠）。
+# =============================================================================
+
+global
+    maxconn {{ haproxy_pg_maxconn }}
+    # 日誌走 stdout：haproxy.service 以 -Ws 前景執行，由 systemd-journald 收容
+    log stdout local0 info
+    user haproxy
+    group haproxy
+    chroot /var/lib/haproxy
+    # expose-fd listeners：無縫 reload（監聽 fd 交棒新行程，reload 不掉 SYN）
+    stats socket /run/haproxy/admin.sock mode 660 level admin expose-fd listeners
+
+defaults
+    log global
+    # 資料層一律 TCP passthrough：TLS 由 PgBouncer 終止（client 憑證驗的是
+    # pgbouncer-server 憑證的 VIP SAN），HAProxy 不解、也解不了 PG 協定
+    mode tcp
+    option tcplog
+    option dontlognull
+    timeout connect {{ haproxy_pg_timeout_connect }}
+    # 30m：長事務 / pg_dump / 報表查詢可能長時間沒有封包往返，
+    # 逾時太短會把「活著但慢」的連線誤斬，app 端看到的是莫名 DB 斷線
+    timeout client {{ haproxy_pg_timeout_client }}
+    timeout server {{ haproxy_pg_timeout_server }}
+
+# -----------------------------------------------------------------------------
+# RW 口：{{ pgbouncer_vip }}:{{ pgbouncer_port }} → 現任 leader 的 PgBouncer
+# -----------------------------------------------------------------------------
+listen pg_rw
+    bind {{ pgbouncer_vip }}:{{ pgbouncer_port }}
+    mode tcp
+    # 健檢是 HTTP（打 Patroni REST），流量是 TCP——option httpchk 只影響
+    # 健檢通道的協定，與 mode tcp 不衝突，這是 HAProxy 的標準組合技
+    option httpchk GET /primary
+    http-check expect status 200
+    # inter 3s × fall 3 ≈ 最慢 9s 判死：failover 偵測速度直接決定寫入
+    # 中斷時間窗；rise 2 防止健檢抖動造成 leader 判定震盪。
+    # on-marked-down shutdown-sessions：節點被判死的「當下」就斬斷其上
+    # 所有既有 TCP 連線（而不是等它們自然逾時）——failover 時逼 app 立刻
+    # 重連到新 leader，把「對舊 leader 寫入失敗」的窗口壓到最小
+    default-server inter {{ haproxy_pg_check_inter }} fall {{ haproxy_pg_check_fall }} rise {{ haproxy_pg_check_rise }} on-marked-down shutdown-sessions
+{% for h in groups['postgres'] %}
+    # 健檢打 {{ h }} 的 Patroni（:{{ patroni_rest_port }}），流量進 {{ h }} 的 PgBouncer（:{{ pgbouncer_port }}）
+    server {{ h }} {{ hostvars[h].ansible_host }}:{{ pgbouncer_port }} check port {{ patroni_rest_port }}
+{% endfor %}
+
+# -----------------------------------------------------------------------------
+# RO 口：{{ pgbouncer_vip }}:{{ pgbouncer_ro_port }} → 健康 replica 的 PgBouncer
+# -----------------------------------------------------------------------------
+listen pg_ro
+    bind {{ pgbouncer_vip }}:{{ pgbouncer_ro_port }}
+    mode tcp
+    balance roundrobin
+    # /replica：只有「健康的副本」回 200；leader 回 503，因此 leader 在這個
+    # 池永遠顯示 DOWN——看 stats 頁時別誤判為故障，這正是讀寫分離的機制
+    option httpchk GET /replica
+    http-check expect status 200
+    # 設計取捨（刻意不加 backup server 行）：
+    #   有人會想把 leader 加成 `backup`（兩台 replica 全掛時讓讀流量退回
+    #   leader），但 backup 行沿用本池的 /replica 健檢——leader 對 /replica
+    #   永遠回 503，這個 backup 永遠是 DOWN，加了也是死路（HAProxy 的健檢
+    #   是「每個 listen 一組」，無法對單一 server 行換不同的 httpchk URI）。
+    #   結論：三台全列 + 不加 backup。兩台 replica 全掛時 RO 口才會空——
+    #   機率極低（等同資料層只剩單點），且屆時該做的是搶修副本；RO 空窗的
+    #   fallback（改打 RW 口）屬於應用層的降級邏輯，不在 LB 層越權處理。
+    # on-marked-down shutdown-sessions 對 RO 同樣有價值：replica 被拔掉
+    # （例如被 Patroni 提升為新 leader）時，立刻把黏在它身上的讀連線斬斷、
+    # 重新分配到其餘 replica
+    default-server inter {{ haproxy_pg_check_inter }} fall {{ haproxy_pg_check_fall }} rise {{ haproxy_pg_check_rise }} on-marked-down shutdown-sessions
+{% for h in groups['postgres'] %}
+    server {{ h }} {{ hostvars[h].ansible_host }}:{{ pgbouncer_port }} check port {{ patroni_rest_port }}
+{% endfor %}
+
+# -----------------------------------------------------------------------------
+# stats / metrics（CONVENTIONS.md §3：節點 IP:{{ haproxy_stats_port }}）
+# -----------------------------------------------------------------------------
+frontend stats
+    # 綁節點 IP：三台 pg 的 HAProxy 狀態各自獨立可看（Prometheus 逐台抓；
+    # 判讀 pg_rw/pg_ro 的 UP/DOWN 分佈是 failover 事後分析的第一手資料）
+    bind {{ ansible_host }}:{{ haproxy_stats_port }}
+    # defaults 是 tcp，stats 頁面與 exporter 是 HTTP 服務 → 這裡覆寫回 http
+    mode http
+    stats enable
+    stats uri /stats
+    stats refresh {{ haproxy_stats_refresh }}
+    # HAProxy 3.x 內建 Prometheus exporter：/stats 給人看、/metrics 給機器抓
+    http-request use-service prometheus-exporter if { path /metrics }

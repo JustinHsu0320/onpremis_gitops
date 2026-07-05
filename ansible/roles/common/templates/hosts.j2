@@ -1,0 +1,19 @@
+{# ===========================================================================
+   /etc/hosts 受管區塊內容（ADR-5：名稱解析由 Ansible 統一管理）
+   - 本檔案只產生 blockinfile 的「區塊內容」，marker 由 task 給定；
+     系統自帶的 127.0.0.1 / 127.0.1.1 行在區塊之外，不受影響。
+   - (a) inventory 所有主機：ansible_host → fqdn + 短名（排序求輸出穩定=冪等）；
+         同一台實體主機以多群組成員（如 egress=lb）出現時，groups['all']
+         已去重，只會輸出一行。
+   - (b) extra_hosts_entries：VIP 與服務別名（svc-api / egress-proxy /
+         pgbouncer-vip / rabbitmq-vip / gitlab / registry），
+         清單定義於 group_vars/all/vars.yml。
+   =========================================================================== #}
+{% for h in groups['all'] | sort %}
+{% if hostvars[h].ansible_host is defined %}
+{{ "%-16s" | format(hostvars[h].ansible_host) }} {{ h }}.{{ domain }} {{ h }}
+{% endif %}
+{% endfor %}
+{% for entry in extra_hosts_entries %}
+{{ "%-16s" | format(entry.ip) }} {{ entry.names | join(' ') }}
+{% endfor %}

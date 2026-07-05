@@ -1,0 +1,197 @@
+---
+# =============================================================================
+# roles/keydb/tasks/main.yml — KeyDB 3 master + 3 replica（規劃書 §7.6）
+#
+# 拓撲（junior 必讀）：
+#   每台 app 節點跑 1 個 master（6379）+ 1 個 replica（6380），Docker 容器、
+#   host network、TLS-only。--cluster create --cluster-replicas 1 會把
+#   replica 分配到「別台」的 master 上（anti-affinity），所以任一台 app
+#   整台故障時，它負責的 1/3 slot 由他台的 replica 自動 failover 接手——
+#   這就是本 role 對「3 master 無副本」舊架構的修正。
+#
+# 前置依賴（由 site.yml 順序保證）：
+#   00-bootstrap：Docker Engine；10-pki：keydb-server（peer）/ keydb-client 憑證
+# =============================================================================
+
+# ---------- 0. kernel 參數 ----------
+# replica 全量同步時 KeyDB 會 fork 做 RDB-to-socket 快照，copy-on-write
+# 最壞情況需要「看起來」翻倍的記憶體；vm.overcommit_memory=1 讓 fork
+# 不因 overcommit 保守估計而失敗（KeyDB/Redis 官方建議值）。
+# vm.* 是 kernel 級參數，容器共用宿主 kernel、無權也不該去改 → lab 跳過。
+- name: 設定 vm.overcommit_memory=1（容器環境跳過）
+  ansible.posix.sysctl:
+    name: vm.overcommit_memory
+    value: "1"
+    state: present
+    sysctl_set: true
+  when: not is_container
+
+# ---------- 1. 目錄結構 ----------
+# tls/ 與 data-* 的擁有者是 999:999：eqalpha/keydb 映像的 entrypoint 會
+# gosu 降權到容器內建的 keydb 使用者（UID/GID 999）執行，宿主檔案不給
+# 這個 UID 讀就起不來。data-* 還必須「可寫」——純快取雖不開 AOF/RDB，
+# 但 cluster 拓撲檔 nodes.conf（節點身分/slot 分配）要能持久化。
+- name: 建立 KeyDB 目錄結構
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: "{{ item.group }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ keydb_home }}", owner: root, group: root, mode: "0755" }
+    - { path: "{{ keydb_home }}/tls", owner: "{{ keydb_container_uid }}", group: "{{ keydb_container_gid }}", mode: "0750" }
+    - { path: "{{ keydb_home }}/data-master", owner: "{{ keydb_container_uid }}", group: "{{ keydb_container_gid }}", mode: "0700" }
+    - { path: "{{ keydb_home }}/data-replica", owner: "{{ keydb_container_uid }}", group: "{{ keydb_container_gid }}", mode: "0700" }
+  loop_control:
+    label: "{{ item.path }}"
+
+# ---------- 2. TLS 憑證 ----------
+# 為什麼 copy 一份而不直接掛 {{ pki_dir }}？
+#   pki_leaf 產出的檔案 owner 是 root（契約 §5），容器內的 keydb（999）讀不到
+#   私鑰；直接改 {{ pki_dir }} 的 ownership 會影響同機其他讀憑證的服務。
+#   所以複製到 /opt/keydb/tls 並 chown 999——容器專用、互不干擾。
+# remote_src：來源就在目標主機上（10-pki 已派送），不是 controller 推檔。
+# 私鑰是機密：mode 0600 + no_log（防 --diff 把金鑰內容印上終端）。
+- name: 複製 TLS 憑證與私鑰到容器掛載目錄
+  ansible.builtin.copy:
+    src: "{{ pki_dir }}/{{ item.name }}"
+    dest: "{{ keydb_home }}/tls/{{ item.name }}"
+    remote_src: true
+    owner: "{{ keydb_container_uid }}"
+    group: "{{ keydb_container_gid }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { name: ca.crt, mode: "0644" }
+    - { name: keydb-server.crt, mode: "0644" }
+    - { name: keydb-server.key, mode: "0600" }
+    - { name: keydb-client.crt, mode: "0644" }
+    - { name: keydb-client.key, mode: "0600" }
+  loop_control:
+    label: "{{ item.name }}"
+  no_log: true
+  notify: restart keydb
+
+# PKI 契約：10-pki 重簽憑證時 pki_leaf 會設 host fact pki_certs_changed=true。
+# 正常情況上面的 copy 比對內容就會 changed→notify；這個「橋接 task」是
+# 契約要求的保險絲——確保 10-pki 重簽後重跑本 playbook 一定會 recreate
+# 容器讓新憑證生效（copy 在前、recreate handler 在後，順序正確）。
+# /bin/true 只是掛 notify 的載體，本身無副作用。
+- name: 偵測 PKI 憑證輪替並排程容器重建
+  ansible.builtin.command: /bin/true
+  changed_when: true
+  when: pki_certs_changed | default(false)
+  notify: restart keydb
+
+# ---------- 3. 設定檔（master / replica 各一份） ----------
+# 單一 template render 兩次（item.tls_port 是唯一差異）：雙檔手寫遲早漂移。
+# conf 內含 requirepass/masterauth → 0600 + no_log；owner 999 讓容器內
+# 降權後的 keydb 使用者讀得到。
+- name: 佈署 KeyDB 設定檔（master 6379 / replica 6380）
+  ansible.builtin.template:
+    src: keydb.conf.j2
+    dest: "{{ keydb_home }}/{{ item.role }}.conf"
+    owner: "{{ keydb_container_uid }}"
+    group: "{{ keydb_container_gid }}"
+    mode: "0600"
+  loop:
+    - { role: master, tls_port: "{{ keydb_port }}" }
+    - { role: replica, tls_port: "{{ keydb_replica_port }}" }
+  loop_control:
+    label: "{{ item.role }}"
+  no_log: true
+  notify: restart keydb
+
+# ---------- 4. docker compose 專案 ----------
+# healthcheck 內含密碼 → 0600 + no_log（root 讀就夠：docker compose 以 root 跑）
+- name: 佈署 docker-compose.yml
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ keydb_home }}/docker-compose.yml"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  notify: restart keydb
+
+# state=present ≒ docker compose up -d：容器不存在就建、存在就確保運行。
+# 注意它「偵測不到」volume 掛載檔（conf/tls）的內容變更——那由上面的
+# notify → recreate handler 補上。
+- name: 啟動 KeyDB master/replica 容器
+  community.docker.docker_compose_v2:
+    project_src: "{{ keydb_home }}"
+    state: present
+
+# 把排隊中的 recreate 立刻執行掉再驗埠/建叢集——否則設定已變但容器
+# 還跑舊 conf，下面的 wait_for 與叢集操作會在「舊狀態」上假通過。
+- name: 立即套用尚未生效的容器變更
+  ansible.builtin.meta: flush_handlers
+
+# ---------- 5. 部署自驗：埠就緒 ----------
+# 只驗 TCP 可達（TLS 握手與認證由 compose healthcheck 和 99-verify 驗）；
+# keydb-server SAN 含 127.0.0.1（group_vars/app.yml），本機迴環即可驗。
+- name: 等待 KeyDB 監聽 TLS 埠
+  ansible.builtin.wait_for:
+    host: 127.0.0.1
+    port: "{{ item | int }}"
+    timeout: "{{ keydb_wait_timeout }}"
+  loop:
+    - "{{ keydb_port }}"
+    - "{{ keydb_replica_port }}"
+  loop_control:
+    label: "port {{ item }}"
+
+# ---------- 6. 叢集初始化（run_once：只在第一台執行一次） ----------
+# 先查現況再決定要不要 create——這是 command 冪等化的標準手法。
+# 指令行含密碼 → no_log（失敗除錯時可暫時拿掉 no_log 重跑）。
+- name: 查詢叢集現況（cluster info）
+  ansible.builtin.command: >-
+    docker exec keydb-master keydb-cli
+    --tls --cacert /tls/ca.crt --cert /tls/keydb-client.crt --key /tls/keydb-client.key
+    -p {{ keydb_port }} -a {{ keydb_password }} --no-auth-warning
+    cluster info
+  register: keydb_cluster_info
+  changed_when: false
+  run_once: true
+  no_log: true
+
+# regex 抓 cluster_known_nodes 數字；未初始化的節點回 1（只認識自己）
+- name: 解析 cluster_known_nodes
+  ansible.builtin.set_fact:
+    keydb_known_nodes: "{{ (keydb_cluster_info.stdout | regex_search('cluster_known_nodes:([0-9]+)', '\\1') or ['0']) | first }}"
+  run_once: true
+
+# 已是 6 節點（3M+3R 全員到齊）就跳過——重複 create 會直接報錯。
+# 端點順序刻意「3 個 :6379 在前、3 個 :6380 在後」：--cluster-replicas 1
+# 會把前 N 個當 master、其餘依序配對成 replica，且 create 內建
+# anti-affinity——replica 不會被配到「同 IP」的 master 上，
+# 所以單台 app 整機故障不會同時帶走某段 slot 的 master 和它的 replica。
+- name: 初始化叢集（3 master + 3 replica、anti-affinity）
+  ansible.builtin.command: >-
+    docker exec keydb-master keydb-cli
+    --tls --cacert /tls/ca.crt --cert /tls/keydb-client.crt --key /tls/keydb-client.key
+    -a {{ keydb_password }} --no-auth-warning
+    --cluster create
+    {% for h in groups['keydb'] %}{{ hostvars[h].ansible_host }}:{{ keydb_port }} {% endfor %}
+    {% for h in groups['keydb'] %}{{ hostvars[h].ansible_host }}:{{ keydb_replica_port }} {% endfor %}
+    --cluster-replicas 1 --cluster-yes
+  changed_when: true
+  run_once: true
+  no_log: true
+  when: keydb_known_nodes | int < 6
+
+# create 回傳後 slot 指派與 epoch 收斂還要幾秒；輪詢到 cluster_state:ok
+# 才放行，讓後續 50-app / 99-verify 面對的是「真的可用」的叢集。
+- name: 等待 cluster_state:ok
+  ansible.builtin.command: >-
+    docker exec keydb-master keydb-cli
+    --tls --cacert /tls/ca.crt --cert /tls/keydb-client.crt --key /tls/keydb-client.key
+    -p {{ keydb_port }} -a {{ keydb_password }} --no-auth-warning
+    cluster info
+  register: keydb_cluster_state
+  until: "'cluster_state:ok' in keydb_cluster_state.stdout"
+  retries: "{{ keydb_cluster_ok_retries }}"
+  delay: "{{ keydb_cluster_ok_delay }}"
+  changed_when: false
+  run_once: true
+  no_log: true

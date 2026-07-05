@@ -1,0 +1,14 @@
+---
+# =============================================================================
+# roles/node_exporter/handlers/main.yml
+#
+# node_exporter 是無狀態行程，restart 中斷 < 1 秒；期間 Prometheus 最多
+# 錯過一輪 15s 抓取，不會觸發 InstanceDown（門檻 for: 2m），可放心重啟。
+# =============================================================================
+
+# handler 名稱格式為契約規定的「restart <service>」小寫（CONVENTIONS.md §8.6），
+# 對 ansible-lint 的 name[casing] 加 noqa
+- name: restart node_exporter  # noqa: name[casing]
+  ansible.builtin.systemd_service:
+    name: "{{ node_exporter_service }}"
+    state: restarted

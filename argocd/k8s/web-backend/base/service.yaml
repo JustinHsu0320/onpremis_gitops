@@ -1,0 +1,23 @@
+# =============================================================================
+# web-backend Service（base）
+#
+# ClusterIP：對外走 Ingress、叢集內（如 web-frontend 的 nginx 反代或
+# 其他服務）直接打 http://web-backend.web-backend.svc（80）。
+# =============================================================================
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-backend
+  labels:
+    app.kubernetes.io/name: web-backend
+    app.kubernetes.io/component: backend
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: web-backend
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80 # 叢集內統一打 80
+      targetPort: http # 指向容器具名 port（8000）；改埠號只動 deployment

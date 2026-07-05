@@ -1,0 +1,133 @@
+---
+# =============================================================================
+# roles/gitlab_runner/tasks/main.yml — GitLab Runner（docker executor）
+#
+# 前提：meta 依賴已先跑 docker role（executor 的硬相依，見 meta/main.yml），
+# common/pki_leaf 由 site.yml 順序保證（/etc/hosts 已能解析 gitlab.*、
+# 系統信任庫已含內部 CA → runner 對 gitlab 的 TLS 連線直接可用）
+# =============================================================================
+
+# ---------- 1. GitLab Runner 官方 APT repo（同 gitlab_server 的 keyring 模式） ----------
+- name: 建立 APT keyring 目錄
+  ansible.builtin.file:
+    path: "{{ gitlab_runner_keyring_path | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+# .asc（ASCII armor）原樣落地即可（apt 2.4+ signed-by 直接支援）；
+# get_url 對「內容相同」不重下載 → 冪等
+- name: 下載 GitLab Runner repo GPG 金鑰
+  ansible.builtin.get_url:
+    url: "{{ gitlab_runner_apt_key_url }}"
+    dest: "{{ gitlab_runner_keyring_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+  environment: "{{ gitlab_runner_proxy_env if use_egress_proxy else {} }}"
+
+# register 給下面 apt 用：repo 剛加入/變更時強制 apt update，
+# 否則索引裡沒有 gitlab-runner 套件
+- name: 佈署 GitLab Runner APT 來源
+  ansible.builtin.template:
+    src: gitlab-runner.list.j2
+    dest: /etc/apt/sources.list.d/gitlab-runner.list
+    owner: root
+    group: root
+    mode: "0644"
+  register: gitlab_runner_repo
+
+# ---------- 2. 套件 ----------
+- name: 安裝 gitlab-runner
+  ansible.builtin.apt:
+    name: gitlab-runner
+    state: present
+    update_cache: true
+    cache_valid_time: "{{ 0 if gitlab_runner_repo.changed else 3600 }}"
+
+# ---------- 3. 註冊（需要 token；未提供時整段跳過） ----------
+# 冪等判斷：config.toml 內已有 [[runners]] 區塊 = 已註冊過，不再重複註冊
+# （重複 register 會在 GitLab 端堆出一排殭屍 runner）。
+# rc 意義：0=已註冊、1=檔案存在但未註冊、2=檔案不存在（全新主機）——
+# 後兩者都該進行註冊，只有其他 rc 才是真錯誤
+- name: 檢查 runner 是否已註冊
+  ansible.builtin.command:
+    argv:
+      - grep
+      - -q
+      - '^\[\[runners\]\]'
+      - "{{ gitlab_runner_config_path }}"
+  register: gitlab_runner_pre_check
+  changed_when: false
+  failed_when: gitlab_runner_pre_check.rc not in [0, 1, 2]
+
+# GitLab 16+ 流程：先在 UI/API 建 runner 拿 glrt- token（見 defaults 註解），
+# register 只綁定既有 runner，不再自帶 tag/description 之類的伺服器端屬性
+# （--description 仍寫入本地 config 供辨識）。
+# --docker-volumes 逐項帶入（含內部 CA 唯讀掛載，理由見 defaults）。
+# no_log：token 是機密（拿到就能冒充 runner 領 job）
+- name: 註冊 runner（docker executor）
+  ansible.builtin.command:
+    cmd: >-
+      gitlab-runner register --non-interactive
+      --url {{ gitlab_external_url }}
+      --token {{ gitlab_runner_registration_token }}
+      --executor docker
+      --docker-image {{ gitlab_runner_default_image }}
+      --description {{ inventory_hostname }}
+      {% for v in gitlab_runner_docker_volumes %} --docker-volumes {{ v }}{% endfor %}
+  when:
+    - gitlab_runner_registration_token is defined
+    - gitlab_runner_pre_check.rc != 0
+  changed_when: true
+  no_log: true
+
+# 註冊可能剛剛才發生，重新取得「現在」的註冊狀態，
+# 供下面 volumes 調整判斷（未註冊就沒有 [runners.docker] 區塊可改）
+- name: 再次檢查註冊狀態（供 config 調整判斷）
+  ansible.builtin.command:
+    argv:
+      - grep
+      - -q
+      - '^\[\[runners\]\]'
+      - "{{ gitlab_runner_config_path }}"
+  register: gitlab_runner_post_check
+  changed_when: false
+  failed_when: gitlab_runner_post_check.rc not in [0, 1, 2]
+
+# ---------- 4. config.toml 調整 ----------
+# concurrent 是「全域」頂層設定，register 不會寫它（預設 1 = CI 全部排隊）。
+# lineinfile 只動這一行、不重寫整個檔（token 等其他內容不碰）；
+# create: true 讓「裝了套件但尚未註冊」的主機也能先落地此設定。
+# 0600：config.toml 註冊後含 runner token，屬機密檔（規範 §8.5）
+- name: 調整全域併發上限（concurrent）
+  ansible.builtin.lineinfile:
+    path: "{{ gitlab_runner_config_path }}"
+    regexp: '^concurrent = '
+    line: "concurrent = {{ gitlab_runner_concurrent }}"
+    create: true
+    owner: root
+    group: root
+    mode: "0600"
+  notify: restart gitlab-runner
+
+# 兜底：舊有主機若是在「加入 CA 掛載需求之前」註冊的，config 裡的
+# volumes 只有 ["/cache"]——把整行改寫成 defaults 宣告的完整清單，
+# 讓 job 容器信任內部 registry（新註冊的主機此行已由 register 寫好 → no-op）。
+# 只在已註冊時執行：未註冊的 config 沒有 [runners.docker] 區塊，
+# lineinfile 找不到 regexp 會把這行 append 到檔尾（頂層 volumes 是非法 TOML）
+- name: 掛載內部 CA 目錄至 job 容器（runners.docker volumes）
+  ansible.builtin.lineinfile:
+    path: "{{ gitlab_runner_config_path }}"
+    regexp: '^\s*volumes = '
+    line: "    volumes = {{ gitlab_runner_docker_volumes | to_json }}"
+  when: gitlab_runner_post_check.rc == 0
+  notify: restart gitlab-runner
+
+# ---------- 5. 服務 ----------
+- name: 啟用並啟動 gitlab-runner 服務
+  ansible.builtin.systemd_service:
+    name: gitlab-runner
+    enabled: true
+    state: started

@@ -1,0 +1,55 @@
+---
+# =============================================================================
+# group_vars/rabbitmq.yml — 訊息佇列層（RabbitMQ 4.x quorum queue）
+# =============================================================================
+
+rabbitmq_vhost: email_proxy
+rabbitmq_app_user: email_proxy
+
+# ---------- 資料碟（block_storage role；lab 因 is_container 跳過） ----------
+# 對應 terraform 的 mq disk1-mqdata（100G）。RabbitMQ 的 mnesia / quorum queue
+# 的 Raft log 都寫在這裡，寫不進去 = 佇列服務癱瘓，所以要獨立碟
+storage_volumes:
+  - { mountpoint: /var/lib/rabbitmq, size_gb: 100, owner: rabbitmq, group: rabbitmq, mode: "0750" }
+
+# 佇列拓撲（對齊現有系統：主佇列 / 重試 / 死信）
+# quorum queue 靠 Raft 多數複寫，天生跨節點 HA —— 這是 RabbitMQ 4.x 的預設最佳實踐，
+# 取代已淘汰的 classic mirrored queue
+rabbitmq_queues:
+  - name: email_proxy_queue
+    dlx: email_proxy_dlx            # 失敗訊息經 DLX 轉到 dlq
+  - name: email_proxy_retry
+    dlx: email_proxy_dlx
+  - name: email_proxy_dlq
+    dlx: ""
+
+# 延遲訊息 plugin（現有系統的重試機制依賴它；下載走 egress proxy 白名單
+# 的 .githubusercontent.com，或先下載後放內部制品庫）
+rabbitmq_delayed_plugin_enabled: true
+
+# ---------- PKI ----------
+pki_certificates:
+  - name: rabbitmq-server
+    profile: server
+    owner: rabbitmq
+    group: rabbitmq
+    key_mode: "0600"
+    # app 連 rabbitmq-vip:5671，SAN 必須涵蓋 VIP 名稱與 IP
+    extra_sans:
+      - "DNS:rabbitmq-vip.{{ domain }}"
+      - "DNS:rabbitmq-vip"
+      - "IP:{{ rabbitmq_vip }}"
+
+# ---------- HAProxy（AMQPS VIP）+ Keepalived ----------
+# 修正規劃書 §10.4：app 一律經 VIP 5671，不再直連個別節點的 25671
+haproxy_profile: rabbitmq
+
+keepalived_instances:
+  - name: VI_MQ
+    vrid: 31
+    vip: "{{ rabbitmq_vip }}"
+    state: "{{ keepalived_state }}"
+    priority: "{{ keepalived_priority }}"
+    auth_pass: "{{ vrrp_pass_mq }}"
+    peers_group: rabbitmq
+    track_haproxy: true

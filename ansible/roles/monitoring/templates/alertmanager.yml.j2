@@ -1,0 +1,59 @@
+{#
+  alertmanager.yml.j2 — Alertmanager 告警路由
+
+  現況：通知管道尚未接（公司 SMTP / IM webhook 都要另申請），先用
+  「無整合的空 receiver」佔位——告警仍會進 Alertmanager（UI :9093 可查、
+  可 silence），只是不外送。接通知管道時照下方註解範例改。
+#}
+# ===== {{ ansible_managed }} =====
+
+route:
+  # 預設路由：全部告警進 ops-null。之後接上通知管道時，把 receiver 換掉
+  # 或在 routes: 底下按 severity 分流（critical → 值班、warning → 郵件）。
+  receiver: ops-null
+  # 同一告警規則 + 同一主機聚成一封通知，避免一次網路事件炸出幾十封
+  group_by: ["alertname", "instance"]
+  # 首封等 30s：讓同批告警聚齊再送
+  group_wait: 30s
+  # 同群組有新告警加入時，最快 5 分鐘後補送
+  group_interval: 5m
+  # 未解決的告警每 4 小時重送一次——足夠提醒但不至於淹沒信箱
+  repeat_interval: 4h
+
+receivers:
+  # 空 receiver（無任何 *_configs）＝ Alertmanager 官方的 null 佔位模式：
+  # 告警被「接收」但不外送。千萬不要因為沒通知管道就不部署 Alertmanager——
+  # 它的 UI / silence / 聚合功能在事故處理時就已經有價值。
+  - name: ops-null
+
+# =============================================================================
+# ↓↓↓ Email/SMTP 通知範例（完整可用；解除註解、填入公司 SMTP 即可） ↓↓↓
+#
+# 步驟：
+#   1. smtp_auth_password 加入 vault（vault_alertmanager_smtp_password），
+#      並在 group_vars/all/vars.yml 加非 vault 別名——別把密碼明文寫在這
+#   2. 本檔含機密後：roles/monitoring/tasks 的「佈署 Alertmanager 路由設定」
+#      task 改 mode "0600" + no_log: true
+#   3. 公司 SMTP 主機要加入 Squid egress 白名單（若走 465/587 出站）
+#      或使用內網 SMTP relay
+#
+# global:
+#   # 公司 SMTP relay（host:port；587 = STARTTLS、465 = 隱式 TLS）
+#   smtp_smarthost: "mail.{{ domain }}:587"
+#   # 寄件人：收到告警信時一眼認得出來源
+#   smtp_from: "alertmanager@{{ domain }}"
+#   smtp_auth_username: "alertmanager"
+#   smtp_auth_password: "<vault 別名，見上方步驟 1>"
+#   # 強制 TLS：告警內容含主機名/內部拓撲，不走明文
+#   smtp_require_tls: true
+#
+# route:
+#   receiver: ops-email          # ← 換掉 ops-null
+#
+# receivers:
+#   - name: ops-email
+#     email_configs:
+#       - to: "ops@{{ domain }}"
+#         # 告警解除時也發信：值班的人才知道事情結束了
+#         send_resolved: true
+# =============================================================================

@@ -1,0 +1,45 @@
+---
+# =============================================================================
+# roles/pgbouncer/defaults/main.yml — PgBouncer 可調參數（單一服務的 knob）
+#
+# 跨 role 契約變數（pgbouncer_port、pki_dir、pg_app_db、
+# pgbouncer_auth_password、pgbouncer_admin_password）定義於
+# inventories/*/group_vars/，本檔只放「僅本 role 關心」的預設值。
+# =============================================================================
+
+# ---------- 後端 PostgreSQL 位置 ----------
+# PgBouncer 永遠只連「本機」的 PostgreSQL（127.0.0.1:5432）。
+# 「哪一台的 PgBouncer 收到流量」由上層 HAProxy 依 Patroni 角色決定，
+# 這裡不需要（也不應該）知道誰是 leader。
+pgbouncer_backend_host: 127.0.0.1
+pgbouncer_backend_port: 5432
+
+# ---------- 監聽 ----------
+# 0.0.0.0：要讓本機 HAProxy（health check 走節點 IP）與 VIP 轉發都進得來
+# 綁「節點 IP + loopback」而非 0.0.0.0：同一台 pg 節點上 HAProxy 要綁 VIP:6432，
+# 若 PgBouncer 佔了 wildcard socket，HAProxy 綁特定 IP 同埠會 EADDRINUSE 起不來。
+# 這是「服務綁自己的 IP、LB 綁 VIP」的埠共存原則（CONVENTIONS §3）
+pgbouncer_listen_addr: "{{ ansible_host }},127.0.0.1"
+
+# ---------- 連線池參數（規劃書 §7.7） ----------
+# transaction pooling：交易結束即歸還連線，池利用率最高（見 template 內註解與限制）
+pgbouncer_pool_mode: transaction
+# 客戶端連線上限：3 台 app × api/worker/smtp 的連線總和上限，抓寬鬆值
+pgbouncer_max_client_conn: 1000
+# 每個 database/user 組合對後端 PG 的常態池大小
+pgbouncer_default_pool_size: 20
+# 池內至少保持的熱連線數：避免離峰後第一波請求吃建連延遲
+pgbouncer_min_pool_size: 5
+# 池滿時的額外緩衝連線數（撐過短暫尖峰，超過 reserve_pool_timeout 才動用）
+pgbouncer_reserve_pool_size: 5
+
+# ---------- auth_query 相關身分 ----------
+# 這兩個「PgBouncer 專用身分」是唯二進 userlist.txt 的帳號：
+#   - pgbouncer_auth：PgBouncer 拿它連 PG 執行 auth_query（查其他使用者的驗證資訊）
+#   - pgbouncer_admin：只用於 pgbouncer 管理 console / 統計（SHOW POOLS 等）
+pgbouncer_auth_user: pgbouncer_auth
+pgbouncer_admin_user: pgbouncer_admin
+
+# ---------- 部署後健檢 ----------
+# wait_for 監聽埠的等待上限（秒）
+pgbouncer_wait_timeout: 30

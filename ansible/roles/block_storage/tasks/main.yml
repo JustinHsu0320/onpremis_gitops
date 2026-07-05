@@ -1,0 +1,38 @@
+---
+# =============================================================================
+# roles/block_storage/tasks/main.yml — 把裸的資料 VMDK 變成掛好的檔案系統
+# =============================================================================
+
+# 整個 role 只在實體/VM 主機有意義：容器共用宿主 kernel、沒有獨立 block device。
+# 把 when 放在 include 這一層，lab（is_container=true）就完全不進入下面的邏輯。
+- name: 處理本機資料碟（僅實體/VM 主機）
+  when:
+    - not is_container
+    - storage_volumes | length > 0
+  block:
+
+    - name: 安裝檔案系統工具（xfsprogs）
+      ansible.builtin.apt:
+        name: xfsprogs
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    # 一次抓齊所有 block device 的結構（-b = bytes，-J = JSON 好解析）：
+    # 後面靠這份清單「認碟」，不重複呼叫
+    - name: 盤點目前的 block device
+      ansible.builtin.command: lsblk -bJ -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT
+      register: block_storage_lsblk_raw
+      changed_when: false
+
+    - name: 解析 lsblk 輸出
+      ansible.builtin.set_fact:
+        block_storage_devices: "{{ (block_storage_lsblk_raw.stdout | from_json).blockdevices }}"
+
+    # 每顆資料碟獨立處理（格式化 + 掛載 + 設權限），流程見 one_volume.yml
+    - name: 逐一格式化並掛載資料碟
+      ansible.builtin.include_tasks: one_volume.yml
+      loop: "{{ storage_volumes }}"
+      loop_control:
+        loop_var: vol
+        label: "{{ vol.mountpoint }}（{{ vol.size_gb }}GB）"

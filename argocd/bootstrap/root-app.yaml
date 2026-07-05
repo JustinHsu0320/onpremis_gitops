@@ -1,0 +1,83 @@
+# =============================================================================
+# root Application —— App-of-Apps 的「種子」
+#
+# 這是整個 GitOps 結構中「唯一」需要手動 kubectl apply 的 Application
+# （README 安裝三步驟之步驟 3）。它被種下後：
+#
+#   root-app ──sync──> argocd/projects/platform.yaml（AppProject：安全邊界）
+#            └─sync──> argocd/apps/*.yaml（各應用的 Application）
+#                        └─各自再 sync──> argocd/k8s/<app>/overlays/prod
+#
+# 之後新增應用只要往 argocd/apps/ 加一個 YAML 並 push，ArgoCD 自動收編，
+# 不再需要任何 kubectl —— Git 是唯一事實來源。
+#
+# 【架構邊界 / ADR-4】本 root app（及其底下一切）只管「平台 K8s」上的
+# 工作負載（web-frontend / web-backend）。email_proxy 本體跑在獨立 VM
+# （Docker Compose），由本 repo 的 ansible/ 目錄管理，「不在」ArgoCD
+# 管轄範圍 —— 永遠不要把 email_proxy 的部署加進 argocd/apps/。
+# 詳細決策理由見 bootstrap/README.md「架構邊界」一節。
+# =============================================================================
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: root
+  # Application CR 一律放在 argocd namespace（ArgoCD 只 watch 這裡，
+  # 除非另外設定 application namespaces）
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: platform
+# 【刻意不加 finalizer】子應用（apps/*.yaml）都有 resources-finalizer，
+# 各自刪除時會級聯清掉工作負載；但 root 若也加 finalizer，
+# 誤刪 root 會把「整個平台」級聯剷平。少了這層保險絲，
+# 誤刪 root 只會刪掉 Application 物件本身，工作負載原地不動，
+# 重 apply root-app.yaml 即可無痛復原。
+spec:
+  # root app 使用內建的 default project ——
+  # 雞生蛋問題：platform AppProject 正是由 root app 同步建立的，
+  # root 自己不能屬於一個「還不存在」的 project。
+  # default project 權限較寬，但 root app 的 source 僅限本 repo 的
+  # projects/ 與 apps/ 兩個目錄，內容物只有 AppProject / Application CR，
+  # 實際工作負載的安全邊界由 platform AppProject 收緊。
+  project: default
+
+  # multi-source：一顆 root 同時看管兩個目錄
+  sources:
+    # 1. AppProject 定義（安全邊界）—— 必須與 apps 一起被 root 管理，
+    #    否則新叢集重建時 apps 會因 project 不存在而全部卡 Unknown
+    - repoURL: https://gitlab.ptc-nec.com.tw/platform/gitops.git
+      targetRevision: main
+      path: argocd/projects
+      directory:
+        recurse: false # 只收第一層 YAML，目錄結構即 API，避免誤掃
+    # 2. 各應用的 Application 定義
+    - repoURL: https://gitlab.ptc-nec.com.tw/platform/gitops.git
+      targetRevision: main
+      path: argocd/apps
+      directory:
+        recurse: false
+
+  destination:
+    # in-cluster 的固定寫法（ArgoCD 與工作負載同一座叢集）
+    server: https://kubernetes.default.svc
+    # AppProject / Application CR 都落在 argocd namespace
+    namespace: argocd
+
+  syncPolicy:
+    automated:
+      # prune：apps/ 目錄刪掉某個 YAML，對應 Application 也會被移除
+      # （其 finalizer 再級聯清掉該應用的工作負載）—— 「刪碼即下架」
+      prune: true
+      # selfHeal：有人在叢集上手改/誤刪 Application CR，ArgoCD 會自動
+      # 把它擰回 Git 宣告的狀態 —— 杜絕組態飄移（drift）
+      selfHeal: true
+    retry:
+      # GitLab 短暫不可用（重啟/升級）時自動重試，指數退避
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+
+  # 保留最近 10 筆同步歷史供回溯（UI 的 History and Rollback）
+  revisionHistoryLimit: 10

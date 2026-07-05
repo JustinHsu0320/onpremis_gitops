@@ -1,0 +1,191 @@
+---
+# =============================================================================
+# roles/common/tasks/main.yml — 所有主機的系統基線（規劃書 §7.1）
+#
+# 任務順序刻意安排（不是規格條列順序）：
+#   1. /etc/hosts 先寫 —— egress-proxy.<domain> 這個名字要先解析得到（ADR-5）
+#   2. proxy 環境再設 —— 地端主機出網唯一通道是 Squid（prod）
+#   3. 然後才裝套件 —— apt 需要上面兩步才抓得到 archive
+# =============================================================================
+
+# ---------- 1. 時區 ----------
+# 全站統一時區：日誌時間軸、cron 排程、憑證 notAfter 的「人類解讀」才一致；
+# 混用 UTC/本地時區是跨主機排障對不上時間的第一大元兇
+- name: 設定系統時區
+  community.general.timezone:
+    name: "{{ timezone }}"
+
+# ---------- 2. /etc/hosts（ADR-5：名稱解析由 Ansible 統一管理） ----------
+# 用 blockinfile 只接管「我們的區塊」：系統自帶的 127.0.0.1/127.0.1.1 行
+# 留在區塊外不動；重跑時整塊重算，主機增減 / VIP 異動自動收斂
+- name: 管理 /etc/hosts（inventory 主機 + VIP/服務別名）
+  ansible.builtin.blockinfile:
+    path: /etc/hosts
+    marker: "# {mark} email-proxy hosts — 此區塊由 Ansible（common role）管理，手動修改必被覆蓋"
+    block: "{{ lookup('ansible.builtin.template', 'hosts.j2') }}"
+    # 容器內 /etc/hosts 是 Docker 的 bind mount，原子性「寫暫存檔再 rename」會吃
+    # EBUSY——只有這種環境才放棄原子寫入改為就地覆寫；prod VM 維持原子寫入保障
+    unsafe_writes: "{{ is_container }}"
+  when: manage_etc_hosts
+
+# ---------- 3. proxy 環境（規劃書 §4：主機層出網一律經 Squid） ----------
+# /etc/environment 走 PAM 載入：SSH 登入的 shell、systemd 使用者工作階段
+# 都會吃到；大小寫都寫是因為工具鏈不統一（curl 認小寫、多數 Java/Go 認大寫）
+- name: 設定全域 proxy 環境變數（/etc/environment）
+  ansible.builtin.lineinfile:
+    path: /etc/environment
+    regexp: '^{{ item.key }}='
+    line: '{{ item.key }}="{{ item.value }}"'
+  loop: "{{ common_proxy_env | dict2items }}"
+  when: use_egress_proxy
+  vars:
+    common_proxy_env:
+      HTTP_PROXY: "{{ egress_proxy_url }}"
+      HTTPS_PROXY: "{{ egress_proxy_url }}"
+      NO_PROXY: "{{ no_proxy_list }}"
+      http_proxy: "{{ egress_proxy_url }}"
+      https_proxy: "{{ egress_proxy_url }}"
+      no_proxy: "{{ no_proxy_list }}"
+
+# 冪等清理：環境從「走 proxy」切回「直連」（如 lab）時，
+# 不能留下殘渣，否則 apt / curl 會去戳一個不存在的 proxy 然後 timeout
+- name: 清除 /etc/environment 殘留 proxy 設定（未啟用 egress proxy 時）
+  ansible.builtin.lineinfile:
+    path: /etc/environment
+    regexp: '^{{ item }}='
+    state: absent
+  loop:
+    - HTTP_PROXY
+    - HTTPS_PROXY
+    - NO_PROXY
+    - http_proxy
+    - https_proxy
+    - no_proxy
+  when: not use_egress_proxy
+
+# apt 不讀 /etc/environment（daemon 情境沒有 PAM），要用自己的設定檔
+- name: 設定 apt proxy（/etc/apt/apt.conf.d/95proxy）
+  ansible.builtin.template:
+    src: apt-95proxy.j2
+    dest: /etc/apt/apt.conf.d/95proxy
+    owner: root
+    group: root
+    mode: "0644"
+  when: use_egress_proxy
+
+- name: 清除殘留 apt proxy 設定（未啟用 egress proxy 時）
+  ansible.builtin.file:
+    path: /etc/apt/apt.conf.d/95proxy
+    state: absent
+  when: not use_egress_proxy
+
+# ---------- 4. 基線套件 ----------
+# cache_valid_time=3600：一小時內重跑不重複 apt update，
+# 全站 13 台跑 site.yml 時省下大量重複的 index 下載
+- name: 安裝基線套件
+  ansible.builtin.apt:
+    name: "{{ common_packages }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+# ---------- 5. chrony 統一時源 ----------
+- name: 佈署 chrony 設定（統一時源）
+  ansible.builtin.template:
+    src: chrony.conf.j2
+    dest: /etc/chrony/chrony.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart chrony
+
+# 容器不跑 chrony：Ubuntu 的 chrony.service 帶 ConditionVirtualization=!container，
+# systemd 會直接 condition-skip（時間由宿主/VM 管理）。若照常下 state=started，
+# 每次都是「啟動請求發出但單元未執行」→ 永遠假 changed，故整個 task 跳過
+- name: 確保 chrony 服務啟用並執行
+  when: not is_container
+  ansible.builtin.systemd_service:
+    name: chrony
+    enabled: true
+    state: started
+
+# ---------- 6. sysctl 調校 ----------
+# 整段跳過容器（規格 §7.1）：vm.* 是 kernel 級參數，容器共用宿主 kernel
+# 寫不進去；net.* 雖是 namespaced，但 lab 容器的 net 參數由容器 runtime
+# 統一給定，故此段一律只在實體/VM 主機套用
+- name: 調校核心參數（sysctl）
+  ansible.posix.sysctl:
+    name: "{{ item.key }}"
+    value: "{{ item.value }}"
+    sysctl_file: /etc/sysctl.d/99-email-proxy.conf
+    sysctl_set: true
+    reload: true
+    state: present
+  loop: "{{ common_sysctl | dict2items }}"
+  when: not is_container
+
+# ---------- 7. 關閉 swap ----------
+# 為什麼關 swap：資料庫/快取（PG、KeyDB）的工作集一旦被換出到磁碟，
+# 延遲從 µs 級掉到 ms 級，且會拖垮 Patroni/etcd 的心跳判斷 → 誤觸發 failover。
+# 記憶體不足應該用「加 RAM / 調 shared_buffers」解決，不是讓 kernel 慢性自殺
+- name: 檢查目前是否有啟用中的 swap
+  ansible.builtin.command: swapon --noheadings --show=NAME
+  register: common_swap_status
+  changed_when: false
+  when: not is_container
+
+- name: 停用所有 swap（swapoff -a）
+  ansible.builtin.command: swapoff -a
+  changed_when: true
+  when:
+    - not is_container
+    - common_swap_status.stdout | trim | length > 0
+
+# 開機也不能再掛回來：把 fstab 的 swap 行註解掉（已註解的行不會再被改，冪等）
+- name: 註解掉 /etc/fstab 中的 swap 掛載行
+  ansible.builtin.replace:
+    path: /etc/fstab
+    regexp: '^([^#\s]\S*\s+\S+\s+swap\s+.*)$'
+    replace: '# \1'
+  when: not is_container
+
+# ---------- 8. 檔案描述子上限 ----------
+- name: 佈署 nofile limits 設定
+  ansible.builtin.template:
+    src: limits-99-email-proxy.conf.j2
+    dest: /etc/security/limits.d/99-email-proxy.conf
+    owner: root
+    group: root
+    mode: "0644"
+
+# ---------- 9. journald 持久化 ----------
+- name: 建立 journald drop-in 目錄
+  ansible.builtin.file:
+    path: /etc/systemd/journald.conf.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+# 預設 Storage=auto 時日誌只進 /run（tmpfs），重開機就消失——
+# 對「事故後回溯」是致命傷；persistent 落到 /var/log/journal 並限制用量
+- name: 設定 journald 持久化與磁碟用量上限
+  ansible.builtin.template:
+    src: journald-99-persistent.conf.j2
+    dest: /etc/systemd/journald.conf.d/99-persistent.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart systemd-journald
+
+# ---------- 10. SSH 強化 ----------
+# 用 drop-in 而不是改主檔：不與套件升級的 sshd_config 衝突（conffile prompt），
+# 且我們的意圖一目了然。各指令的「為什麼」見 template 內註解
+- name: 佈署 SSH 強化 drop-in
+  ansible.builtin.template:
+    src: sshd-99-hardening.conf.j2
+    dest: /etc/ssh/sshd_config.d/99-hardening.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart ssh

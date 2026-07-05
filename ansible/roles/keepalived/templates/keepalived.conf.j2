@@ -1,0 +1,118 @@
+# =============================================================================
+# /etc/keepalived/keepalived.conf — {{ ansible_managed }}
+#
+# 本檔由 Ansible roles/keepalived 產生（來源：group_vars 的 keepalived_instances
+# + host_vars 的 state/priority），手改必被覆蓋——要調整請改 inventory 變數。
+#
+# 「一台主機一份設定檔」：主機身兼多個 VIP（如 lb 同時有服務 VIP 與 egress VIP）
+# 時，所有 vrrp_instance 集中在這裡，各自獨立健檢、獨立漂移。
+# =============================================================================
+
+global_defs {
+    # 腳本安全（CVE-2018-19115 之後的標配）：拒絕執行「非 root 擁有、
+    # 或 group/other 可寫」的健檢腳本——防止低權帳號替換腳本內容後
+    # 被 keepalived 以高權限執行（提權攻擊面）
+    enable_script_security
+    # vrrp_script 以 root 身分執行；與上面的擁有權檢查配套使用
+    script_user root
+}
+{# 只渲染「本主機群組真的有用到」的 vrrp_script：            #}
+{# 定義了卻沒 instance 引用的 script 會讓 keepalived 印警告， #}
+{# 也會誤導 on-call 以為這台有在追蹤該行程                    #}
+{% set need_chk_haproxy = keepalived_instances | map(attribute='track_haproxy', default=false) | select | list | length > 0 %}
+{% set need_chk_squid = keepalived_instances | map(attribute='track_squid', default=false) | select | list | length > 0 %}
+{% if need_chk_haproxy %}
+
+# -----------------------------------------------------------------------------
+# 行程健檢：HAProxy 還活著嗎？
+# pgrep -x haproxy：exit 0 = 行程存在（健康）、非 0 = 不存在 → 扣 priority。
+# 「存在性檢查」就夠了——後端伺服器的健康由 HAProxy 自己的 health check 負責，
+# keepalived 只需回答「這台的入口行程還收不收得了流量」。
+#
+# weight {{ keepalived_check_weight }}（而非 -50）的邊界情況推導：
+#   MASTER priority 150、BACKUP 100（主備差 50；pg 三節點為 150/120/100）。
+#   若 weight=-50：MASTER 健檢失敗後有效 priority = 150-50 = 100，
+#   與 BACKUP 的 100「平手」——VRRP 平手時比較來源 IP 大小決定 MASTER，
+#   lb-02（.12）IP 較大會反超、但 pg 場景就看網段運氣，行為不可預期。
+#   原則：要「保證」漂移，|weight| 必須嚴格大於主備 priority 差。
+#   本專案最大主備差 50 → 取 -60 留安全邊際（150-60=90，低於所有備援節點）。
+# fall/rise {{ keepalived_check_fall }} × interval {{ keepalived_check_interval }}s：
+#   連續 {{ keepalived_check_fall }} 次失敗（{{ keepalived_check_interval * keepalived_check_fall }} 秒）才扣分、
+#   連續 {{ keepalived_check_rise }} 次成功才復權——單次抖動不觸發漂移。
+# -----------------------------------------------------------------------------
+vrrp_script chk_haproxy {
+    script "/usr/bin/pgrep -x haproxy"
+    interval {{ keepalived_check_interval }}
+    weight {{ keepalived_check_weight }}
+    fall {{ keepalived_check_fall }}
+    rise {{ keepalived_check_rise }}
+}
+{% endif %}
+{% if need_chk_squid %}
+
+# 同 chk_haproxy 的參數與推導，但追蹤的是 Squid 行程。
+# egress VIP 跟著 Squid 走、服務 VIP 跟著 HAProxy 走（group_vars/lb.yml）：
+# 兩個 VIP 各自跟隨自己的服務，HAProxy 掛了只漂服務 VIP、Squid 照常出網。
+vrrp_script chk_squid {
+    script "/usr/bin/pgrep -x squid"
+    interval {{ keepalived_check_interval }}
+    weight {{ keepalived_check_weight }}
+    fall {{ keepalived_check_fall }}
+    rise {{ keepalived_check_rise }}
+}
+{% endif %}
+{% for inst in keepalived_instances %}
+
+# -----------------------------------------------------------------------------
+# {{ inst.name }}：VIP {{ inst.vip }}（vrid {{ inst.vrid }}，同一 L2 網段內不可重複）
+# -----------------------------------------------------------------------------
+vrrp_instance {{ inst.name }} {
+    # 初始角色與靜態 priority（host_vars 決定）；運行中真正的 MASTER
+    # 由「有效 priority = priority + track_script weight」動態決定
+    state {{ inst.state }}
+    priority {{ inst.priority }}
+    virtual_router_id {{ inst.vrid }}
+    # 綁定網卡由 role 自動偵測（IPv4 == ansible_host 的那張），不寫死機型網卡名
+    interface {{ keepalived_interface }}
+    # 心跳間隔：BACKUP 約 3*advert_int 沒收到通告就接手（≈ 3-4 秒 failover）
+    advert_int {{ keepalived_advert_int }}
+
+    # 注意：VRRPv2 的 PASS 驗證欄位只有 8 bytes——auth_pass 只取「前 8 個字元」，
+    # 超過的部分靜默截斷（等於沒用到）。vault 內的 vrrp_pass_* 請直接用 8 字元。
+    # 這只防「設定錯誤的鄰居誤加入」，不是加密——真正的隔離靠 VLAN 分段
+    authentication {
+        auth_type PASS
+        auth_pass {{ inst.auth_pass }}
+    }
+
+    # 單播 VRRP（ADR-7）：預設 VRRP 走 224.0.0.18 多播，交換器/雲網路/Docker
+    # bridge 常不放行多播 → 心跳互相聽不見 → 兩台都自認 MASTER（腦裂、VIP 雙棲）。
+    # 指名單播對象後不依賴網路設備放行多播，跨 DC/雲/容器實驗室行為完全一致。
+    # 對象由 inventory 群組（{{ inst.peers_group }}）展開，絕不硬編 IP（CONVENTIONS §1）
+    unicast_src_ip {{ ansible_host }}
+    unicast_peer {
+{% for peer in groups[inst.peers_group] | difference([inventory_hostname]) | sort %}
+        {{ hostvars[peer].ansible_host }}
+{% endfor %}
+    }
+
+    # /32：VIP 是「一個位址」不是「一個網段」——同網段可達性靠 MASTER 發 GARP
+    # 更新鄰居的 ARP 表；掛 /32 避免 kernel 多長出一條 connected route 干擾路由表
+    virtual_ipaddress {
+        {{ inst.vip }}/32
+    }
+{% if inst.track_haproxy | default(false) or inst.track_squid | default(false) %}
+
+    # 被追蹤行程死亡 → 本機扣 priority → 對端有效 priority 反超 → VIP 漂移。
+    # 「主機活著但服務死了」是 VRRP 本身看不見的故障，全靠這裡補上
+    track_script {
+{% if inst.track_haproxy | default(false) %}
+        chk_haproxy
+{% endif %}
+{% if inst.track_squid | default(false) %}
+        chk_squid
+{% endif %}
+    }
+{% endif %}
+}
+{% endfor %}

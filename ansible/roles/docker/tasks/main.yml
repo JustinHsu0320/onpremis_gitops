@@ -1,0 +1,130 @@
+---
+# =============================================================================
+# roles/docker/tasks/main.yml — Docker Engine（官方 repo）＋日誌/存活策略
+# 前提：common role 已先跑過（00-bootstrap.yml 順序保證）——
+# apt proxy、/etc/hosts、ca-certificates 都已就緒
+# =============================================================================
+
+# ---------- 1. 官方 APT repo ----------
+- name: 建立 APT keyring 目錄
+  ansible.builtin.file:
+    path: "{{ docker_keyring_path | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+# 金鑰放 /etc/apt/keyrings 並在 sources 以 signed-by 指名：
+# 這是現行 Debian/Ubuntu 慣例——金鑰只信任「這一個 repo」，
+# 不進全域 trusted.gpg（否則該金鑰可為任何 repo 背書，信任範圍過大）。
+# get_url 是 Ansible 模組自己出網（非 apt），prod 需經 egress proxy，
+# 故以 environment 明確注入（daemon 情境吃不到 /etc/environment）
+- name: 下載 Docker 官方 GPG 金鑰
+  ansible.builtin.get_url:
+    url: "{{ docker_apt_key_url }}"
+    dest: "{{ docker_keyring_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+  environment: "{{ docker_proxy_env if use_egress_proxy else {} }}"
+
+# 用 dpkg 回報的架構組 repo 定義（amd64/arm64 自動偵測），
+# 不能寫死 amd64：runner 或未來的 ARM 節點會拿到裝不了的 repo
+- name: 偵測 dpkg 架構（amd64/arm64）
+  ansible.builtin.command: dpkg --print-architecture
+  register: docker_dpkg_arch
+  changed_when: false
+
+# deb822_repository（取代已棄用的 apt_repository，ansible-core 2.25 將移除）
+# 在目標主機需要 python3-debian 才能解析/寫入 .sources 檔
+- name: 安裝 deb822 repo 管理相依（python3-debian）
+  ansible.builtin.apt:
+    name: python3-debian
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+# 產出 /etc/apt/sources.list.d/docker.sources（deb822 格式，
+# Ubuntu 26.04 的原生 sources 格式）；Signed-By 指名金鑰 = 信任範圍僅此 repo
+- name: 加入 Docker 官方 APT repo
+  ansible.builtin.deb822_repository:
+    name: docker
+    types: deb
+    uris: "{{ docker_apt_repo_base }}"
+    suites: "{{ docker_repo_codename }}"
+    components: stable
+    architectures: "{{ docker_dpkg_arch.stdout }}"
+    signed_by: "{{ docker_keyring_path }}"
+    state: present
+    mode: "0644"
+  register: docker_repo
+
+# ---------- 2. 套件 ----------
+# deb822_repository 不像舊模組會自動 apt update：repo 剛加入/變更時
+# 把 cache_valid_time 歸零強制更新，否則 apt 找不到 docker-ce
+- name: 安裝 Docker Engine 與週邊套件
+  ansible.builtin.apt:
+    name: "{{ docker_packages }}"
+    state: present
+    update_cache: true
+    cache_valid_time: "{{ 0 if docker_repo.changed else 3600 }}"
+
+# ---------- 3. daemon.json ----------
+- name: 確保 /etc/docker 目錄存在
+  ansible.builtin.file:
+    path: /etc/docker
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+# 日誌輪替 + live-restore（兩者的「為什麼」見 template 內 Jinja 註解）；
+# 改 daemon.json 必須 restart（reload 不會重讀此檔）
+- name: 佈署 /etc/docker/daemon.json
+  ansible.builtin.template:
+    src: daemon.json.j2
+    dest: /etc/docker/daemon.json
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart docker
+
+# ---------- 4. dockerd 的 egress proxy（systemd drop-in） ----------
+- name: 建立 docker systemd drop-in 目錄
+  ansible.builtin.file:
+    path: /etc/systemd/system/docker.service.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when: use_egress_proxy
+
+- name: 佈署 dockerd proxy drop-in（http-proxy.conf）
+  ansible.builtin.template:
+    src: http-proxy.conf.j2
+    dest: /etc/systemd/system/docker.service.d/http-proxy.conf
+    owner: root
+    group: root
+    mode: "0644"
+  when: use_egress_proxy
+  notify:
+    - reload systemd
+    - restart docker
+
+# 冪等清理：環境切回直連（如 lab）時把 drop-in 拿掉，
+# 否則 dockerd 拉映像仍會去戳不存在的 proxy 然後 timeout
+- name: 移除 dockerd proxy drop-in（未啟用 egress proxy 時）
+  ansible.builtin.file:
+    path: /etc/systemd/system/docker.service.d/http-proxy.conf
+    state: absent
+  when: not use_egress_proxy
+  notify:
+    - reload systemd
+    - restart docker
+
+# ---------- 5. 服務 ----------
+- name: 啟用並啟動 docker 服務
+  ansible.builtin.systemd_service:
+    name: docker
+    enabled: true
+    state: started

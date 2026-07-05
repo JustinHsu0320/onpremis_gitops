@@ -1,0 +1,14 @@
+---
+# =============================================================================
+# roles/pgbackrest/handlers/main.yml
+# =============================================================================
+
+# unit 檔（service/timer）內容變更時：daemon-reload 讓 systemd 重讀 unit，
+# restart timer 讓新的 OnCalendar/RandomizedDelaySec 立即生效。
+# 注意 pgbackrest 本身沒有常駐 daemon，需要 restart 的只有 timer。
+- name: Restart pgbackrest-backup timer
+  ansible.builtin.systemd_service:
+    name: pgbackrest-backup.timer
+    state: restarted
+    daemon_reload: true
+  listen: restart pgbackrest-backup.timer

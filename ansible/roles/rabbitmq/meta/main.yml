@@ -1,0 +1,25 @@
+---
+# =============================================================================
+# roles/rabbitmq/meta/main.yml
+# 依賴說明：本 role 假設 10-pki（pki_leaf）已把 rabbitmq-server.crt/.key 與
+# ca.crt 派送到 pki_dir、common role 已把 mq-01..03 短名寫進 /etc/hosts
+# （classic_config 的 rabbit@短名 靠它解析）——這些是 playbook 層順序保證
+# （site.yml：00-bootstrap → 10-pki → 31-rabbitmq），
+# 不寫進 dependencies 以免上游 role 被隱式重複執行。
+# =============================================================================
+galaxy_info:
+  author: justin
+  company: PTC-NEC
+  description: RabbitMQ 4.x three-node cluster with AMQPS-only listeners and quorum queues
+  license: MIT
+  min_ansible_version: "2.16"
+  platforms:
+    - name: Ubuntu
+      versions:
+        - all
+  galaxy_tags:
+    - rabbitmq
+    - clustering
+    - messaging
+
+dependencies: []

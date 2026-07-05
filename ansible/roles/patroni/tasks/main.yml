@@ -1,0 +1,34 @@
+---
+# =============================================================================
+# roles/patroni/tasks/main.yml — Patroni + PostgreSQL 18 HA（本專案最核心的 role）
+#
+# 執行流程（= 檔案順序）：
+#   1. install.yml   套件安裝（含 create_main_cluster 經典陷阱處理）
+#   2. config.yml    目錄 / 憑證權限 / /etc/patroni/config.yml
+#   3. bootstrap.yml 依「首節點 initdb → 副本加入」順序啟動叢集
+#   4. app_db.yml    叢集就緒後佈建 app db / user 與 PgBouncer auth_query 函數
+#
+# 為什麼 30-postgres.yml 對本 role「刻意不用 serial」：
+#   啟動順序不是靠 playbook 的 serial 排的，而是靠 bootstrap.yml 內的
+#   「等待條件」排的——首節點等自己成為 leader，副本節點（delegate 到首節點）
+#   等 leader 就緒才起自己。三台同時進入 role，但在等待點自然對齊。
+#   （就算等待條件失效，Patroni 的 DCS initialize lock 也保證只有一台能 initdb，
+#   不會 split-brain；等待條件是為了「結果可預期」：首任 leader 一定是 pg-01。）
+#
+# 依賴（playbook 層順序保證，不寫進 meta dependencies）：
+#   - 10-pki：pki_leaf 已派送 patroni-etcd-client / postgres-server 憑證與 ca.crt
+#   - 30-postgres 前段：etcd role 已讓 DCS quorum 就緒（etcd 不健康時
+#     Patroni 起得來也拿不到 lock，只會產生誤導性錯誤）
+# =============================================================================
+
+- name: 套件安裝（postgresql-common 陷阱 → PG18 + Patroni）
+  ansible.builtin.import_tasks: install.yml
+
+- name: 目錄、憑證權限與 Patroni 設定檔
+  ansible.builtin.import_tasks: config.yml
+
+- name: 依 bootstrap 順序啟動叢集
+  ansible.builtin.import_tasks: bootstrap.yml
+
+- name: 應用資料庫與 PgBouncer auth_query 佈建
+  ansible.builtin.import_tasks: app_db.yml

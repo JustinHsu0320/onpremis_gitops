@@ -1,0 +1,60 @@
+---
+# =============================================================================
+# zz_lab_overrides.yml — 實驗室環境「降規」覆寫
+#
+# 命名以 zz_ 開頭是刻意的：group_vars/all/ 目錄下的檔案按字母序載入，
+# 後載入者覆寫先載入者（vars.yml → vault.yml → zz_lab_overrides.yml）。
+#
+# 原則（CONVENTIONS.md §7）：只降「資源規格」，不降「拓撲」。
+# 節點數、VIP、TLS、quorum 全部與 prod 一致——降拓撲的實驗室驗不出東西。
+# =============================================================================
+
+# ---------- 環境開關 ----------
+# 容器共用宿主 kernel：跳過 kernel 級 sysctl / swapoff / 磁碟分割等動作
+is_container: true
+
+# 實驗室容器直接走 Docker NAT 出網（Squid 照樣部署、照樣被 99-verify 驗證，
+# 只是「主機層 apt/docker」不強制經過它——避免部署順序的雞生蛋問題：
+# prod 有既存的 proxy，實驗室沒有）
+use_egress_proxy: false
+
+# ---------- 資源降規 ----------
+# PostgreSQL：容器實驗室跑 3 個 PG，每個吃小一點
+patroni_pg_parameters_extra:
+  shared_buffers: 128MB
+  effective_cache_size: 256MB
+  maintenance_work_mem: 32MB
+
+# RabbitMQ：預設 watermark 0.6 在 8GB 的 Docker VM 上跑 3 節點太緊
+rabbitmq_vm_memory_high_watermark: "0.3"
+
+# KeyDB：快取上限縮小
+keydb_maxmemory: 256mb
+
+# Prometheus：保留期縮短、抓取間隔放寬
+prometheus_retention: 2d
+
+# NFS export ACL：lab 是多重掛網（無跨 VLAN 路由），app/pg 連 NFS 的來源 IP
+# 是它們在 vlan40 上的腳（10.20.40.x），不是 prod 的 app/資料網段
+nfs_attachments_clients: "{{ vlan_storage_cidr }}"
+nfs_pgbackup_clients: "{{ vlan_storage_cidr }}"
+
+# Docker-in-Docker：巢狀容器的 /var/lib/docker 已由 lab compose 掛 named volume
+# （ext4），overlay2 可正常運作，不需改 storage driver
+
+# ---------- lab 專用：/etc/hosts 不含 gitlab（實驗室沒有 VLAN 50 網路） ----------
+extra_hosts_entries:
+  - { ip: "{{ service_vip }}", names: ["svc-api.{{ domain }}", "svc-api"] }
+  - { ip: "{{ egress_vip }}", names: ["egress-proxy.{{ domain }}", "egress-proxy"] }
+  - { ip: "{{ pgbouncer_vip }}", names: ["pgbouncer-vip.{{ domain }}", "pgbouncer-vip"] }
+  - { ip: "{{ rabbitmq_vip }}", names: ["rabbitmq-vip.{{ domain }}", "rabbitmq-vip"] }
+
+# ---------- app 映像：實驗室沒有 GitLab Registry，改用本地 build 的 mock ----------
+# mock 模式：app_stack role 會在節點上 build 一個極簡模擬器
+# （/health 回 200 的 HTTP server + SMTP banner + 假 worker），
+# 用來驗證「LB → app → 資料層」的整條鏈路，而非驗證 app 本身的商業邏輯
+app_stack_mock: true
+
+# 巢狀 Docker（DinD）：containerd snapshotter 在巢狀容器內解壓 whiteout 會 EPERM，
+# 退回經典 overlay2 graph driver（named volume 底層是 ext4，overlay2 可正常疊）
+docker_storage_driver: overlay2

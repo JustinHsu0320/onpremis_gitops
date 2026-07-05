@@ -1,0 +1,108 @@
+---
+# =============================================================================
+# roles/patroni/tasks/app_db.yml — 叢集就緒後的資料庫物件佈建
+#
+# 這些是「叢集級」物件（建一次、複寫到全叢集），所以全部 run_once 並且
+# 只對 leader 執行。連線方式刻意用 unix socket + become postgres（peer 認證）：
+# 密碼完全不經網路、也不依賴 pg_hba 的 TCP 規則——最小攻擊面的維運通道。
+# =============================================================================
+
+# 為什麼要「定位 leader」而不是寫死 groups['postgres'][0]：
+# 首次部署時 leader 一定是首節點（bootstrap.yml 排好的），但日後重跑 playbook 時
+# leader 可能已經 failover 到別台——把 CREATE 語句打到 replica 會吃
+# read-only transaction 錯誤。所以先問 Patroni REST /cluster（任一成員都答得出
+# 全叢集狀態），拿到 leader 的成員名再 delegate 過去。
+# until 條件同時要求「有 leader」：也兜住了剛啟動完 leader 選舉還沒收斂的空窗
+- name: 查詢 Patroni /cluster 定位當前 leader
+  ansible.builtin.uri:
+    url: "http://{{ hostvars[groups['postgres'][0]].ansible_host }}:{{ patroni_rest_port }}/cluster"
+    return_content: true
+  delegate_to: "{{ groups['postgres'][0] }}"
+  run_once: true
+  register: patroni_cluster_state
+  until: >-
+    patroni_cluster_state.status == 200 and
+    (patroni_cluster_state.json.members | default([])
+     | selectattr('role', 'equalto', 'leader') | list | length) == 1
+  retries: "{{ patroni_bootstrap_retries }}"
+  delay: "{{ patroni_bootstrap_delay }}"
+
+# Patroni 成員名 = inventory_hostname（config.yml.j2 的 name: 就是這樣填的），
+# 所以 REST 回的 leader 名字可以直接拿來 delegate_to
+- name: 記錄 leader 主機名（Patroni member name 即 inventory_hostname）
+  ansible.builtin.set_fact:
+    patroni_leader_host: "{{ (patroni_cluster_state.json.members | selectattr('role', 'equalto', 'leader') | list | first).name }}"
+  run_once: true
+
+- name: 叢集級資料庫物件（只在 leader 執行一次）
+  run_once: true
+  delegate_to: "{{ patroni_leader_host }}"
+  become: true
+  become_user: postgres
+  block:
+    # 先建 user 再建 db：db 的 owner 要指向它。
+    # 密碼以 SCRAM 形式落庫（DCS 參數 password_encryption=scram-sha-256），
+    # 模組會用既有 SCRAM 驗證子比對，密碼沒變就不會誤報 changed
+    - name: 建立應用使用者 {{ pg_app_user }}
+      community.postgresql.postgresql_user:
+        name: "{{ pg_app_user }}"
+        password: "{{ postgres_app_password }}"
+        login_unix_socket: /var/run/postgresql
+      no_log: true
+
+    # owner 給 app 使用者 = 它在自己的 db 內有完整 DDL 權限（schema migration
+    # 工具需要建表/索引），但拿不到任何 superuser 能力——最小권限的實用折衷
+    - name: 建立應用資料庫（owner 為應用使用者）：{{ pg_app_db }}
+      community.postgresql.postgresql_db:
+        name: "{{ pg_app_db }}"
+        owner: "{{ pg_app_user }}"
+        login_unix_socket: /var/run/postgresql
+
+    # pgbouncer_auth：PgBouncer auth_query 專用低權身分（pgbouncer role 的
+    # userlist.txt 只放它，一般使用者密碼不落地）。只給 LOGIN，
+    # 它唯一能做的事是 EXECUTE 下面那個 get_auth 函數
+    - name: 建立 PgBouncer auth_query 低權身分（僅 LOGIN）
+      community.postgresql.postgresql_user:
+        name: "{{ pgbouncer_auth_user | default('pgbouncer_auth') }}"
+        password: "{{ pgbouncer_auth_password }}"
+        role_attr_flags: LOGIN
+        login_unix_socket: /var/run/postgresql
+      no_log: true
+
+    # 明確授 CONNECT（而不是依賴 PUBLIC 的預設 CONNECT）：
+    # 日後有人對這個 db REVOKE CONNECT FROM PUBLIC 做硬化時，這兩個身分不會被誤傷
+    - name: 授予應用使用者與 pgbouncer_auth 的資料庫 CONNECT 權限：{{ pg_app_db }}
+      community.postgresql.postgresql_privs:
+        login_db: "{{ pg_app_db }}"
+        type: database
+        objs: "{{ pg_app_db }}"
+        privs: CONNECT
+        roles: "{{ pg_app_user }},{{ pgbouncer_auth_user | default('pgbouncer_auth') }}"
+        state: present
+        login_unix_socket: /var/run/postgresql
+
+    # PgBouncer auth_query 的後端（pgbouncer.ini：SELECT username, password FROM
+    # pgbouncer.get_auth($1)）。為什麼用 auth_query 而不是把所有使用者密碼抄進
+    # userlist.txt：密碼只存 PG 一處（single source of truth），改密碼 / 加使用者
+    # 完全不用重佈 PgBouncer；userlist.txt 只剩 pgbouncer 自用的兩個內部帳號。
+    # SECURITY DEFINER 的意義：函數以「定義者」（postgres）權限讀 pg_shadow，
+    # 呼叫者 pgbouncer_auth 本身完全沒有讀密碼表的權限——它只被授權執行這一個
+    # 參數化查詢，權限面收到最小。
+    # 冪等性：CREATE SCHEMA IF NOT EXISTS / CREATE OR REPLACE / REVOKE / GRANT
+    # 天然收斂到同一終態，重跑無副作用 → changed_when: false 讓報表誠實呈現
+    - name: 佈建 pgbouncer.get_auth SECURITY DEFINER 函數（auth_query 後端）
+      community.postgresql.postgresql_query:
+        login_db: "{{ pg_app_db }}"
+        login_unix_socket: /var/run/postgresql
+        query: |
+          CREATE SCHEMA IF NOT EXISTS pgbouncer;
+          CREATE OR REPLACE FUNCTION pgbouncer.get_auth(p_usename TEXT)
+            RETURNS TABLE(username TEXT, password TEXT) LANGUAGE sql SECURITY DEFINER AS
+            $$ SELECT usename::TEXT, passwd::TEXT FROM pg_catalog.pg_shadow WHERE usename = p_usename $$;
+          REVOKE ALL ON FUNCTION pgbouncer.get_auth(TEXT) FROM PUBLIC;
+          REVOKE ALL ON SCHEMA pgbouncer FROM PUBLIC;
+          -- EXECUTE 之外還要 schema 的 USAGE：呼叫 pgbouncer.get_auth() 要先「進得了」
+          -- pgbouncer 這個 schema（缺這行 auth_query 會報 permission denied for schema）
+          GRANT USAGE ON SCHEMA pgbouncer TO {{ pgbouncer_auth_user | default('pgbouncer_auth') }};
+          GRANT EXECUTE ON FUNCTION pgbouncer.get_auth(TEXT) TO {{ pgbouncer_auth_user | default('pgbouncer_auth') }};
+      changed_when: false

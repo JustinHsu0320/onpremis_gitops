@@ -1,0 +1,11 @@
+// ==========================================================================
+// /etc/apt/apt.conf.d/95proxy — 由 Ansible（common role）管理
+//
+// 為什麼 apt 要單獨設 proxy：apt 以 daemon/非登入情境執行時不會經過 PAM，
+// 讀不到 /etc/environment；不設這份檔案，unattended-upgrades 與
+// ansible.builtin.apt 都會出不了網（地端唯一出口是 Squid，規劃書 §4）。
+// 注意：apt 對 https 來源是 CONNECT 隧道穿過 proxy，TLS 仍由 apt 端對端驗證，
+// Squid 看不到內容（它只做網域白名單放行）。
+// ==========================================================================
+Acquire::http::Proxy "{{ egress_proxy_url }}";
+Acquire::https::Proxy "{{ egress_proxy_url }}";

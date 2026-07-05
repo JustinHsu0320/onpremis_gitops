@@ -1,0 +1,48 @@
+---
+# =============================================================================
+# roles/docker/defaults/main.yml — Docker Engine（僅 app / monitoring /
+# gitlab_runner，見 00-bootstrap.yml；資料層與邊界走原生 systemd——ADR-2）
+#
+# 契約變數（group_vars/all/vars.yml，不在此重複宣告）：
+#   use_egress_proxy / egress_proxy_url / no_proxy_list
+# =============================================================================
+
+# ---------- APT repo 來源 ----------
+# Docker Engine 是本專案唯一允許的「第三方 apt repo」例外（規格明列）：
+# distro 的 docker.io 版本更新太慢，且缺 buildx / compose v2 plugin
+docker_apt_key_url: https://download.docker.com/linux/ubuntu/gpg
+docker_keyring_path: /etc/apt/keyrings/docker.asc
+docker_apt_repo_base: https://download.docker.com/linux/ubuntu
+# Docker 官方 repo 對剛發布的 Ubuntu codename 可能尚未開目錄（歷史上常滯後數週）；
+# 若 resolute 尚未上線，可用此變數暫時覆寫成上一個已支援的 codename
+docker_repo_codename: "{{ ansible_distribution_release }}"
+
+# ---------- 套件 ----------
+docker_packages:
+  - docker-ce
+  - docker-ce-cli
+  - containerd.io
+  - docker-buildx-plugin        # buildx：runner 建映像用（多平台 build）
+  - docker-compose-plugin       # compose v2：app / keydb / monitoring 堆疊用
+  # community.docker 模組在「目標主機」上執行時需要 Docker SDK for Python，
+  # 用 distro 套件而非 pip（地端環境不引入 PyPI 依賴面）
+  - python3-docker
+
+# ---------- daemon.json ----------
+# 容器 stdout 日誌輪替：預設 json-file 無上限，一個 debug 迴圈就能吃滿根碟
+docker_log_max_size: 10m
+docker_log_max_file: 3
+# live-restore：dockerd 重啟/升級時不殺運行中的容器（見 template 內完整理由）
+docker_live_restore: true
+
+# 影像存放層驅動：空字串 = 用 docker 預設（實體機的正確選擇）。
+# 只有巢狀 Docker（實驗室）需要覆寫成 overlay2——理由見 daemon.json.j2 檔頭註解 4
+docker_storage_driver: ""
+
+# ---------- dockerd 的 proxy 環境（use_egress_proxy=true 時套用） ----------
+# dockerd 是 systemd 服務、不經 PAM，讀不到 /etc/environment，
+# 拉映像的出網 proxy 必須用 systemd drop-in 單獨餵給它
+docker_proxy_env:
+  HTTP_PROXY: "{{ egress_proxy_url }}"
+  HTTPS_PROXY: "{{ egress_proxy_url }}"
+  NO_PROXY: "{{ no_proxy_list }}"

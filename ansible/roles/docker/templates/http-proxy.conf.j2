@@ -1,0 +1,18 @@
+# =============================================================================
+# /etc/systemd/system/docker.service.d/http-proxy.conf
+# 由 Ansible（docker role）管理，僅在 use_egress_proxy=true 時佈署
+#
+# 為什麼 dockerd 要單獨餵 proxy：
+# dockerd 是 systemd 啟動的 daemon，不經 PAM，讀不到 /etc/environment；
+# 不設這份 drop-in，docker pull 在地端（唯一出口=Squid）會直接 timeout。
+#
+# NO_PROXY 必須涵蓋內部網域與內網 CIDR（no_proxy_list 已含 .{{ domain }} 與
+# 10.20.0.0/16）：否則 pull 內部 registry（registry.{{ domain }}）的流量
+# 也會繞去 Squid——白名單沒放內部網域，等於自斷內部映像來源。
+#
+# 改這份檔案後必須 systemctl daemon-reload 再 restart docker（handler 已串好）
+# =============================================================================
+[Service]
+{% for key, value in docker_proxy_env.items() %}
+Environment="{{ key }}={{ value }}"
+{% endfor %}

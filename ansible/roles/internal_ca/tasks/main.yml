@@ -1,0 +1,208 @@
+---
+# =============================================================================
+# internal_ca — 建立兩層式內部 CA（Root → Issuing），只在 mgmt-01 執行
+#
+# 為什麼要兩層、而不是一層自簽了事？（規劃書 §5）
+#   1. Root CA（20 年）只做一件事：簽 Issuing CA。私鑰建立後即可搬離線保存
+#      （加密 USB / 保險櫃），日常簽發完全用不到它 → 攻擊面趨近於零。
+#   2. Issuing CA（5 年）留在 mgmt-01 做日常葉憑證簽發。萬一 mgmt-01 被入侵、
+#      Issuing 私鑰外洩：用離線 Root 重簽一張新 Issuing + 全站重簽葉憑證即可，
+#      已派送到 13 台主機信任庫的「信任根」（Root）完全不用動。
+#   3. Issuing 帶 pathlen:0：它簽出的憑證一律不能再當 CA 使用——就算 Issuing
+#      私鑰外洩，攻擊者也無法拿它建立下級 CA 把災害擴大成整棵信任樹。
+# =============================================================================
+
+# 防呆：CA 私鑰只允許存在於 internal_ca_host（= groups['monitoring'][0]）。
+# 若有人把這個 role 誤掛到其他 hosts 的 play，寧可直接失敗，也不能讓 CA 私鑰擴散
+- name: 確認本 role 只在簽發主機上執行
+  ansible.builtin.assert:
+    that: inventory_hostname == internal_ca_host
+    fail_msg: >-
+      internal_ca 只能在 {{ internal_ca_host }} 上執行，
+      目前卻在 {{ inventory_hostname }}——請檢查 playbook 的 hosts 設定
+    success_msg: "簽發主機確認：{{ inventory_hostname }}"
+
+# ca_root 整個目錄 0700：私鑰、CSR、憑證、簽發副本全收在這裡，只有 root 可進入。
+# 憑證本身雖是公開資訊，但整個目錄鎖死可以杜絕「私鑰不小心放成 0644」這類單點失誤
+- name: 建立 CA 根目錄
+  ansible.builtin.file:
+    path: "{{ ca_root }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+# issued/ 保存每張簽出去的葉憑證副本（檔名 <host>-<name>.crt，由 pki_leaf 寫入）：
+# 稽核時可直接回答「這個 CA 到底簽過哪些憑證給誰」，也是輪替/撤銷時的清單來源
+- name: 建立葉憑證簽發副本目錄
+  ansible.builtin.file:
+    path: "{{ internal_ca_issued_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+# ---------------------------------------------------------------------------
+# Root CA 層
+#
+# 先盤點既有材料再決定跑不跑：Root 私鑰「合法地」可能不存在（已搬離線），
+# 這種情況下 Root 層任務必須整層跳過，而不是報錯——這是日常的預期狀態
+# ---------------------------------------------------------------------------
+- name: 檢查 Root CA 私鑰是否在線
+  ansible.builtin.stat:
+    path: "{{ internal_ca_root_key }}"
+  register: internal_ca_root_key_stat
+
+- name: 檢查 Root CA 憑證是否已存在
+  ansible.builtin.stat:
+    path: "{{ internal_ca_root_crt }}"
+  register: internal_ca_root_crt_stat
+
+# 【維運註記】Root 私鑰離線保存程序（首次建立後擇期執行，寫在 runbook）：
+#   1. 以 gpg 對 root-ca.key 加密，拷貝到兩支加密 USB（異地保存）
+#   2. 驗證 USB 內容可解密還原後，在 mgmt-01 上 `shred -u {{ ca_root }}/root-ca.key`
+#   3. 本 role 已設計為「root-ca.key 不在 + root-ca.crt 存在 → 跳過 Root 層」，
+#      日常重跑不受影響；只有「重簽 Issuing CA」時才需把私鑰暫時復位。
+# 註：openssl_privatekey 的回傳值只含路徑/指紋、不含私鑰內容，
+#     所以不加 no_log（加了反而遮蔽失敗時的除錯訊息）；機密保護靠 0600 + 目錄 0700
+- name: 產生 Root CA 私鑰（RSA 4096）
+  community.crypto.openssl_privatekey:
+    path: "{{ internal_ca_root_key }}"
+    size: "{{ internal_ca_key_size }}"
+    type: RSA
+    owner: root
+    group: root
+    mode: "0600"
+  when: internal_ca_root_key_stat.stat.exists or not internal_ca_root_crt_stat.stat.exists
+
+# 就算是 selfsigned，也走「CSR → 簽發」的正規流程（規劃書 §5）：
+# CA 的關鍵擴展（CA:TRUE、keyCertSign/cRLSign、SKI）都宣告在 CSR 上、由憑證忠實繼承，
+# 之後要換簽發工具或做稽核比對時，CSR 就是這張憑證內容的權威描述檔
+- name: 產生 Root CA CSR
+  community.crypto.openssl_csr:
+    path: "{{ internal_ca_root_csr }}"
+    privatekey_path: "{{ internal_ca_root_key }}"
+    common_name: "{{ internal_ca_root_cn }}"
+    # CA:TRUE 必須 critical：不理解此擴展的驗證端「必須」拒絕，而不是默默忽略
+    basic_constraints: ["CA:TRUE"]
+    basic_constraints_critical: true
+    # CA 私鑰只拿來簽憑證與 CRL，不做任何其他用途（最小權限原則的憑證版）
+    key_usage: [keyCertSign, cRLSign]
+    key_usage_critical: true
+    # SKI 讓驗證端能用 AKI→SKI 快速定位簽發者，鏈組裝更可靠
+    create_subject_key_identifier: true
+    # CA 憑證不該有 SAN（SAN 是「這張憑證代表哪個主機名」的葉憑證概念）
+    use_common_name_for_san: false
+    owner: root
+    group: root
+    mode: "0644"
+  when: internal_ca_root_key_stat.stat.exists or not internal_ca_root_crt_stat.stat.exists
+
+# x509_certificate 對「既存且與 CSR 相符的有效憑證」不會重簽 → 天然冪等
+- name: 自簽 Root CA 憑證（+7300d ≈ 20 年）
+  community.crypto.x509_certificate:
+    path: "{{ internal_ca_root_crt }}"
+    csr_path: "{{ internal_ca_root_csr }}"
+    privatekey_path: "{{ internal_ca_root_key }}"
+    provider: selfsigned
+    selfsigned_not_after: "{{ internal_ca_root_validity }}"
+    owner: root
+    group: root
+    mode: "0644"
+  when: internal_ca_root_key_stat.stat.exists or not internal_ca_root_crt_stat.stat.exists
+
+# 前面可能剛生成 Root 私鑰，重新 stat 一次拿到「當下」狀態，
+# 供下面「Issuing 是否能簽/該不該簽」的判斷使用（不能沿用進場時的舊快照）
+- name: 重新確認 Root 私鑰狀態
+  ansible.builtin.stat:
+    path: "{{ internal_ca_root_key }}"
+  register: internal_ca_root_key_now
+
+# ---------------------------------------------------------------------------
+# Issuing CA 層（日常簽發者：pki_leaf 的 delegate 簽發就是用這把私鑰）
+# ---------------------------------------------------------------------------
+- name: 產生 Issuing CA 私鑰（RSA 4096）
+  community.crypto.openssl_privatekey:
+    path: "{{ internal_ca_issuing_key }}"
+    size: "{{ internal_ca_key_size }}"
+    type: RSA
+    owner: root
+    group: root
+    mode: "0600"
+
+# pathlen:0 的意義：Issuing 之下不允許再出現任何 CA。
+# 它簽出的每張憑證都只能是「終端實體」——這把後門焊死在憑證擴展層，
+# 而不是仰賴「大家都乖乖不簽 CA」的口頭約定
+- name: 產生 Issuing CA CSR
+  community.crypto.openssl_csr:
+    path: "{{ internal_ca_issuing_csr }}"
+    privatekey_path: "{{ internal_ca_issuing_key }}"
+    common_name: "{{ internal_ca_issuing_cn }}"
+    basic_constraints: ["CA:TRUE", "pathlen:0"]
+    basic_constraints_critical: true
+    key_usage: [keyCertSign, cRLSign]
+    key_usage_critical: true
+    create_subject_key_identifier: true
+    use_common_name_for_san: false
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: 檢查 Issuing CA 憑證是否已存在
+  ansible.builtin.stat:
+    path: "{{ internal_ca_issuing_crt }}"
+  register: internal_ca_issuing_crt_stat
+
+# 唯一無解的狀態：需要簽發 Issuing（憑證不存在）但 Root 私鑰已搬離線。
+# 明確炸出人話錯誤訊息，好過 x509_certificate 的 file not found
+- name: 防呆：需要簽 Issuing CA 但 Root 私鑰已離線
+  ansible.builtin.assert:
+    that: internal_ca_root_key_now.stat.exists or internal_ca_issuing_crt_stat.stat.exists
+    fail_msg: >-
+      Issuing CA 憑證不存在，但 Root 私鑰已離線——
+      請依 runbook 將 root-ca.key 復位到 {{ ca_root }} 後重跑本 playbook
+    success_msg: "Issuing CA 簽發條件確認"
+
+# Root 私鑰離線期間跳過本 task：既有 Issuing 憑證繼續服役（效期 5 年，充裕）；
+# 真要輪替 Issuing 時，把 Root 私鑰復位再重跑即可
+- name: 以 Root CA 簽發 Issuing CA 憑證（+1825d ≈ 5 年）
+  community.crypto.x509_certificate:
+    path: "{{ internal_ca_issuing_crt }}"
+    csr_path: "{{ internal_ca_issuing_csr }}"
+    provider: ownca
+    ownca_path: "{{ internal_ca_root_crt }}"
+    ownca_privatekey_path: "{{ internal_ca_root_key }}"
+    ownca_not_after: "{{ internal_ca_issuing_validity }}"
+    owner: root
+    group: root
+    mode: "0644"
+  when: internal_ca_root_key_now.stat.exists
+
+# ---------------------------------------------------------------------------
+# CA chain（pki_leaf 會把這份檔案派送到全站 pki_dir/ca.crt 與系統信任庫）
+# ---------------------------------------------------------------------------
+- name: 讀取 Issuing CA 憑證內容
+  ansible.builtin.slurp:
+    src: "{{ internal_ca_issuing_crt }}"
+  register: internal_ca_issuing_pem
+
+- name: 讀取 Root CA 憑證內容
+  ansible.builtin.slurp:
+    src: "{{ internal_ca_root_crt }}"
+  register: internal_ca_root_pem
+
+# 順序契約：Issuing 在前、Root 在後。TLS 驗證是「由葉往根」逐層找簽發者：
+# 驗證端拿到葉憑證後先要找 Issuing（葉的直接簽發者）、再找 Root；
+# chain 順序顛倒時，部分嚴格實作（老版 openssl、部分 JVM/語言 runtime）會直接驗證失敗。
+# 用 copy+content 而不是 shell cat：內容比對即冪等，重跑 0 changed。
+# 注意用 YAML literal block（|）讓兩張 PEM 之間是「真的換行」——
+# 在 Jinja 表達式裡串 '\n' 會落地成字面上的反斜線+n，整個 chain 解析失敗
+- name: 組合 ca-chain.crt（Issuing 在前、Root 在後）
+  ansible.builtin.copy:
+    content: |
+      {{ internal_ca_issuing_pem.content | b64decode | trim }}
+      {{ internal_ca_root_pem.content | b64decode | trim }}
+    dest: "{{ internal_ca_chain }}"
+    owner: root
+    group: root
+    mode: "0644"

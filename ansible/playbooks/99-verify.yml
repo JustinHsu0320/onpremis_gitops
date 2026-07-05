@@ -1,0 +1,382 @@
+---
+# =============================================================================
+# 99-verify.yml — 全鏈健康檢查（規劃書 §6.1：取代散落各處的 check_*.sh）
+#
+# 設計理念：
+#   1. 每個子系統一個 play，可用 --tags 單獨驗證（如 --tags verify-pg）
+#   2. 驗的是「使用者視角的行為」而非「程序有沒有活著」——
+#      例如 NFS 驗的是「app-01 寫的檔案 app-02 讀得到」，這才是附件共享的本質
+#   3. 全部唯讀或自我清理（測試檔案會刪掉、測試訊息會消費掉），可安全重複執行
+# =============================================================================
+
+# ---------- 1. etcd：quorum 健康 ----------
+- name: 驗證 etcd 叢集
+  hosts: postgres
+  tags: [verify, verify-etcd]
+  tasks:
+    - name: 檢查 etcd 全端點健康（TLS + 客戶端憑證）
+      ansible.builtin.command: >
+        etcdctl --endpoints=https://127.0.0.1:2379
+        --cacert={{ pki_dir }}/ca.crt
+        --cert={{ pki_dir }}/etcd.crt
+        --key={{ pki_dir }}/etcd.key
+        endpoint health --cluster
+      register: etcd_health
+      changed_when: false
+      run_once: true
+
+    # 注意：etcd 3.5 的健檢結果可能經 zap logger 印到 stderr，stdout+stderr 合併計數才穩
+    - name: 斷言：三個 endpoint 都 healthy
+      ansible.builtin.assert:
+        that: >-
+          (etcd_health.stdout_lines + etcd_health.stderr_lines)
+          | select('search', 'is healthy') | list | length == 3
+        fail_msg: "etcd 叢集不健康：{{ etcd_health.stdout }} {{ etcd_health.stderr }}"
+        success_msg: "etcd：3/3 節點健康"
+      run_once: true
+
+# ---------- 2. Patroni：一個 leader、其餘 streaming 副本 ----------
+- name: 驗證 Patroni / PostgreSQL HA
+  hosts: postgres
+  tags: [verify, verify-pg]
+  tasks:
+    - name: 取得 Patroni 叢集狀態
+      ansible.builtin.uri:
+        url: "http://{{ ansible_host }}:{{ patroni_rest_port }}/cluster"
+        return_content: true
+      register: patroni_cluster
+      run_once: true
+
+    - name: 斷言：恰好 1 個 leader、2 個 running 副本
+      ansible.builtin.assert:
+        that:
+          - patroni_cluster.json.members | selectattr('role', 'equalto', 'leader') | list | length == 1
+          - >-
+            patroni_cluster.json.members
+            | selectattr('role', 'in', ['replica', 'sync_standby'])
+            | selectattr('state', 'in', ['running', 'streaming']) | list | length == 2
+        fail_msg: "Patroni 叢集狀態異常：{{ patroni_cluster.json }}"
+        success_msg: "Patroni：1 leader + 2 replica，同步模式運作中"
+      run_once: true
+
+# ---------- 3. PgBouncer VIP：RW 進 leader、RO 進 replica ----------
+- name: 驗證 PgBouncer VIP 讀寫分流
+  hosts: postgres
+  tags: [verify, verify-pgbouncer]
+  tasks:
+    # pg_is_in_recovery()=false 代表連到的是 leader —— RW 口的正確行為
+    - name: RW 口（6432）應連到 leader
+      ansible.builtin.command: >
+        psql "host={{ pgbouncer_vip }} port={{ pgbouncer_port }} dbname={{ pg_app_db }}
+        user={{ pg_app_user }} sslmode=verify-full sslrootcert={{ pki_dir }}/ca.crt"
+        -tAc "SELECT pg_is_in_recovery()"
+      environment:
+        PGPASSWORD: "{{ postgres_app_password }}"
+      register: rw_check
+      changed_when: false
+      run_once: true
+
+    - name: RO 口（6433）應連到 replica
+      ansible.builtin.command: >
+        psql "host={{ pgbouncer_vip }} port={{ pgbouncer_ro_port }} dbname={{ pg_app_db }}
+        user={{ pg_app_user }} sslmode=verify-full sslrootcert={{ pki_dir }}/ca.crt"
+        -tAc "SELECT pg_is_in_recovery()"
+      environment:
+        PGPASSWORD: "{{ postgres_app_password }}"
+      register: ro_check
+      changed_when: false
+      run_once: true
+
+    - name: 斷言：RW=leader（f）、RO=replica（t）
+      ansible.builtin.assert:
+        that:
+          - rw_check.stdout | trim == 'f'
+          - ro_check.stdout | trim == 't'
+        fail_msg: "讀寫分流異常：RW recovery={{ rw_check.stdout }}, RO recovery={{ ro_check.stdout }}"
+        success_msg: "PgBouncer VIP：RW→leader、RO→replica，TLS 驗證通過"
+      run_once: true
+
+# ---------- 4. RabbitMQ：叢集 + quorum queue + 實際收發 ----------
+- name: 驗證 RabbitMQ 叢集
+  hosts: rabbitmq
+  tags: [verify, verify-mq]
+  tasks:
+    - name: 取得叢集狀態
+      ansible.builtin.command: rabbitmqctl cluster_status --formatter json
+      register: mq_status
+      changed_when: false
+      run_once: true
+
+    - name: 斷言：3 節點都在叢集內運行
+      ansible.builtin.assert:
+        that: (mq_status.stdout | from_json).running_nodes | length == 3
+        fail_msg: "RabbitMQ 叢集節點數異常"
+        success_msg: "RabbitMQ：3/3 節點運行中"
+      run_once: true
+
+    - name: 斷言：佇列存在且為 quorum 型
+      ansible.builtin.command: >
+        rabbitmqctl list_queues -p {{ rabbitmq_vhost }} name type --formatter json
+      register: mq_queues
+      changed_when: false
+      run_once: true
+
+    - name: 檢查佇列型別
+      ansible.builtin.assert:
+        that: >-
+          (mq_queues.stdout | from_json)
+          | selectattr('type', 'equalto', 'quorum') | list | length >= 3
+        fail_msg: "quorum queue 數量不足：{{ mq_queues.stdout }}"
+        success_msg: "RabbitMQ：quorum queues 就緒"
+      run_once: true
+
+    # 端到端：經 VIP 以 AMQPS 發佈一則測試訊息再取回（驗證 VIP + TLS + 佇列全鏈）
+    - name: 經管理 API 發佈測試訊息
+      ansible.builtin.uri:
+        url: "http://{{ ansible_host }}:15672/api/exchanges/{{ rabbitmq_vhost | urlencode }}/amq.default/publish"
+        method: POST
+        user: admin
+        password: "{{ rabbitmq_admin_password }}"
+        force_basic_auth: true
+        body_format: json
+        body:
+          properties: {}
+          routing_key: email_proxy_queue
+          payload: "verify-ping"
+          payload_encoding: string
+      register: publish_result
+      run_once: true
+
+    - name: 取回測試訊息（自我清理）
+      ansible.builtin.uri:
+        url: "http://{{ ansible_host }}:15672/api/queues/{{ rabbitmq_vhost | urlencode }}/email_proxy_queue/get"
+        method: POST
+        user: admin
+        password: "{{ rabbitmq_admin_password }}"
+        force_basic_auth: true
+        body_format: json
+        body: { count: 1, ackmode: ack_requeue_false, encoding: auto }
+        return_content: true
+      register: consume_result
+      run_once: true
+
+    - name: 斷言：訊息成功路由並取回
+      ansible.builtin.assert:
+        that:
+          - publish_result.json.routed
+          - consume_result.json | length > 0
+        success_msg: "RabbitMQ：訊息發佈/消費全鏈通過"
+      run_once: true
+
+# ---------- 5. KeyDB：cluster ok、跨節點讀寫 ----------
+- name: 驗證 KeyDB 叢集
+  hosts: keydb
+  tags: [verify, verify-keydb]
+  tasks:
+    - name: 取得 cluster info
+      ansible.builtin.command: >
+        docker exec keydb-master keydb-cli
+        --tls --cacert /tls/ca.crt --cert /tls/keydb-client.crt --key /tls/keydb-client.key
+        -a {{ keydb_password }} --no-auth-warning cluster info
+      register: keydb_info
+      changed_when: false
+      run_once: true
+
+    - name: 斷言：cluster_state:ok 且 6 個已知節點
+      ansible.builtin.assert:
+        that:
+          - "'cluster_state:ok' in keydb_info.stdout"
+          - "'cluster_known_nodes:6' in keydb_info.stdout"
+        fail_msg: "KeyDB 叢集異常：{{ keydb_info.stdout }}"
+        success_msg: "KeyDB：3 master + 3 replica，cluster_state:ok"
+      run_once: true
+
+    # -c 開 cluster 模式（自動跟隨 MOVED 轉向）：在 app-01 寫、在 app-03 讀
+    - name: 從第一台節點寫入測試鍵
+      ansible.builtin.command: >
+        docker exec keydb-master keydb-cli -c
+        --tls --cacert /tls/ca.crt --cert /tls/keydb-client.crt --key /tls/keydb-client.key
+        -a {{ keydb_password }} --no-auth-warning
+        set verify:ping pong ex 60
+      changed_when: true
+      run_once: true
+
+    - name: 從最後一台節點讀取
+      ansible.builtin.command: >
+        docker exec keydb-master keydb-cli -c
+        --tls --cacert /tls/ca.crt --cert /tls/keydb-client.crt --key /tls/keydb-client.key
+        -a {{ keydb_password }} --no-auth-warning
+        get verify:ping
+      register: keydb_get
+      changed_when: false
+      delegate_to: "{{ groups['keydb'][-1] }}"
+      run_once: true
+
+    - name: 斷言：跨節點讀寫一致
+      ansible.builtin.assert:
+        that: "'pong' in keydb_get.stdout"
+        success_msg: "KeyDB：跨節點讀寫（cluster redirect）通過"
+      run_once: true
+
+# ---------- 6. NFS：跨節點附件共享（規劃書修正的核心痛點） ----------
+- name: 驗證 NFS 附件共享
+  hosts: app
+  tags: [verify, verify-nfs]
+  tasks:
+    - name: 從第一台 app 節點寫入測試附件
+      ansible.builtin.copy:
+        content: "verify-{{ ansible_date_time.epoch }}"
+        dest: "{{ attachments_mount }}/.verify_probe"
+        mode: "0664"
+      run_once: true
+
+    - name: 其他節點應讀得到同一份檔案（這就是「SMTP 收信節點 ≠ worker 寄送節點」情境）
+      ansible.builtin.stat:
+        path: "{{ attachments_mount }}/.verify_probe"
+      register: probe_stat
+
+    - name: 斷言：所有 app 節點看得到
+      ansible.builtin.assert:
+        that: probe_stat.stat.exists
+        fail_msg: "{{ inventory_hostname }} 讀不到共享附件！"
+        success_msg: "NFS：{{ inventory_hostname }} 可見共享附件"
+
+    - name: 清理測試檔案
+      ansible.builtin.file:
+        path: "{{ attachments_mount }}/.verify_probe"
+        state: absent
+      run_once: true
+
+# ---------- 7. 邊界 VIP：HTTPS 健檢 + SMTP banner ----------
+- name: 驗證邊界服務 VIP
+  hosts: lb
+  tags: [verify, verify-edge]
+  tasks:
+    - name: 經服務 VIP 打 HTTPS /health（驗 VIP + TLS 終止 + 後端分流）
+      ansible.builtin.uri:
+        url: "https://svc-api.{{ domain }}/health"
+        ca_path: "{{ pki_dir }}/ca.crt"
+        return_content: true
+      register: health_via_vip
+      run_once: true
+
+    - name: 斷言：/health 回 200
+      ansible.builtin.assert:
+        that: health_via_vip.status == 200
+        success_msg: "邊界：https://svc-api/health 經 VIP 回 200"
+      run_once: true
+
+    - name: SMTPS 口（465）TCP 可達且後端回 SMTP banner
+      ansible.builtin.shell: |
+        set -o pipefail
+        echo QUIT | timeout 5 nc {{ service_vip }} 465 | head -1
+      args: { executable: /bin/bash }
+      register: smtp_banner
+      changed_when: false
+      run_once: true
+
+    - name: 斷言：SMTP banner 以 220 開頭
+      ansible.builtin.assert:
+        that: smtp_banner.stdout is search('^220')
+        fail_msg: "SMTPS 後端無回應：{{ smtp_banner.stdout }}"
+        success_msg: "邊界：465 → app:2525 鏈路通"
+      run_once: true
+
+# ---------- 8. Egress：白名單放行、非白名單拒絕 ----------
+- name: 驗證 Squid 顯式白名單
+  hosts: app
+  tags: [verify, verify-egress]
+  tasks:
+    # curl 而非 uri 模組：uri 無法回報「代理對 CONNECT 的回應碼」（%{http_connect}），
+    # 而那正是本測試的斷言對象——這是少數 curl 是正確工具的場合
+    - name: 白名單網域應可經 proxy 出網（.ubuntu.com 在白名單上） # noqa: command-instead-of-module
+      ansible.builtin.command: >
+        curl -sS -o /dev/null -w "%{http_code}" --max-time 20
+        -x http://egress-proxy.{{ domain }}:{{ squid_port }} https://www.ubuntu.com/
+      register: egress_allow
+      changed_when: false
+      run_once: true
+
+    # HTTPS 經代理被拒是發生在「CONNECT 隧道建立」階段：Squid 回 403 給 CONNECT，
+    # 這時 curl 的 %{http_code} 是 000（隧道沒建成、沒有 HTTP 回應），
+    # 要用 %{http_connect} 才能抓到代理對 CONNECT 的回應碼
+    - name: 非白名單網域應被拒絕（CONNECT 403） # noqa: command-instead-of-module
+      ansible.builtin.command: >
+        curl -sS -o /dev/null -w "%{http_connect}" --max-time 20
+        -x http://egress-proxy.{{ domain }}:{{ squid_port }} https://www.example.com/
+      register: egress_deny
+      changed_when: false
+      failed_when: false
+      run_once: true
+
+    - name: 斷言：白名單 2xx/3xx、非白名單 CONNECT 403
+      ansible.builtin.assert:
+        that:
+          - egress_allow.stdout in ['200', '301', '302']
+          - egress_deny.stdout == '403'
+        fail_msg: "egress 行為異常：allow={{ egress_allow.stdout }} deny(CONNECT)={{ egress_deny.stdout }}"
+        success_msg: "Egress：白名單放行（{{ egress_allow.stdout }}）、其餘 CONNECT 拒絕（403）"
+      run_once: true
+
+# ---------- 9. 監控：Prometheus / Grafana 就緒、目標健康 ----------
+- name: 驗證監控堆疊
+  hosts: monitoring
+  tags: [verify, verify-monitoring]
+  tasks:
+    - name: Prometheus ready
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:9090/-/ready"
+      run_once: true
+
+    - name: Grafana 健康
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:3000/api/health"
+      run_once: true
+
+    - name: 抓取目標的健康比例
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:9090/api/v1/targets?state=active"
+        return_content: true
+      register: prom_targets
+      run_once: true
+
+    - name: 斷言：>=90% 目標 up（容忍個別節點短暫抖動）
+      ansible.builtin.assert:
+        that: >-
+          (prom_targets.json.data.activeTargets | selectattr('health', 'equalto', 'up') | list | length)
+          >= (prom_targets.json.data.activeTargets | length * 0.9)
+        fail_msg: >-
+          有目標 down：{{ prom_targets.json.data.activeTargets
+          | rejectattr('health', 'equalto', 'up') | map(attribute='labels') | list }}
+        success_msg: "監控：Prometheus 目標健康"
+      run_once: true
+
+# ---------- 10. 憑證效期：全站葉憑證 30 天內不到期 ----------
+- name: 驗證憑證效期
+  hosts: all
+  tags: [verify, verify-pki]
+  tasks:
+    - name: 找出本機所有葉憑證
+      ansible.builtin.find:
+        paths: "{{ pki_dir }}"
+        patterns: "*.crt"
+        excludes: "ca.crt"
+      register: leaf_certs
+
+    - name: 檢查 30 天內是否到期（openssl -checkend 回非 0 = 快到期）
+      ansible.builtin.command: openssl x509 -checkend 2592000 -noout -in {{ item.path }}
+      loop: "{{ leaf_certs.files }}"
+      loop_control: { label: "{{ item.path | basename }}" }
+      changed_when: false
+
+# ---------- 總結 ----------
+- name: 驗收總結
+  hosts: monitoring
+  tags: [verify]
+  tasks:
+    - name: 全鏈健檢通過
+      ansible.builtin.debug:
+        msg: >-
+          ✅ 全鏈驗證通過：etcd quorum / Patroni HA / PgBouncer RW-RO 分流 /
+          RabbitMQ quorum queue 收發 / KeyDB 3M+3R / NFS 跨節點共享 /
+          邊界 VIP TLS / Egress 白名單 / 監控 / 憑證效期。

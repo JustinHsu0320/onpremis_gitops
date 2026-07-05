@@ -1,0 +1,82 @@
+{#
+  keydb.conf.j2 — KeyDB 節點設定（master 與 replica 共用同一份 template）
+
+  由 tasks/main.yml 以 loop 帶入 item.role / item.tls_port 各 render 一次：
+    /opt/keydb/master.conf  → tls-port 6379（keydb_port）
+    /opt/keydb/replica.conf → tls-port 6380（keydb_replica_port）
+  兩檔「唯一」差異就是埠號——集中一份 template 是刻意的：
+  分成兩檔遲早會有人只改其中一份而造成 master/replica 設定漂移。
+
+  機密注意：本檔含 requirepass/masterauth，佈署 mode 0600 + no_log。
+#}
+# ===== {{ ansible_managed }} =====
+# KeyDB {{ item.role }}（容器 keydb-{{ item.role }}，host network，TLS-only）
+
+# ---------- 網路 / TLS ----------
+# port 0 = 完全關閉明文埠：所有流量（client、replication、cluster bus）
+# 一律走 TLS。不留明文口就不存在「程式誤連明文口」的降級風險。
+port 0
+tls-port {{ item.tls_port }}
+
+# 憑證三件套（容器內路徑 /tls 對應宿主 {{ keydb_home }}/tls，
+# 來源是 pki_leaf 簽發的 {{ pki_dir }}）。
+# keydb-server 用 peer profile：cluster bus 彼此互連時每個節點
+# 同時是 server（被連）也是 client（去連別人），EKU 必須兩者都有。
+tls-cert-file /tls/keydb-server.crt
+tls-key-file /tls/keydb-server.key
+tls-ca-cert-file /tls/ca.crt
+
+# mTLS：客戶端必須出示「內部 CA 簽發的憑證」（keydb-client）才進得來——
+# 沒憑證的程式連 TLS 握手都過不了，密碼再正確也沒用。
+# 這是第一層防護；第二層 TLS 加密、第三層 requirepass。
+tls-auth-clients yes
+
+# 複寫流量與 cluster bus（gossip / failover 投票）也走 TLS：
+# 快取內容會流經複寫通道，節點間流量的機密性要求與 client 流量相同
+tls-replication yes
+tls-cluster yes
+
+# ---------- Cluster ----------
+cluster-enabled yes
+# nodes.conf 是叢集拓撲的「身分證」：node id、slot 分配、epoch，
+# 由 KeyDB 自己讀寫、人不可手改。必須放在會持久化的 /data（宿主 data-*）：
+# 容器重建後靠它記得「我是誰」，否則節點以全新身分加入會破壞既有叢集。
+cluster-config-file /data/nodes.conf
+# 判定節點失聯的毫秒數（預設 15000）。快取層寧可積極 failover：
+# 資料可從 PG 重建，5 秒的誤判代價遠低於 15 秒的讀取中斷。
+cluster-node-timeout {{ keydb_cluster_node_timeout }}
+# host network + 多網卡（多 VLAN）環境「必須」顯式宣告對外 IP：
+# 不宣告時節點自行猜測，可能把 docker0 / 迴環等錯誤介面位址
+# gossip 給其他節點，對方照著錯 IP 連 bus 就 handshake 失敗。
+cluster-announce-ip {{ ansible_host }}
+
+# ---------- 認證 ----------
+# requirepass：客戶端連「本節點」的密碼。
+# masterauth：本節點以 replica 身分連 master 時出示的密碼。
+# 叢集所有節點共用同一把：failover 後 master/replica 角色互換也連得通。
+requirepass {{ keydb_password }}
+masterauth {{ keydb_password }}
+
+# ---------- 記憶體 / 淘汰 ----------
+maxmemory {{ keydb_maxmemory }}
+# volatile-lru：只在「有設 TTL 的鍵」中淘汰最久未用者。
+# 本系統快取語意是「郵件中繼資料 14 天 TTL」——業務鍵全部帶 TTL，
+# volatile-lru 等於對快取鍵做 LRU；而誤寫入的「無 TTL 鍵」不會被淘汰，
+# 記憶體異常成長時反而容易被監控揪出來（fail loud 原則）。
+maxmemory-policy {{ keydb_maxmemory_policy }}
+
+# ---------- 持久化：純快取，不落地 ----------
+# 資料可從 PostgreSQL 重建，不開 AOF/RDB——省掉 fork 快照的
+# 記憶體尖峰（copy-on-write 最壞翻倍）與磁碟 IO。
+# 注意例外：上面的 nodes.conf「叢集狀態」仍寫入 /data——那是拓撲身分
+# 不是資料持久化，所以 data-* 目錄仍必須可寫、不可用 tmpfs。
+appendonly no
+save ""
+
+dir /data
+
+# ---------- 安全 ----------
+# protected-mode 是「無密碼且未 bind 時拒絕外部連線」的最後保護傘；
+# 本部署已有 TLS 加密 + mTLS 客戶端憑證 + requirepass 三層防護，
+# 且 cluster bus 必須接受其他 app 節點跨網段連入，故關閉之。
+protected-mode no

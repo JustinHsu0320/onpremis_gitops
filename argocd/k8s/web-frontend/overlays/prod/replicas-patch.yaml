@@ -1,0 +1,31 @@
+# =============================================================================
+# 正式環境副本數 patch（strategic merge patch）
+#
+# 意圖上只想覆蓋 spec.replicas，其餘欄位一律繼承 base ——
+# 這就是 overlay 的精神：環境差異最小化、一眼可見。
+#
+# 副本數 2 的理由：搭配 base Deployment 的 maxUnavailable: 0 滾動更新，
+# 任何時刻至少一副本在線；靜態前端無狀態，2 副本足以承擔單 node 故障。
+# 流量成長時直接改這個數字發 MR（或之後導入 HPA —— 屆時移除本 patch，
+# 改由 HorizontalPodAutoscaler 接管 replicas，兩者不可並存）。
+#
+# 註：下方 selector / template 與 base「完全相同」，merge 後為 no-op。
+# 之所以要重複宣告，是因為 CI 的 kubeconform -strict 會把 patch 檔
+# 當完整 Deployment 驗證，而 DeploymentSpec 的 selector/template 是必填。
+# 改動這兩段時務必與 base 同步，否則會意外覆蓋 label。
+# =============================================================================
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-frontend
+spec:
+  replicas: 2 # ← 本 patch 唯一有意義的覆蓋值
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: web-frontend # 與 base 一致（僅為 schema 驗證）
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: web-frontend # 與 base 一致（僅為 schema 驗證）
+        app.kubernetes.io/component: frontend

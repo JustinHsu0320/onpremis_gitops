@@ -1,0 +1,49 @@
+---
+# =============================================================================
+# roles/app_stack/defaults/main.yml — email_proxy 應用堆疊可調參數
+#
+# 跨 role 契約變數（app_http_port、app_smtp_port、pki_dir、attachments_mount、
+# app_images、registry_host、egress_proxy_url、no_proxy_list 與各機密別名）
+# 定義於 inventories/*/group_vars/，本檔只放「僅本 role 關心」的預設值
+# 與「跨群組對齊」用的別名。
+# =============================================================================
+
+# ---------- 部署模式 ----------
+# false（prod 預設）：拉 registry.<domain> 的正式映像（ADR-6：CI build → push
+#   registry → 各節點 pull，取代各節點自行 build 的舊做法）
+# true（lab）：在節點本地 build 極簡 mock 模擬器——驗證「LB → app → 資料層」
+#   整條鏈路，不驗商業邏輯；由 inventories/lab/.../zz_lab_overrides.yml 覆寫
+app_stack_mock: false
+
+# ---------- 佈署路徑（CONVENTIONS.md §4：app compose 專案 = /opt/email-proxy） ----------
+app_stack_home: /opt/email-proxy
+
+# ---------- 跨群組對齊別名（junior 必讀） ----------
+# rabbitmq_vhost / rabbitmq_app_user 定義於 group_vars/rabbitmq.yml——
+# 「app 群組的主機載入不到 rabbitmq 群組的 group_vars」是 Ansible 變數作用域
+# 的天性（group_vars 只對該群組的主機生效），不是 bug。因此本 role 以等值
+# 別名重宣告；若 rabbitmq 側改名/改值，這裡必須同步（契約檢查點）。
+# noqa 理由：這組變數是「app 視角的介面名」，刻意用 app_ 前綴而非 role 前綴，
+# 未來拆出多個 app 相關 role 時共用同一組名字。
+app_amqp_vhost: email_proxy # noqa: var-naming[no-role-prefix] 與 group_vars/rabbitmq.yml 的 rabbitmq_vhost 對齊
+app_amqp_user: email_proxy # noqa: var-naming[no-role-prefix] 與 group_vars/rabbitmq.yml 的 rabbitmq_app_user 對齊
+
+# pg_app_db / pg_app_user 同理：定義於 group_vars/postgres.yml，app 群組看不到
+app_pg_db: email_proxy # noqa: var-naming[no-role-prefix] 與 group_vars/postgres.yml 的 pg_app_db 對齊
+app_pg_user: email_proxy # noqa: var-naming[no-role-prefix] 與 group_vars/postgres.yml 的 pg_app_user 對齊
+
+# ---------- registry 認證（prod、可選） ----------
+# 兩者都有定義時才執行 docker_login；未定義 = registry 允許內網匿名 pull。
+# 需要認證時在 group_vars 或 -e 提供（密碼值務必放 vault）：
+#   app_registry_username: deploy-token-user
+#   app_registry_password: "{{ vault_app_registry_password }}"
+# 刻意不在此給空字串預設——tasks 用 `is defined` 判斷，空字串會造成
+# 「看似有帳密其實是空值」的登入失敗誤導。
+
+# ---------- 部署後自驗 ----------
+# 等待 api(8080)/smtp(2525) 開始監聽的上限（秒）；
+# mock 首次 build + 三容器啟動在低規 lab 上可能吃到數十秒
+app_stack_wait_timeout: 90
+# /health 輪詢：埠開了不代表 handler 就緒，再輪詢到 200 為止
+app_stack_health_retries: 12
+app_stack_health_delay: 5

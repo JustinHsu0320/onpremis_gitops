@@ -1,0 +1,33 @@
+---
+# =============================================================================
+# Ansible Collection 依賴（用 `make deps` 或以下指令安裝到 ./collections）：
+#   ansible-galaxy collection install -r requirements.yml -p collections
+#
+# 為什麼要鎖版本下限？—— collection 的模組參數會演進，鎖下限保證
+# CI 與每個人本機行為一致；升級 = 改這份檔案 → PR → CI 驗證。
+# =============================================================================
+collections:
+  # Docker Engine / docker compose v2 佈署（app_stack、keydb、monitoring）
+  - name: community.docker
+    version: ">=3.10.0"
+
+  # PKI 全流程（openssl_privatekey / openssl_csr / x509_certificate）
+  # 取代裸 openssl shell：可讀、冪等、支援 ownca 簽發模式（規劃書 §5）
+  - name: community.crypto
+    version: ">=2.20.0"
+
+  # mount（NFS 掛載進 fstab）、sysctl 等 POSIX 基礎操作
+  - name: ansible.posix
+    version: ">=1.5.0"
+
+  # timezone、ufw、ini_file 等泛用模組
+  - name: community.general
+    version: ">=9.0.0"
+
+  # PostgreSQL 使用者/資料庫/權限的冪等管理（patroni role 建 app user 用）
+  - name: community.postgresql
+    version: ">=3.4.0"
+
+  # RabbitMQ vhost / user / queue / policy 的冪等管理
+  - name: community.rabbitmq
+    version: ">=1.3.0"

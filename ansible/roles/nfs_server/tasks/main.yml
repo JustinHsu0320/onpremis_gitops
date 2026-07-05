@@ -1,0 +1,127 @@
+---
+# =============================================================================
+# roles/nfs_server/tasks/main.yml — NFSv4.1 檔案伺服器（nfs-01，規劃書 §7.4）
+#
+# 這台是修正現況最大痛點的核心：附件從「各 app 節點本機碟」改為
+# 「全 app 節點掛同一個 NFS」，根治「SMTP 收信節點 ≠ worker 寄送節點時
+# 讀不到附件」的問題；另外也承載 pgBackRest 的備份庫。
+#
+# 容器實驗室注意：nfsd 是 kernel module，容器共用宿主 kernel，
+# module 必須由「宿主機」載入（lab 已驗證可行）。tasks 本身不需分支，
+# 但服務啟動包了 block/rescue，失敗時給 lab 使用者明確的排查指引。
+# =============================================================================
+
+# nfs-kernel-server 走 Ubuntu 官方 archive（版本鎖定交給 distro，不加第三方 repo）。
+# cache_valid_time：一小時內重跑不再 apt update，加快收斂也維持冪等輸出乾淨。
+- name: 安裝 nfs-kernel-server
+  ansible.builtin.apt:
+    name: nfs-kernel-server
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+# 為什麼 owner/group 用數字 "1000"：NFS 的權限判斷只看「數字 UID/GID」不看帳號名，
+# 而 app 容器內的程式以 UID 1000 執行——直接用數字對齊容器 UID，
+# nfs-01 本機不存在 1000 這個帳號也完全沒關係。
+# 反面教材：兩邊各建同名帳號但 UID 不同，掛上來全是 permission denied，
+# 這是 NFS 最經典的地雷，所以契約（group_vars/nfs.yml）直接寫死數字。
+# 先建「中繼目錄」（pseudo-root 到葉目錄之間的路徑，如 /export/mail-proxy）：
+# 必須是 root:root 0755 —— NFSv4 client 掛葉目錄時要以「fsid=0 根匯出的身分」
+# （squash 後=匿名者）一路遍歷到葉；中繼目錄若被建成葉目錄的 0770/1000:1000，
+# 匿名者沒有 +x 遍歷權限，client 端會吃 access denied（實驗室實測踩過的雷）
+- name: 建立中繼目錄（pseudo-root 遍歷路徑，root:root 0755）
+  ansible.builtin.file:
+    path: "{{ item.path | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop: "{{ nfs_exports }}"
+  loop_control:
+    label: "{{ item.path | dirname }}"
+
+- name: 建立各匯出目錄（owner 對齊 app 容器 UID）
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: "{{ item.group }}"
+    mode: "{{ item.mode }}"
+  loop: "{{ nfs_exports }}"
+  loop_control:
+    label: "{{ item.path }}"
+
+# 把每個資料匯出「bind-mount 到自己身上」讓它成為獨立掛載點（vfsmount）——
+# NFSv4 pseudo-root 的教科書模式：kernel nfsd 以「檔案系統」為單位套用匯出選項，
+# 葉匯出與 fsid=0 根在同一個檔案系統時，子樹內的存取會被判到「根匯出的選項」
+# （ro + 匿名 65534）→ 全部 Permission denied（實驗室實測踩過的雷）。
+# 自我 bind 之後每個葉匯出是獨立 mount，rw/all_squash/anonuid 才會正確生效。
+- name: 各匯出目錄 bind-mount 成獨立掛載點（NFSv4 巢狀匯出的正確姿勢）
+  ansible.posix.mount:
+    path: "{{ item.path }}"
+    src: "{{ item.path }}"
+    fstype: none
+    opts: bind
+    state: mounted
+  loop: "{{ nfs_exports }}"
+  loop_control:
+    label: "{{ item.path }}"
+  notify: reload nfs-server
+
+# /etc/exports.d 在少數精簡 image 上不存在；先確保目錄在，template 才不會失敗
+- name: 確保 /etc/exports.d 目錄存在
+  ansible.builtin.file:
+    path: /etc/exports.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+# 匯出表變更只需 exportfs -ra 熱套用（不中斷既有 client 的掛載），
+# 所以 notify 的是 reload 而不是 restart
+- name: 佈署 exports 定義（/etc/exports.d 片段檔）
+  ansible.builtin.template:
+    src: email-proxy.exports.j2
+    dest: "{{ nfs_server_exports_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: reload nfs-server
+
+# /etc/nfs.conf.d 由 nfs-common 套件建立，但同樣防一手精簡 image
+- name: 確保 /etc/nfs.conf.d 目錄存在
+  ansible.builtin.file:
+    path: /etc/nfs.conf.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+# vers3=n / udp=n 是 nfsd 的「啟動參數」，reload 不會重讀，必須 restart 才生效
+- name: 佈署 NFSv4-only 設定（關閉 v3 與 UDP）
+  ansible.builtin.template:
+    src: email-proxy-nfs.conf.j2
+    dest: "{{ nfs_server_conf_dropin }}"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart nfs-server
+
+# 服務啟動包 block/rescue：容器實驗室裡 nfsd kernel module 若沒被宿主載入，
+# nfs-server 會啟動失敗——與其丟一串 systemd 原始錯誤，不如直接告訴
+# lab 使用者「去宿主機 modprobe nfsd」這個正確答案。
+- name: 啟動 NFS server（含容器實驗室失敗指引）
+  block:
+    - name: 啟用並啟動 nfs-server
+      ansible.builtin.systemd_service:
+        name: "{{ nfs_server_service }}"
+        enabled: true
+        state: started
+  rescue:
+    - name: NFS server 啟動失敗——輸出排查指引後中止
+      ansible.builtin.fail:
+        msg: >-
+          nfs-server 啟動失敗。若你在容器實驗室（is_container=true）：
+          nfsd 是 kernel module、容器共用宿主 kernel，請先在「宿主機」執行
+          `sudo modprobe nfsd` 再重跑本 playbook。
+          實體機/VM 請檢查 `journalctl -xeu nfs-server` 與 `lsmod | grep nfsd`。
