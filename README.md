@@ -3,7 +3,8 @@
 > **Greenfield 平行重建**：VMware 起手（Terraform）→ 系統組態（Ansible）→ 工作負載（Docker Compose / K8s）
 > → 變更管線（GitLab CI）→ 應用交付（ArgoCD）。
 > 依據 [`.spec/email_proxy 正式環境重建：地端基礎設施最佳實踐規劃書.md`](.spec/) 實作，
-> **Ansible 主體已在 13 節點 Docker 實驗室完整部署並通過全鏈驗收**（見 [§12 實驗室](#12-docker-實驗室驗證過的拓撲)）。
+> **Ansible 主體已在 16 節點 Docker 實驗室完整部署並通過全鏈驗收**（見 [§12 實驗室](#12-docker-實驗室驗證過的拓撲)）——
+> 含新增的 ScyllaDB 層（33-scylladb）：`99-verify` 16 節點 `failed=0`、3 節點 UN + 跨節點 QUORUM 讀寫（過程踩雷見 §17 #18–#21）。
 
 ---
 
@@ -36,7 +37,7 @@
 | 層 | 工具 | 職責 | 目錄 | 驗證方式 |
 |---|---|---|---|---|
 | L1 機器的存在 | Terraform（vSphere provider） | VM、Port Group（VLAN）、磁碟、反親和規則、cloud-init | [`terraform/`](terraform/) | `terraform validate`（✅ 已通過） |
-| L2 機器的內容 | Ansible | OS 基線、PKI、全部服務組態 | [`ansible/`](ansible/) | **13 節點實驗室實測**（✅ 99-verify 全綠） |
+| L2 機器的內容 | Ansible | OS 基線、PKI、全部服務組態 | [`ansible/`](ansible/) | **16 節點實驗室實測**（✅ 99-verify 全綠，含 scylladb） |
 | L3 VM 上的工作負載 | Docker Compose | email_proxy app、KeyDB、監控堆疊 | `ansible/roles/*/templates/docker-compose.yml.j2` | 實驗室實測（✅） |
 | L4 變更管線 | GitLab CI | lint → validate → plan → apply 的 GitOps 紀律 | [`.gitlab-ci.yml`](.gitlab-ci.yml)、[`gitlab/`](gitlab/) | YAML 驗證（✅） |
 | L5 K8s 應用交付 | ArgoCD | 公司前後端應用的 App-of-Apps GitOps | [`argocd/`](argocd/) | kubeconform + kustomize render（✅） |
@@ -55,7 +56,7 @@ ansible_email_proxy/
 │   ├── inventories/{prod,lab}/   ← lab 拓撲 symlink prod（單一事實來源）
 │   ├── playbooks/            ← site.yml + 00→99 階段
 │   ├── roles/                ← 20 個 role，每個都有豐富的「為什麼」註解
-│   └── lab/                  ← 13 節點 Docker 實驗室（Dockerfile + compose）
+│   └── lab/                  ← 16 節點 Docker 實驗室（Dockerfile + compose）
 ├── gitlab/ci-templates/      ← L4：可 include 的 CI 模板（kaniko/前後端/部署）
 └── argocd/                   ← L5：bootstrap + projects + apps + k8s manifests
 ```
@@ -86,7 +87,7 @@ graph TB
         TF["Terraform plan/apply<br/>（state 存 GitLab-managed TF state）"]
         VC["vCenter / ESXi ×3"]
         ANS["Ansible（mgmt-01）<br/>site.yml"]
-        VMS["13+2 台 VM"]
+        VMS["16+2 台 VM"]
     end
 
     subgraph APP_PATH["email_proxy 應用路徑（VM + Compose）"]
@@ -155,6 +156,7 @@ graph TB
         PG["pg-01/02/03<br/>Patroni＋PG18＋etcd＋PgBouncer＋HAProxy"]
         MQVIP{{"RabbitMQ VIP 10.20.30.20:5671<br/>AMQPS（TLS）"}}
         MQ["mq-01/02/03<br/>RabbitMQ 4.x quorum queues"]
+        SCY[("scylla-01/02/03<br/>ScyllaDB 2026.1（CQL TLS :9042）<br/>NTS RF=3，無 VIP：gocql 原生 failover")]
     end
 
     subgraph VLAN40["VLAN 40 儲存層"]
@@ -171,6 +173,7 @@ graph TB
     A1 & A2 & A3 --- KDB
     A1 & A2 & A3 -->|"6432 RW / 6433 RO（TLS verify-full）"| PGVIP --> PG
     A1 & A2 & A3 -->|"amqps 5671"| MQVIP --> MQ
+    A1 & A2 & A3 -->|"CQL 9042（TLS，多 host failover）"| SCY
     A1 & A2 & A3 -->|"NFSv4.1 hard mount"| NFS
     PG -->|"WAL 歸檔＋每日備份"| NFS
     A1 & A2 & A3 -->|"對外一律經 proxy"| PX --> NET
@@ -218,7 +221,7 @@ sequenceDiagram
 |---|---|---|---|
 | 10 邊界 | `10.20.10.0/24` | 服務 VIP、egress VIP、lb-01/02 | 用戶端可達 443/465 |
 | 20 應用 | `10.20.20.0/24` | app-01/02/03 + KeyDB | 僅 LB → App |
-| 30 資料 | `10.20.30.0/24` | pg/mq 節點與 VIP | 僅 App、mgmt |
+| 30 資料 | `10.20.30.0/24` | pg/mq/scylla 節點與 VIP | 僅 App、mgmt |
 | 40 儲存 | `10.20.40.0/24` | nfs-01 | 僅 App、PG、mgmt |
 | 50 DevOps | `10.20.50.0/24` | gitlab-01、runner-01 | 開發者可達 443 |
 | 60 平台 K8s | `10.20.60.0/24` | K8s 叢集（參考架構，見 §10） | Ingress |
@@ -238,6 +241,7 @@ sequenceDiagram
 10.20.30.11-13  pg-01 / pg-02 / pg-03
 10.20.30.20   rabbitmq-vip.ptc-nec.com.tw   MQ VIP（5671，vrid 31）
 10.20.30.21-23  mq-01 / mq-02 / mq-03
+10.20.30.31-33  scylla-01 / scylla-02 / scylla-03（無 VIP：gocql 多 host 原生 failover）
 10.20.40.11   nfs-01
 10.20.50.11   gitlab-01（gitlab.* 與 registry.* 同機）
 10.20.50.12   runner-01
@@ -257,9 +261,11 @@ sequenceDiagram
 | pg ↔ pg | pg | 5432, 8008, 2379/2380 | 複寫 + Patroni REST + etcd |
 | pg | nfs-01 | 2049 | pgBackRest repo |
 | mq ↔ mq | mq | 25672, 4369 | Erlang 叢集 |
+| app | scylla | 9042, 19042 | CQL over TLS（19042 = gocql shard-aware） |
+| scylla ↔ scylla | scylla | 7001 | internode mTLS（明文 7000 不監聽） |
 | app / lb | egress VIP | 3128 | 唯一對外出口 |
 | mgmt | 全部 | 22 | Ansible / 維運 |
-| mgmt | 全部 | 9100, 8008, 15692, 8404, 9090.. | 監控抓取（詳見 §14） |
+| mgmt | 全部 | 9100, 8008, 15692, 8404, 9180, 9090.. | 監控抓取（詳見 §14） |
 | runner | gitlab | 443, 5050 | CI ↔ Git/Registry |
 
 **埠共存原則**（實測踩雷後寫入契約 CONVENTIONS §3）：VIP 所在主機上「後端服務」與「HAProxy」
@@ -272,20 +278,21 @@ sequenceDiagram
 
 ### 5.1 ESXi 故障域與反親和（規劃書 §2.1）
 
-最少 **3 台 ESXi**：任一台故障時，所有三節點 quorum 叢集（etcd/Patroni/RabbitMQ/KeyDB）
-最多掉 1 個成員、不失去多數。由 `terraform/modules/anti_affinity` 落地 4 組規則：
+最少 **3 台 ESXi**：任一台故障時，所有三節點 quorum 叢集（etcd/Patroni/RabbitMQ/KeyDB/ScyllaDB）
+最多掉 1 個成員、不失去多數。由 `terraform/modules/anti_affinity` 落地 5 組規則：
 
 | 規則 | 成員 | 理由 |
 |---|---|---|
 | `AA-postgres` | pg-01/02/03 | Patroni + etcd quorum |
 | `AA-rabbitmq` | mq-01/02/03 | quorum queue Raft 多數 |
+| `AA-scylladb` | scylla-01/02/03 | RF=3 + QUORUM 讀寫多數 |
 | `AA-app` | app-01/02/03 | 同居的 KeyDB cluster 也要分散 |
 | `AA-lb` | lb-01/02 | VIP 主備不可同機 |
 
 > 反親和用 `mandatory=false`（should 規則）：3 台 ESXi = 叢集成員數時，must 規則會擋
 > 維護模式 vMotion 與 HA 故障重啟。ESXi > 3 台時可覆寫變數改成 must。（模組內有完整註解）
 
-### 5.2 VM 清單（15 台 = 規劃書 13 台 + GitLab 2 台）
+### 5.2 VM 清單（18 台 = 規劃書 13 台 + GitLab 2 台 + ScyllaDB 3 台）
 
 | VM | 角色 | vCPU | RAM | OS 碟 | 資料碟 | VLAN |
 |---|---|---|---|---|---|---|
@@ -293,6 +300,7 @@ sequenceDiagram
 | app-01..03 | api/worker/smtp + KeyDB | 4 | 8G | 60G | — | 20 |
 | pg-01..03 | Patroni/PG18+etcd+PgBouncer+HAProxy | 6 | 16G | 40G | 200G data + 50G WAL + 10G etcd（**各自獨立 PVSCSI 控制器**，SSD） | 30 |
 | mq-01..03 | RabbitMQ 4.x | 4 | 8G | 40G | 100G | 30 |
+| scylla-01..03 | ScyllaDB 2026.1（Docker） | 4 | 16G | 40G | 500G（獨立 PVSCSI 控制器，SSD，XFS） | 30 |
 | nfs-01 | NFSv4.1 | 2 | 8G | 40G | 500G–1T | 40 |
 | gitlab-01 | GitLab CE + Registry | 4 | 8G | 100G | 200G | 50 |
 | runner-01 | gitlab-runner | 4 | 8G | 60G | — | 50 |
@@ -304,13 +312,15 @@ sequenceDiagram
 - 有狀態資料碟 `independent_persistent`（**排除在 VM 快照之外**——DB 備份走 pgBackRest，
   不用 VM 快照）＋ `keep_on_remove`（terraform destroy 不刪資料 VMDK）。
 - etcd/PG WAL 對 fsync 延遲極敏感 → pg 節點整台放 SSD/NVMe datastore（`datastore_ssd` 變數）。
+- ScyllaDB 同理整台放 `datastore_ssd`：500G 資料碟走獨立 PVSCSI 控制器、thick、
+  `independent_persistent`（比照 pg/mq；guest 內 mkfs.xfs 掛載由 `block_storage` role 處理）。
 
 ### 5.3 Terraform 結構與流程
 
 ```mermaid
 graph LR
     subgraph TF["terraform/"]
-        ENV["environments/prod<br/>main.tf：15 台 VM locals"]
+        ENV["environments/prod<br/>main.tf：18 台 VM locals"]
         MODN["modules/network<br/>vDS port groups ×6 VLAN"]
         MODV["modules/vm<br/>clone template + cloud-init"]
         MODA["modules/anti_affinity"]
@@ -466,7 +476,7 @@ sequenceDiagram
 
 ```mermaid
 graph LR
-    TF["Terraform apply<br/>（L1：15 台 VM）"] --> B["00 bootstrap<br/>系統基線 common"]
+    TF["Terraform apply<br/>（L1：18 台 VM）"] --> B["00 bootstrap<br/>系統基線 common"]
     B --> BS["05 block-storage<br/>資料碟格式化+掛載"]
     BS --> DK["08 docker"]
     DK --> P["10 PKI"]
@@ -518,7 +528,7 @@ make syntax        # 兩套 inventory 語法檢查
 make tf-validate   # terraform fmt+validate（官方 docker image）
 make argocd-validate  # kubeconform
 make check-all     # 以上全部（= CI 的 validate 階段）
-make lab-up        # 起 13 節點實驗室
+make lab-up        # 起 16 節點實驗室
 make lab-deploy    # 對實驗室跑 site.yml
 make lab-verify    # 只跑 99-verify
 make lab-destroy   # 銷毀實驗室
@@ -640,13 +650,13 @@ ansible-vault edit inventories/prod/group_vars/all/vault.yml     # 逐項換新�
 
 ## 12. Docker 實驗室（驗證過的拓撲）
 
-**「實驗室驗證的就是正式環境的拓撲」**：13 節點、5 VLAN、IP 與 prod 完全相同、
+**「實驗室驗證的就是正式環境的拓撲」**：16 節點、5 VLAN、IP 與 prod 完全相同、
 TLS/quorum/VIP 一個不少。lab inventory 的拓撲檔全部 **symlink** 到 prod（單一事實來源），
 只覆寫降規參數（`zz_lab_overrides.yml`）。
 
 ```mermaid
 graph TB
-    subgraph HOST["你的機器（Docker Desktop，建議 8GB）"]
+    subgraph HOST["你的機器（Docker Desktop，建議 12GB）"]
         subgraph V10["bridge: vlan10（10.20.10.0/24）"]
             LLB1["lb-01/02<br/>(+VIP .10/.20)"]
         end
@@ -656,6 +666,7 @@ graph TB
         subgraph V30["vlan30（10.20.30.0/24）"]
             LPG["pg-01..03（+VIP .10）"]
             LMQ["mq-01..03（+VIP .20）"]
+            LSCY["scylla-01..03（.31-.33，DinD：scylla）"]
         end
         subgraph V40["vlan40（10.20.40.0/24）"]
             LNFS["nfs-01（kernel nfsd）"]
@@ -685,6 +696,7 @@ make lab-destroy
 | GitLab / runner | 不部署（記憶體） | 部署 | lab inventory 無此群組，自動跳過 |
 | app 映像 | 本地 build mock（/health+SMTP banner） | registry pull | `app_stack_mock` 開關 |
 | Docker 影像存放層 | overlay2（巢狀相容） | 預設 | `docker_storage_driver` 變數 |
+| ScyllaDB 運行模式 | developer mode（DinD/overlay 過不了 XFS/AIO 檢查）+ smp1/768M | **正式模式**（dev mode 是 MIS 反模式，prod 必 false）+ smp2/8G | `scylla_developer_mode` 等，lab 覆寫 |
 
 **驗收證據（最後一次完整跑）**：`site.yml` 全綠、`99-verify` 十個子系統全過、
 `ansible-lint` production profile 0 findings、site.yml 重跑收斂（冪等）。
@@ -698,6 +710,7 @@ make lab-destroy
 | **PostgreSQL** | pgBackRest：WAL 連續歸檔（`archive_command`）+ 每週日全備 + 每日差異備，`repo1-retention-full=2` ≈ 兩週 PITR 窗口；repo **AES-256 加密**（NFS 上靜態加密） | nfs-01 `/export/mail-proxy/pgbackup` |
 | **RabbitMQ** | definitions（vhost/user/queue/policy）由 Ansible 冪等重建 = 設定即備份；quorum queue 資料靠叢集多數複寫 | Git（本 repo） |
 | **KeyDB** | 純快取（TTL 語意），不備份 | — |
+| **ScyllaDB** | RF=3 保「節點故障」不保「邏輯錯誤」（誤刪表全叢集同步刪）。**快照策略待決策**：`nodetool snapshot` + 異地拷貝的排程尚未實作（MIS 現況亦無備份——這是已知債，不是刻意設計）；上線承載正式資料前必須補上 | TODO |
 | **附件** | NFS 卷每日增量備份到異地（站點既有備份系統，掛載點即備份源） | nfs-01 |
 | **GitLab** | `gitlab-backup create` + 異地同步（runbook TODO 註記於 role） | gitlab-01 |
 | **CA** | Root CA 私鑰離線保存（建立後搬離 mgmt-01）；Issuing CA 隨 mgmt-01 的檔案系統備份 | 離線媒體 |
@@ -731,7 +744,8 @@ mgmt-01 上的 compose（`roles/monitoring`）：Prometheus + Grafana + Alertman
 | RabbitMQ | mq 節點 `:15692/metrics` | 佇列深度、節點狀態、記憶體水位 |
 | **KeyDB** | app 節點 `:9121`（redis_exporter，mTLS 連本機 master） | redis_up、**connected_slaves**（replica 備援）、記憶體 |
 | HAProxy | lb/pg/mq 節點 `:8404/metrics`（內建 exporter） | 後端健康、連線數、5xx |
-| Blackbox | `https://svc-api/health`、`amqps VIP:5671`（TLS）、`pgbouncer VIP:6432`、`egress VIP:3128`（tcp） | 4 個 VIP 端到端可達性 + **憑證到期天數** |
+| **ScyllaDB** | scylla 節點 `:9180/metrics`（Seastar 原生，免 exporter） | operation_mode、讀寫 timeout、壓實/空間壓力 |
+| Blackbox | `https://svc-api/health`、`amqps VIP:5671`（TLS）、`pgbouncer VIP:6432`、`egress VIP:3128`（tcp）、scylla 各節點 `:9042`（TLS） | VIP／CQL 端到端可達性 + **憑證到期天數** |
 
 **告警規則**（`roles/monitoring/templates/rules.yml.j2`，每條附中文註解）：
 
@@ -744,6 +758,7 @@ mgmt-01 上的 compose（`roles/monitoring`）：Prometheus + Grafana + Alertman
 | **EtcdSlowFsync** | WAL fsync p99 > 500ms for 5m（datastore 非 SSD 的預警） | warning |
 | RabbitNodeDown | 叢集在線節點 < 3 for 3m | critical |
 | **KeyDBMasterNoReplica** | `redis_connected_slaves < 1`（master 失去備援即告警，補審查點名盲點） | warning |
+| **ScyllaNodeNotNormal** | `scylla_node_operation_mode != 3` for 10m（節點離開 NORMAL＝再倒一台就 QUORUM 不足） | warning |
 | ProbeFailed | 端到端探測失敗 for 3m（涵蓋 4 個 VIP「沒人持有」） | critical |
 | NodeFilesystemAlmostFull | 可用 < 15% for 10m | warning |
 
@@ -819,7 +834,7 @@ ansible-playbook playbooks/site.yml        # 冪等收斂：PG 使用者、Rabbi
 | **ADR-2** | 全部基礎服務用 **Ubuntu 26.04 官方 archive 套件**（PG18/Patroni 4.1/RabbitMQ 4.0.5/etcd 3.5/HAProxy 3.2…），Docker 只裝在跑容器的節點（app/mgmt/runner） | 地端封閉環境最小化第三方 repo = 最小化供應鏈與 egress 依賴。實測 26.04 archive 版本全數符合規劃書要求。PGDG 作為次要選項保留（要 minor 版鎖定時） |
 | **ADR-3** | egress Squid **與 lb 同居** + 獨立 VIP（規劃書 §10.3） | 主備 VIP 消除單台 Squid SPOF，又不用多開 2 台 VM；兩者同為無狀態邊界元件，故障域重疊可接受 |
 | **ADR-4** | PKI 先落地 **openssl（community.crypto）版**（規劃書 §10.4）；ArgoCD 只管平台 K8s，email_proxy 留在 VM+Compose | step-ca/Vault PKI 留為中期演進（role 介面已預留）；email_proxy 依賴 NFS/host network/VIP 拓撲，強行進 K8s 是為了工具而工具 |
-| **ADR-5** | 名稱解析：**Ansible 管理 /etc/hosts**（規劃書 §10.5） | 13 台規模下比自建 DNS 簡單可靠；公司 DNS 就緒後設 `manage_etc_hosts=false` 即可切換 |
+| **ADR-5** | 名稱解析：**Ansible 管理 /etc/hosts**（規劃書 §10.5） | 16 台規模下比自建 DNS 簡單可靠；公司 DNS 就緒後設 `manage_etc_hosts=false` 即可切換 |
 | **ADR-6** | 映像：**CI build 一次 → push 內部 registry → 節點 pull**（規劃書 §10.6），registry = GitLab 內建 | 消除「各節點自行 build」的版本漂移與重複勞動；GitLab 已自建，registry 零額外成本 |
 | ADR-7 | Keepalived 用 **unicast VRRP**（顯式 peers） | 不依賴交換器放行 224.0.0.18 多播；跨機房/容器/雲一體適用；peers 由 inventory 動態展開 |
 | ADR-8 | KeyDB 跑容器、其餘服務原生 systemd | KeyDB 無 26.04 套件；app 節點本來就有 Docker；資料層服務原生跑（少一層抽象、systemd 資源控制直接） |
@@ -870,6 +885,15 @@ ansible-playbook playbooks/site.yml        # 冪等收斂：PG 使用者、Rabbi
 | 15 | delayed plugin 404 | 上游 4.0.7 資產檔名帶 `v` 前綴（與其他版本不一致） | URL 抽成變數 + 實測值（rabbitmq defaults） |
 | 16 | 資料碟閒置、資料落 OS 碟 | Terraform 掛 VMDK 但無 role 在 guest 格式化/掛載（對抗式審查抓到） | 新增 block_storage role + 05 階段（ADR-13） |
 | 17 | redis_exporter `permission denied` 讀 client 憑證 | exporter 預設 UID ≠ 999，讀不到 owner 999 的 keydb 憑證 | compose `user: "999:999"`（keydb role） |
+| 18 | ScyllaDB 容器 crash-loop：`insufficient physical memory: needed 718M available 500M` | Seastar 用「瞬時 MemFree」而非 cgroup 上限或 MemAvailable 判斷可用記憶體；16 節點同開時前 15 個服務把 Docker Desktop VM 的 buff/cache 撐滿，MemFree 一度掉到 ~500MB（MemAvailable 仍有 11GB） | lab `scylla_memory=400M`（zz_lab_overrides）；**prod 不受影響**（實體 VM、無巢狀），用 defaults 的 8G |
+| 19 | ScyllaDB 第 3 個節點 crash：`does not satisfy minimum AIO requirements` | `fs.aio-max-nr` 是全 kernel 單一計數器（非 per-namespace），預設 65536 被前節點與其他服務耗光；developer mode **不**豁免此檢查 | scylla role 的 aio-max-nr 任務移除 `when: not is_container`（privileged DinD 可寫全域 kernel、且一台設好全 VM 生效）；`reload: false` 避免容器內 `sysctl -p` 全域重載報錯 |
+| 20 | 出廠 `cassandra` 帳號沒被刪、角色審計失敗 | code-review 階段把子字串比對改成 `is search('\bcassandra\b')`，但 **Jinja2 字串常值把 `\b` 解析成 backspace 控制字元**（非正則 word-boundary），pattern 永不匹配 → DROP 的 `when` 恆為 false | 改用清單成員判斷（split `\|` 取第一欄）取代 `\b` 正則（scylla role 三處 `when`） |
+| 21 | 全鏈部署末段 verify-monitoring 誤報「多目標 down」 | Prometheus 剛部署完、第一輪抓取尚未完成（連自我抓取都 down）；scylla 新增的 6 個 target（3×:9180 + 3×blackbox-cql）擴大暖機面 | 目標健康查詢加 `until`+`retries` 輪詢至首輪抓取收斂（99-verify）；實測暖機後 **47/47 targets up** |
+
+> **16 節點實驗室全鏈實測結果**：`make lab-up → lab-deploy → lab-verify` 全綠——
+> `99-verify` 16 節點 `failed=0`，含 ScyllaDB 子系統（3/3 UN、TLS + 應用帳號 + 跨節點 QUORUM
+> 讀寫、原生 metrics）；scylla role 重跑 `changed=0`（冪等）。上表 #18–#21 為本次 ScyllaDB
+> 上線過程實際踩到並修正的問題。
 
 ---
 

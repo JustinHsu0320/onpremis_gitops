@@ -112,6 +112,20 @@ scrape_configs:
           instance: {{ h }}
 {% endfor %}
 
+  # ---------- job: scylla —— 寬欄資料層健康（原生 :9180 /metrics，免 exporter） ----------
+  # Seastar 內建 Prometheus 端點，指標極多（per-shard）。關鍵指標：
+  # scylla_node_operation_mode（3=NORMAL，是 ScyllaNodeNotNormal 告警的資料源）、
+  # scylla_storage_proxy_coordinator_write/read_timeouts（QUORUM 湊不齊的直接證據）、
+  # scylla_lsa_total_space_bytes / scylla_compaction_manager_compactions（空間與壓實壓力）
+  - job_name: scylla
+    metrics_path: /metrics
+    static_configs:
+{% for h in groups['scylladb'] | sort %}
+      - targets: ["{{ hostvars[h].ansible_host }}:{{ monitoring_scylla_metrics_port }}"]
+        labels:
+          instance: {{ h }}
+{% endfor %}
+
   # ---------- job: blackbox-https —— 使用者視角的端到端 HTTPS 探測 ----------
   # 探 https://svc-api.{{ domain }}/health：一次驗完 VIP 漂移、HAProxy TLS 終止、
   # 憑證有效性（probe_ssl_earliest_cert_expiry → CertExpirySoon）、後端 app 分流。
@@ -145,6 +159,30 @@ scrape_configs:
       module: [tcp_tls_internal_ca]
     static_configs:
       - targets: ["rabbitmq-vip.{{ domain }}:{{ rabbitmq_amqps_port }}"]
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: "blackbox:{{ monitoring_blackbox_port }}"
+
+  # ---------- job: blackbox-cql —— ScyllaDB 9042 的 TCP+TLS 探測 ----------
+  # scylla 沒有 VIP（gocql 多 host 原生 failover），逐節點探 9042 的 TLS 握手：
+  # 驗「app 視角的 CQL 口可達」+ 產出 probe_ssl_earliest_cert_expiry——
+  # 讓 CertExpirySoon 一條規則連 scylla-server 憑證也一起涵蓋（四個資料層服務中
+  # 只有 scylla 是 implicit TLS、可零成本這樣探；PG 是 STARTTLS 式探不了）。
+  # 用 IP 而非 FQDN：blackbox 容器的名稱解析只有 compose extra_hosts 的 VIP 條目，
+  # 沒有各主機名；scylla-server 憑證的 SAN 含節點 IP（pki_leaf 預設），IP 探測可過驗證
+  - job_name: blackbox-cql
+    metrics_path: /probe
+    params:
+      module: [tcp_tls_internal_ca]
+    static_configs:
+      - targets:
+{% for h in groups['scylladb'] | sort %}
+          - "{{ hostvars[h].ansible_host }}:{{ scylla_cql_port }}"
+{% endfor %}
     relabel_configs:
       - source_labels: [__address__]
         target_label: __param_target

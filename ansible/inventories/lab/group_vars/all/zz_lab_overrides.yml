@@ -31,6 +31,24 @@ rabbitmq_vm_memory_high_watermark: "0.3"
 # KeyDB：快取上限縮小
 keydb_maxmemory: 256mb
 
+# ScyllaDB：實驗室跑在 DinD 容器 + overlayfs/named volume 上，過不了
+# XFS/AIO 檢查 → developer mode 開啟（prod 必為 false，這是 MIS 反模式的
+# 修正重點，勿把這個覆寫帶回 prod）；資源同步降規
+scylla_developer_mode: true
+scylla_smp: 1
+# 為什麼 lab 只給 400M（實測踩雷後定值，見 §17 除錯知識庫）：
+# Seastar 啟動時用「瞬時 MemFree」而非 cgroup 上限或 MemAvailable 判斷可用記憶體。
+# 16 節點同時開機時，前 15 個服務的 apt/pull/啟動把整個 Docker Desktop VM 的
+# buff/cache 撐滿，MemFree 一度掉到 ~500MB（MemAvailable 仍有 11GB 但 seastar 不看）。
+# 768M（需 ~718MiB）> 500MB → seastar「insufficient physical memory」crash-loop
+# → CQL 埠永不開 → wait_for 逾時。400M（需 ~350MiB）對這個低谷留 ~150MB 餘裕，
+# 且 dev mode 下實測連 300M 都能起、lab verify 的微量寫入綽綽有餘。
+# prod 完全不受影響：真實 VM 有 16G 實體記憶體、無 DinD 巢狀，用 defaults 的 8G。
+scylla_memory: 400M
+scylla_container_memory_limit: 1536m
+# developer mode 跳過 IO 基準測試，啟動快很多，等待上限跟著縮
+scylla_wait_timeout: 120
+
 # Prometheus：保留期縮短、抓取間隔放寬
 prometheus_retention: 2d
 

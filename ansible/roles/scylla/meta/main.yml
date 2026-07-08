@@ -1,0 +1,21 @@
+---
+# =============================================================================
+# roles/scylla/meta/main.yml
+# =============================================================================
+galaxy_info:
+  author: email-proxy-infra
+  description: >-
+    ScyllaDB 3 節點叢集（Docker 容器、host network、內外部 TLS、
+    PasswordAuthenticator/CassandraAuthorizer、NTS RF=3；
+    拓撲承襲 MIS 正式環境驗證、修正其 developer-mode/:latest 等反模式）。
+  license: MIT
+  min_ansible_version: "2.16"
+  platforms:
+    - name: Ubuntu
+      versions:
+        - all
+
+# 執行順序依賴（05-block-storage 先掛好 XFS 資料碟、08-docker 先裝好 Docker、
+# 10-pki 先簽好 scylla-server 憑證）由 site.yml 的 play 順序保證，不用 meta
+# dependencies 硬綁——硬綁會讓 --tags scylladb 單跑時把整個 bootstrap 拖進來。
+dependencies: []

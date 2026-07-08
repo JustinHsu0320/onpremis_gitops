@@ -48,11 +48,11 @@ argocd-validate: ## ArgoCD/K8s manifests 結構驗證（kubeconform）
 
 check-all: lint syntax tf-validate argocd-validate ## 全部靜態檢查
 
-# ---------- Docker 實驗室（13 節點 ubuntu:26.04 systemd + 5 VLAN） ----------
+# ---------- Docker 實驗室（16 節點 ubuntu:26.04 systemd + 5 VLAN） ----------
 lab-build: ## 建置實驗室基底映像 + 產生 SSH 金鑰
 	cd ansible/lab && ./lab-build.sh
 
-lab-up: lab-build ## 啟動 13 節點實驗室拓撲
+lab-up: lab-build ## 啟動 16 節點實驗室拓撲
 	cd ansible/lab && docker compose up -d && ./lab-wait-ready.sh
 
 lab-deploy: ## 在 mgmt-01 內對整個實驗室跑 site.yml（真正的端到端部署）

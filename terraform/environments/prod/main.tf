@@ -1,8 +1,8 @@
 # =============================================================================
 # environments/prod/main.tf — prod 環境的機器清單與組裝
 #
-# 這個檔案是 Layer 1 的「事實陳述」：15 台 VM（13 台服務 + 2 台 DevOps）、
-# 6 個 VLAN port group、4 組反親和規則。每一台的規格逐台對照規劃書 §2.2
+# 這個檔案是 Layer 1 的「事實陳述」：18 台 VM（16 台服務 + 2 台 DevOps）、
+# 6 個 VLAN port group、5 組反親和規則。每一台的規格逐台對照規劃書 §2.2
 # 資源配額表；每一個 IP 對照 CONVENTIONS.md §2 與
 # ansible/inventories/prod/hosts.yml（一一對應，兩邊都改才算改完——ADR-1，
 # inventory 是主機清單的唯一事實來源，Terraform 照抄它，不反過來）。
@@ -39,7 +39,7 @@ locals {
   vlans = {
     "${var.port_group_prefix}-vlan10" = { vlan_id = 10, description = "邊界層 10.20.10.0/24：服務 VIP .10 / egress VIP .20 / lb-01..02" }
     "${var.port_group_prefix}-vlan20" = { vlan_id = 20, description = "應用層 10.20.20.0/24：app-01..03（含同居 KeyDB）" }
-    "${var.port_group_prefix}-vlan30" = { vlan_id = 30, description = "資料層 10.20.30.0/24：PgBouncer VIP .10 / pg-01..03 / RabbitMQ VIP .20 / mq-01..03" }
+    "${var.port_group_prefix}-vlan30" = { vlan_id = 30, description = "資料層 10.20.30.0/24：PgBouncer VIP .10 / pg-01..03 / RabbitMQ VIP .20 / mq-01..03 / scylla-01..03 .31-.33" }
     "${var.port_group_prefix}-vlan40" = { vlan_id = 40, description = "儲存層 10.20.40.0/24：nfs-01" }
     "${var.port_group_prefix}-vlan50" = { vlan_id = 50, description = "DevOps 10.20.50.0/24：gitlab-01 / runner-01" }
     "${var.port_group_prefix}-vlan99" = { vlan_id = 99, description = "管理層 10.20.99.0/24：mgmt-01（Ansible 控制 + PKI + 監控）" }
@@ -64,6 +64,22 @@ locals {
     { label = "disk1-pgdata", size_gb = 200, thin = false, independent_persistent = true, unit_number = 0, scsi_controller = 1 },
     { label = "disk2-pgwal", size_gb = 50, thin = false, independent_persistent = true, unit_number = 0, scsi_controller = 2 },
     { label = "disk3-etcd", size_gb = 10, thin = false, independent_persistent = true, unit_number = 0, scsi_controller = 3 },
+  ]
+
+  # ---------------------------------------------------------------------------
+  # ScyllaDB 節點的資料碟（規劃書 §2.2 新增的 scylla 列）——抽成 local 讓
+  # scylla-01..03 完全一致（NTS RF=3 三節點對稱，規格分歧只會製造難查的偏斜）。
+  #
+  # 單顆 500 GB 資料碟，掛「自己專屬的 PVSCSI 控制器」（1 號；0 號留給 OS 碟）：
+  # commitlog 順序寫與 sstable 隨機讀 / 壓實同時發生，獨立控制器讓資料 IO 不與
+  # OS 碟擠同一佇列。thick（thin=false）：資料庫碟不賭 datastore 超賣；
+  # independent_persistent：排除在 VM 快照外（§2.3）。整台放 datastore_ssd
+  # （比照 pg，LSM 隨機讀寫對延遲敏感）。Guest 內 mkfs.xfs + 用 UUID 寫 fstab
+  # 掛到資料目錄一樣交給 block_storage role（05-block-storage 階段，依容量認碟）
+  # ——與 pg / mq 完全同構。
+  # ---------------------------------------------------------------------------
+  scylla_extra_disks = [
+    { label = "disk1-scylladata", size_gb = 500, thin = false, independent_persistent = true, unit_number = 0, scsi_controller = 1 },
   ]
 
   # ---------------------------------------------------------------------------
@@ -153,6 +169,25 @@ locals {
       ]
     }
 
+    # ---- 資料層（VLAN 30）：ScyllaDB 2026.1 寬欄叢集（NTS RF=3，無 VIP） ----
+    # 拓撲承襲 MIS scylladb-1..3；整台放 SSD datastore（LSM 隨機讀寫 + 壓實對
+    # 延遲敏感，比照 pg）。單顆 500 GB 資料碟規格見上面 scylla_extra_disks。
+    "scylla-01" = {
+      cpu       = 4, memory_mb = 16384, os_disk_gb = 40
+      vlan      = 30, ipv4 = "10.20.30.31"
+      datastore = var.datastore_ssd, extra_disks = local.scylla_extra_disks
+    }
+    "scylla-02" = {
+      cpu       = 4, memory_mb = 16384, os_disk_gb = 40
+      vlan      = 30, ipv4 = "10.20.30.32"
+      datastore = var.datastore_ssd, extra_disks = local.scylla_extra_disks
+    }
+    "scylla-03" = {
+      cpu       = 4, memory_mb = 16384, os_disk_gb = 40
+      vlan      = 30, ipv4 = "10.20.30.33"
+      datastore = var.datastore_ssd, extra_disks = local.scylla_extra_disks
+    }
+
     # ---- 儲存層（VLAN 40）：NFSv4.1 附件 + PG 備份庫 ----
     # 1 TB 附件/備份碟（規劃書 §2.2 給 500GB–1TB 區間，取上限）：
     # thin=true 是刻意的——附件是逐步長大的冷資料，thick 一次吃掉 1 TB 太浪費；
@@ -208,7 +243,7 @@ module "network" {
   vlans      = local.vlans
 }
 
-# (2) VM：15 台全部走同一個泛用模組，差異收斂在 local.vms
+# (2) VM：18 台全部走同一個泛用模組，差異收斂在 local.vms
 module "vm" {
   source   = "../../modules/vm"
   for_each = local.vms
@@ -240,7 +275,7 @@ module "vm" {
   dns_servers        = var.dns_servers
 }
 
-# (3) 反親和規則 ×4（規劃書 §2.1 表：AA-postgres / AA-rabbitmq / AA-app / AA-lb）
+# (3) 反親和規則 ×5（規劃書 §2.1 表：AA-postgres / AA-rabbitmq / AA-scylladb / AA-app / AA-lb）
 # mandatory 維持模組預設 false（should 規則）：3 台 ESXi 剛好等於叢集成員數，
 # must 規則會擋維護模式 vMotion 與 HA 故障重啟——取捨的完整說明見
 # modules/anti_affinity/variables.tf。
@@ -261,6 +296,15 @@ module "aa_rabbitmq" {
   compute_cluster_id = data.vsphere_compute_cluster.cluster.id
   # RabbitMQ quorum queue 靠 Raft 多數，同上
   vm_ids = [for h in ["mq-01", "mq-02", "mq-03"] : module.vm[h].id]
+}
+
+module "aa_scylladb" {
+  source = "../../modules/anti_affinity"
+
+  name               = "AA-scylladb"
+  compute_cluster_id = data.vsphere_compute_cluster.cluster.id
+  # NTS RF=3 + QUORUM 讀寫：掉 2 個節點才失去多數，3 台必須在 3 台 ESXi 上
+  vm_ids = [for h in ["scylla-01", "scylla-02", "scylla-03"] : module.vm[h].id]
 }
 
 module "aa_app" {

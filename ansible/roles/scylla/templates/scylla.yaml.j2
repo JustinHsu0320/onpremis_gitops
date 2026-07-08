@@ -1,0 +1,90 @@
+{#
+  scylla.yaml.j2 — ScyllaDB 主設定（單一事實來源：Ansible template，手改必被覆蓋）
+
+  與 compose 的 entrypoint 參數分工（junior 必讀）：
+    位址/seed 類設定「兩邊都寫」（本檔 + entrypoint 參數），值來自同一組
+    變數所以不會漂移——entrypoint 參數是 MIS 驗證過的權威路徑，本檔的
+    同值欄位讓維運人員 cat 一個檔案就看懂整個節點；而認證/TLS/num_tokens
+    這類「entrypoint 沒有對應參數」的設定，本檔是唯一出處。
+
+  安全設計（對照 MIS 的修正）：
+    - rpc_address 綁節點 IP 而非 0.0.0.0（CONVENTIONS §3 埠共存原則）
+    - internode 7001 require_client_auth: true（雙向驗證，MIS 為 false）
+    - client 端 9042 TLS 驗 CA 即可（gocql 以 ca.pem 驗證，不出示客戶端憑證）
+#}
+# ===== {{ ansible_managed }} =====
+
+# ---------- 叢集識別 ----------
+cluster_name: '{{ scylla_cluster_name }}'
+# Tablets 時代（2026.1 預設）只影響舊式 vnode keyspace；沿用 MIS 同值
+num_tokens: {{ scylla_num_tokens }}
+
+# ---------- 位址（host network：直接綁節點 IP） ----------
+listen_address: {{ ansible_host }}
+rpc_address: {{ ansible_host }}
+broadcast_address: {{ ansible_host }}
+broadcast_rpc_address: {{ ansible_host }}
+
+# ---------- 埠（CONVENTIONS.md §3） ----------
+native_transport_port: {{ scylla_cql_port }}
+storage_port: {{ scylla_storage_port }}
+ssl_storage_port: {{ scylla_ssl_storage_port }}
+
+# nodetool 的後端 REST API：只綁 127.0.0.1——這個 API 無認證，
+# 綁節點 IP 等於把「免密碼的叢集管理權」開放給整個 VLAN
+api_address: 127.0.0.1
+api_port: {{ scylla_api_port }}
+
+# 原生 Prometheus metrics（不需要 exporter），綁節點 IP 供 mgmt-01 抓取
+prometheus_address: {{ ansible_host }}
+prometheus_port: {{ scylla_prometheus_port }}
+
+# ---------- seed（叢集初次互相發現的接觸點） ----------
+# Raft 叢集管理時代 seed 只是「初始接觸點」，全員互列最簡單也最耐故障
+# （MIS 同做法驗證過；拓撲加入順序由 Raft 自動序列化，不靠 seed 排序）
+seed_provider:
+  - class_name: org.apache.cassandra.locator.SimpleSeedProvider
+    parameters:
+      - seeds: "{{ groups['scylladb'] | sort | map('extract', hostvars, 'ansible_host') | join(',') }}"
+
+# ---------- 拓撲感知 ----------
+# GossipingPropertyFileSnitch：DC/rack 身分讀 cassandra-rackdc.properties。
+# 現在單 DC 單 rack，但這是日後「加 DC 遷移/異地」唯一要動的開關，
+# 一開始就用對 snitch（SimpleSnitch 沒有 DC 概念，事後換 = 全叢集重建）
+endpoint_snitch: GossipingPropertyFileSnitch
+
+# ---------- 認證授權 ----------
+# 2026.1 的帳號/權限資料由 Raft 管理（auth-v2），全叢集強一致，
+# 不存在舊版「system_auth RF=1」的單點問題
+authenticator: PasswordAuthenticator
+authorizer: CassandraAuthorizer
+
+# ---------- 資料目錄（容器內路徑；宿主側 = {{ scylla_data_root }}/*，獨立 XFS 碟） ----------
+data_file_directories:
+  - /var/lib/scylla/data
+commitlog_directory: /var/lib/scylla/commitlog
+hints_directory: /var/lib/scylla/hints
+view_hints_directory: /var/lib/scylla/view_hints
+saved_caches_directory: /var/lib/scylla/saved_caches
+
+# ---------- 節點間加密（7001） ----------
+# internode_encryption: all = 節點間流量一律 TLS（明文 7000 不監聽）。
+# require_client_auth: true = 雙向驗證——會連 7001 的只有叢集成員，
+# 彼此都有 peer 憑證（serverAuth+clientAuth），沒有理由不驗對方
+server_encryption_options:
+  internode_encryption: all
+  certificate: /etc/scylla/certs/scylla-server.crt
+  keyfile: /etc/scylla/certs/scylla-server.key
+  truststore: /etc/scylla/certs/ca.crt
+  require_client_auth: true
+
+# ---------- 客戶端加密（9042） ----------
+# app（gocql）以內部 CA 驗證伺服器身分 + 帳號密碼認證；
+# require_client_auth 維持 false——與 MIS/app 現行連線方式相容
+# （gocql 只帶 ca.pem，不出示客戶端憑證），身分驗證交給 PasswordAuthenticator
+client_encryption_options:
+  enabled: true
+  certificate: /etc/scylla/certs/scylla-server.crt
+  keyfile: /etc/scylla/certs/scylla-server.key
+  truststore: /etc/scylla/certs/ca.crt
+  require_client_auth: false

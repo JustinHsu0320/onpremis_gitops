@@ -1,0 +1,36 @@
+---
+# =============================================================================
+# group_vars/scylladb.yml — ScyllaDB 寬欄資料層（信件/附件冷資料）
+# =============================================================================
+
+# ---------- PKI ----------
+# scylla-server 用 peer profile：節點間 7001 是「彼此互連」的雙向 TLS
+# （require_client_auth: true），每個節點同時是 server 也是 client，
+# EKU 必須兩者都有；同一張憑證也服務 9042 的客戶端 TLS（serverAuth）。
+# extra_sans 加 127.0.0.1：本機迴環除錯（cqlsh localhost）也能過憑證驗證。
+pki_certificates:
+  - name: scylla-server
+    profile: peer
+    owner: root
+    group: root
+    key_mode: "0640"
+    extra_sans: ["IP:127.0.0.1"]
+
+# ---------- 資料碟（05-block-storage） ----------
+# Scylla 的 data/commitlog 全在獨立 XFS 碟（Scylla 官方唯一完整支援的 FS；
+# MIS 用 ext4 靠 developer mode 遮檢查，本環境修正）。
+# owner 不在這裡指定：容器內 UID 999 不是宿主帳號，掛載點由 scylla role 建子目錄時 chown。
+# 500GB 依 MIS 現況（每節點 ~50GB、三個月）預留成長空間——LSM 壓實需要
+# 可觀的暫存餘裕，磁碟用量常態請維持 < 70%（監控 NodeFilesystemAlmostFull）。
+storage_volumes:
+  - { mountpoint: /var/lib/scylla, size_gb: 500 }
+
+# ---------- 應用 keyspace 與帳號 ----------
+# 兩個 keyspace 沿用 MIS 現況（set_usc：主要業務表；email_service：
+# emails_by_user / attachments_by_email 查詢表），都是 NTS RF=3。
+# app 端的對應別名：roles/app_stack/defaults 的 app_scylla_keyspace /
+# app_scylla_user（契約檢查點）；99-verify 也引用這兩個變數
+scylla_keyspaces:
+  - set_usc
+  - email_service
+scylla_app_user: set_usc_admin

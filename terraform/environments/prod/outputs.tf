@@ -2,13 +2,13 @@
 # environments/prod/outputs.tf — prod 環境的輸出
 #
 # 兩個消費場景：
-#   1. 人：apply 完看 vm_ips 快速確認 15 台機器的名字與 IP
+#   1. 人：apply 完看 vm_ips 快速確認 18 台機器的名字與 IP
 #   2. 對照：rendered_ansible_inventory 渲染出 hosts.yml「樣式」的 YAML，
 #      與 ansible/inventories/prod/hosts.yml 做人工 diff 用
 # =============================================================================
 
 output "vm_ips" {
-  description = "VM 名稱 → 主網卡靜態 IPv4 的 map（15 台）。應與 CONVENTIONS.md §2 的 IP 表完全一致"
+  description = "VM 名稱 → 主網卡靜態 IPv4 的 map（18 台）。應與 CONVENTIONS.md §2 的 IP 表完全一致"
   value       = { for name, m in module.vm : name => m.primary_ip }
 }
 
@@ -45,6 +45,7 @@ locals {
     postgres      = ["pg-01", "pg-02", "pg-03"]
     etcd          = ["pg-01", "pg-02", "pg-03"] # etcd 與 pg 同居（Patroni DCS）
     rabbitmq      = ["mq-01", "mq-02", "mq-03"]
+    scylladb      = ["scylla-01", "scylla-02", "scylla-03"]
     nfs           = ["nfs-01"]
     gitlab        = ["gitlab-01"]
     gitlab_runner = ["runner-01"]

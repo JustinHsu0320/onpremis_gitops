@@ -56,7 +56,7 @@ variable "datastore" {
 }
 
 variable "datastore_ssd" {
-  description = "SSD/NVMe datastore 名稱：pg-01..03 整台放這（etcd 與 PG WAL 對 fsync 延遲極度敏感，規劃書 §2.1；並確認底層關閉會延後寫入確認的快取策略）"
+  description = "SSD/NVMe datastore 名稱：pg-01..03（etcd 與 PG WAL 對 fsync 延遲極度敏感，規劃書 §2.1）與 scylla-01..03（LSM 隨機讀寫 + 壓實）整台放這；並確認底層關閉會延後寫入確認的快取策略"
   type        = string
 }
 

@@ -326,7 +326,7 @@ ansible-deploy:
   # 同一時間只允許一條 pipeline 對 prod 跑 Ansible（滾動更新 serial:1 的
   # 前提是「只有一個指揮官」）
   resource_group: ansible-prod
-  timeout: 2h                  # site.yml 全跑（13 台）遠超預設 1h
+  timeout: 2h                  # site.yml 全跑（16 台）遠超預設 1h
   script:
     - cd ansible
     # 不帶 -i = ansible.cfg 預設 prod inventory（防呆方向：預設值就是 prod，

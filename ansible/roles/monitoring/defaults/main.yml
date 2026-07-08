@@ -35,6 +35,8 @@ monitoring_rabbitmq_metrics_port: 15692
 monitoring_etcd_metrics_port: 2381
 # KeyDB 的 redis_exporter（對照 roles/keydb/defaults 的 keydb_exporter_port）
 monitoring_keydb_exporter_port: 9121
+# ScyllaDB 原生 metrics（對照 group_vars/all 的 scylla_prometheus_port；免 exporter）
+monitoring_scylla_metrics_port: 9180
 
 # ---------- Prometheus 全域抓取節奏 ----------
 # 15s：13 台規模的網路/儲存負擔可忽略，又足夠餵 for: 1m~3m 的告警規則

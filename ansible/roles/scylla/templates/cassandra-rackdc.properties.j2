@@ -1,0 +1,10 @@
+{#
+  cassandra-rackdc.properties.j2 — GossipingPropertyFileSnitch 的節點身分
+
+  注意：DC/rack 是節點的「出生證明」——首次加入叢集後就不可改
+  （改了會被拒絕啟動），要換名等於 decommission 重加。日後要加第二個
+  DC（異地/從 MIS 線上遷移），是「新節點用新值」，不是改這裡的舊節點。
+#}
+# ===== {{ ansible_managed }} =====
+dc={{ scylla_dc }}
+rack={{ scylla_rack }}

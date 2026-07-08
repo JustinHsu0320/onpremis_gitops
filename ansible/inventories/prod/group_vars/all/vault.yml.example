@@ -15,6 +15,10 @@ vault_rabbitmq_app_user_password: "CHANGEME"
 # Erlang cookie：RabbitMQ 叢集節點互認的共享密鑰（等同叢集 root 權限）
 vault_rabbitmq_erlang_cookie: "CHANGEME"
 vault_keydb_password: "CHANGEME"
+# ScyllaDB：專屬超級使用者（取代出廠 cassandra 帳號）與應用帳號（gocql 連線）
+# 兩者都請避免含單引號與雙引號（會破壞 cqlsh 指令的引號結構）；建議純英數
+vault_scylla_admin_password: "CHANGEME"
+vault_scylla_app_password: "CHANGEME"
 # VRRP 認證密碼上限 8 字元（keepalived 協定限制），每個 VIP 各自獨立
 vault_vrrp_pass_svc: "CHANGEME"
 vault_vrrp_pass_egress: "CHANGEME"

@@ -2,15 +2,16 @@
 # =============================================================================
 # 08-docker.yml — Docker Engine（規劃書 ADR-8）
 #
-# 只裝在「真的跑容器」的主機：app（app 本體 + KeyDB）、monitoring（監控 compose）、
-# gitlab_runner（docker executor）。資料層（pg/mq）與邊界（lb/nfs）走原生 systemd
-# 服務，不需要 Docker。
+# 只裝在「真的跑容器」的主機：app（app 本體 + KeyDB）、scylladb（scylla 容器）、
+# monitoring（監控 compose）、gitlab_runner（docker executor）。
+# 資料層（pg/mq）與邊界（lb/nfs）走原生 systemd 服務，不需要 Docker。
 #
 # 排在 05-block-storage 之後：mgmt-01 的 /var/lib/docker 此時已掛到獨立資料碟，
-# Docker 的 image / named volume 就都落在大碟上。
+# Docker 的 image / named volume 就都落在大碟上（scylla 節點的資料碟則掛
+# /var/lib/scylla，scylla 資料 bind mount 進容器，不經 docker 層）。
 # =============================================================================
 - name: 容器主機安裝 Docker Engine
-  hosts: app:monitoring:gitlab_runner
+  hosts: app:scylladb:monitoring:gitlab_runner
   tags: [bootstrap, docker]
   roles:
     - role: docker

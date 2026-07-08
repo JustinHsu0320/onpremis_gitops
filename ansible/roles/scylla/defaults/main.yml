@@ -1,0 +1,114 @@
+---
+# =============================================================================
+# roles/scylla/defaults/main.yml — ScyllaDB 可調參數（單一服務的 knob）
+#
+# 跨 role 契約變數（scylla_cql_port、scylla_prometheus_port、scylla_admin_password、
+# scylla_app_password、pki_dir、is_container）定義於 inventories/*/group_vars/，
+# 本檔只放「僅本 role 關心」的預設值與可獨立測試用的同值 fallback。
+#
+# 【本 role 與 MIS 正式環境（scylladb-1..3.ptc-nec.com.tw）的關係——junior 必讀】
+# 拓撲照抄 MIS 已驗證三個月的部分：3 節點、host network、內外部 TLS、
+# GossipingPropertyFileSnitch、PasswordAuthenticator+CassandraAuthorizer、
+# 資料 bind mount 到獨立資料碟。同時修正 MIS 的反模式：
+#   1. :latest 映像 → 鎖定版本（升級 = 改這裡 + 走 PR）
+#   2. --developer-mode 1 上正式環境 → prod 關閉（lab 才開）
+#   3. 手動 docker run、無 compose 檔 → compose 專案由本 role 全權管理
+#   4. 自簽 100 年 CA、無輪替 → 接內部 PKI（397 天葉憑證，10-pki 輪替）
+#   5. fs.aio-max-nr=65536 過低（被 dev mode 遮蔽）→ 1048576
+#   6. --smp 2 --memory 1G 與 docker limit 4G/2CPU 不一致 → 同源變數推導
+# =============================================================================
+
+# ---------- 容器映像 ----------
+# 鎖定 MIS 已驗證三個月的同一版本（絕不用 :latest——「三個月前 pull 的 latest」
+# 和「今天 pull 的 latest」是兩個不同的東西，重建節點時會得到驚喜）。
+# 2026.1 起 ScyllaDB 是統一版本線（Raft 叢集管理 + Tablets 預設啟用）。
+scylla_image: "scylladb/scylla:2026.1.1"
+
+# ---------- 佈署路徑（CONVENTIONS.md §4：scylladb compose 專案 = /opt/scylladb） ----------
+scylla_home: /opt/scylladb
+
+# 資料根目錄 = block_storage 掛好的獨立資料碟（XFS——Scylla 官方唯一完整支援的 FS；
+# MIS 用 ext4 是靠 developer mode 遮掉檢查，本 role 修正之）。
+# data/commitlog/hints 等子目錄由本 role 在其下建立後整個 bind mount 進容器。
+scylla_data_root: /var/lib/scylla
+
+# scylladb/scylla 映像內 scylla 使用者的 UID/GID：容器內服務以此身分讀寫
+# 掛載進去的 conf/tls/data，宿主檔案擁有者必須對齊，否則起不來
+scylla_container_uid: "999"
+scylla_container_gid: "999"
+
+# ---------- 叢集識別 ----------
+# cluster_name 沿用 MIS 的 setuc2：若日後要用「新增資料中心」方式從 MIS 線上
+# 遷移（加 DC → rebuild → 切 app → 汰除舊 DC），cluster_name 必須相同、
+# scylla_dc 必須不同（屆時把 scylla_dc 改成 dc2 再首次部署——DC 名稱
+# 在節點初始化後不可改，要換名等於整叢集重建）。
+scylla_cluster_name: setuc2
+scylla_dc: dc1
+scylla_rack: rack1
+
+# vnode 數；Tablets 時代（2026.1 預設）此值只影響非 tablets 的舊式 keyspace，
+# 保留 MIS 同值以利日後 sstable 級搬遷
+scylla_num_tokens: 256
+
+# ---------- 資源配置（單一事實來源，容器 limit 由此推導） ----------
+# MIS 的教訓：--smp 2 --memory 1G 但 docker limit 4G/2CPU，兩套數字各說各話。
+# 這裡 scylla 自身用量（smp/memory）與容器上限（cpus/mem_limit）都從同組變數出，
+# mem_limit 比 scylla_memory 多留 ~25% 給容器內輔助程序（nodetool/健檢/日誌）。
+# 建議機型 4 vCPU / 16G：留 2 核與部分記憶體給 OS page cache 與 node_exporter。
+scylla_smp: 2
+scylla_memory: 8G
+scylla_container_memory_limit: 10g
+
+# VMware 共享實體核心的環境維持 overprovisioned（放棄 CPU 獨佔/輪詢模式，
+# 對 hypervisor 鄰居友善；MIS 同設定驗證過）
+scylla_overprovisioned: true
+
+# 正式環境一律 false！developer mode 會停用 XFS/AIO/記憶體鎖定等安全檢查，
+# MIS 開著它跑 production 是本 role 修正的頭號反模式。
+# lab（容器內跑容器、overlayfs、無獨立碟）由 zz_lab_overrides.yml 覆寫為 true。
+scylla_developer_mode: false
+
+# ---------- kernel 參數 ----------
+# Seastar 的 AIO 需求：每 shard 約 1 萬個 aio context，Ubuntu 預設 65536 在
+# 非 developer mode 下可能不足（MIS 就是靠 dev mode 遮掉這個檢查）。
+# 1048576 足夠 smp 開到數十；kernel 對「上限值本身」不佔記憶體，放大無代價。
+scylla_aio_max_nr: 1048576
+
+# ---------- 埠（同值 fallback；真正定義在 group_vars/all/vars.yml，改埠請改契約） ----------
+scylla_cql_port: 9042
+scylla_prometheus_port: 9180
+# 以下埠僅節點間/本機使用，非跨 role 契約：
+scylla_storage_port: 7000          # 明文 internode（internode_encryption: all 時不監聽）
+scylla_ssl_storage_port: 7001      # TLS internode（實際使用的埠）
+scylla_api_port: 10000             # REST API（nodetool 的後端；只綁 127.0.0.1）
+
+# ---------- 認證 / 初始資料 ----------
+# 專屬超級使用者：初次部署以出廠 cassandra/cassandra 建立後，出廠帳號即刪除
+# （MIS 留著出廠帳號可登入——已知弱點，本 role 修正）。
+# 注意：ScyllaDB 2026.1 的認證資料由 Raft 管理（auth-v2），不存在舊版
+# 「system_auth 是 SimpleStrategy RF=1」的單點問題，不需要 ALTER KEYSPACE + repair。
+scylla_admin_user: scylla_admin
+
+# 應用帳號（gocql 連線用；名稱沿用 MIS，密碼走 vault）。
+# 真正的定義在 group_vars/scylladb.yml（99-verify 與 app 別名都對照它），
+# 這裡保留同值 fallback 只為了讓本 role 可獨立測試。
+# 兩個 scylla 密碼都請避免含單引號與雙引號（單引號破壞 CQL 字串常值與
+# -p 參數、雙引號破壞 -e 的外層引號——command 模組是 shlex 解析，沒有
+# shell 幫你轉義）；建議純英數，vault.yml.example 有同樣警告。
+scylla_app_user: set_usc_admin
+# 應用 keyspace 清單的同值 fallback（真正定義同上在 group_vars/scylladb.yml）
+scylla_keyspaces:
+  - set_usc
+  - email_service
+
+# 應用 keyspace 的複寫因子：3 節點全複寫（NetworkTopologyStrategy）
+# → 任一節點故障，QUORUM（2/3）讀寫不中斷
+scylla_keyspace_replication_factor: 3
+
+# ---------- 部署後健檢 ----------
+# 等 CQL 埠監聽的上限（秒）：非 developer mode 首次啟動會跑磁碟 IO 基準測試
+# （scylla_io_setup，SSD 上約 1-2 分鐘），比一般服務慢很多，不要低於 300
+scylla_wait_timeout: 300
+# 等全叢集節點進入 UN 狀態的輪詢次數與間隔（秒）
+scylla_cluster_ok_retries: 60
+scylla_cluster_ok_delay: 5

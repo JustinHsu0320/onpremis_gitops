@@ -32,6 +32,11 @@ app_amqp_user: email_proxy # noqa: var-naming[no-role-prefix] 與 group_vars/rab
 app_pg_db: email_proxy # noqa: var-naming[no-role-prefix] 與 group_vars/postgres.yml 的 pg_app_db 對齊
 app_pg_user: email_proxy # noqa: var-naming[no-role-prefix] 與 group_vars/postgres.yml 的 pg_app_user 對齊
 
+# scylla_keyspaces / scylla_app_user 同理：定義於 group_vars/scylladb.yml。
+# app 只用主要業務 keyspace（set_usc）；email_service 是同帳號可及的查詢表 keyspace
+app_scylla_keyspace: set_usc # noqa: var-naming[no-role-prefix] 與 group_vars/scylladb.yml 的 scylla_keyspaces 首項對齊
+app_scylla_user: set_usc_admin # noqa: var-naming[no-role-prefix] 與 group_vars/scylladb.yml 的 scylla_app_user 對齊
+
 # ---------- registry 認證（prod、可選） ----------
 # 兩者都有定義時才執行 docker_login；未定義 = registry 允許內網匿名 pull。
 # 需要認證時在 group_vars 或 -e 提供（密碼值務必放 vault）：

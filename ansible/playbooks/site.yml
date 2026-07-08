@@ -9,7 +9,7 @@
 #
 # 順序即依賴（不可調換）：
 #   00 系統基線 → 10 PKI（一切 TLS 服務的前提）→ 20 儲存
-#   → 30/31/32 資料層三兄弟 → 40 邊界 LB → 41 egress
+#   → 30/31/32/33 資料層四兄弟 → 40 邊界 LB → 41 egress
 #   → 50 app（要等資料層全就緒）→ 60 監控 → 99 全鏈健檢
 #   70 GitLab 獨立階段（只依賴 00/10；lab 無此群組會自動跳過）
 # =============================================================================
@@ -29,6 +29,8 @@
   import_playbook: 31-rabbitmq.yml
 - name: 階段 32：KeyDB 快取層
   import_playbook: 32-keydb.yml
+- name: 階段 33：ScyllaDB 寬欄資料層
+  import_playbook: 33-scylladb.yml
 - name: 階段 40：邊界負載平衡
   import_playbook: 40-lb.yml
 - name: 階段 41：Egress 白名單代理

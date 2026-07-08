@@ -1,7 +1,7 @@
 # =============================================================================
 # modules/vm/variables.tf — 泛用 VM 模組的輸入介面
 #
-# 這個模組是整個 Layer 1 的核心：所有 15 台 VM（13 台服務 + 2 台 DevOps）都
+# 這個模組是整個 Layer 1 的核心：所有 18 台 VM（16 台服務 + 2 台 DevOps）都
 # 透過同一個模組長出來，差異全部收斂在輸入變數。模組本身不含任何主機名 /
 # IP 的硬編值——那些屬於 environments/prod/main.tf 的 locals（單一事實來源
 # 是 ansible/inventories/prod/hosts.yml + CONVENTIONS.md §2，見 ADR-1）。

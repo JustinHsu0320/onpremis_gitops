@@ -16,6 +16,7 @@
 | `postgres` | pg-01..03 | Patroni/PG18 + PgBouncer + HAProxy + Keepalived | VLAN 30 |
 | `etcd` | = postgres | etcd 3 節點（同居 pg） | 同 pg 主機 |
 | `rabbitmq` | mq-01..03 | RabbitMQ 4.x + HAProxy + Keepalived | VLAN 30 |
+| `scylladb` | scylla-01..03 | ScyllaDB 2026.1 3 節點（Docker、TLS、NTS RF=3） | VLAN 30 |
 | `nfs` | nfs-01 | NFSv4 附件 + PG 備份庫 | VLAN 40 |
 | `monitoring` | mgmt-01 | Ansible 控制 + PKI 簽發 + Prometheus/Grafana | VLAN 99 |
 | `egress` | = lb | Squid 顯式白名單正向代理 | 與 lb 同居（ADR-3） |
@@ -30,7 +31,7 @@
 |---|---|---|
 | 10 邊界 | 10.20.10.0/24 | 服務 VIP `.10`、egress VIP `.20`、lb-01 `.11`、lb-02 `.12` |
 | 20 應用 | 10.20.20.0/24 | app-01..03 `.11-.13` |
-| 30 資料 | 10.20.30.0/24 | PgBouncer VIP `.10`、pg-01..03 `.11-.13`、RabbitMQ VIP `.20`、mq-01..03 `.21-.23` |
+| 30 資料 | 10.20.30.0/24 | PgBouncer VIP `.10`、pg-01..03 `.11-.13`、RabbitMQ VIP `.20`、mq-01..03 `.21-.23`、scylla-01..03 `.31-.33` |
 | 40 儲存 | 10.20.40.0/24 | nfs-01 `.11` |
 | 50 DevOps | 10.20.50.0/24 | gitlab-01 `.11`、runner-01 `.12` |
 | 99 管理 | 10.20.99.0/24 | mgmt-01 `.11` |
@@ -61,6 +62,10 @@ DNS 名稱（由 `common` role 寫入 `/etc/hosts`，ADR-5）：
 | RabbitMQ prometheus | 15692 | mq 節點 IP | |
 | KeyDB master | 6379（bus 16379） | app 節點 IP | TLS-only（`port 0`） |
 | KeyDB replica | 6380（bus 16380） | app 節點 IP | TLS-only |
+| Scylla CQL | 9042 | scylla 節點 IP | TLS；gocql 另自動使用 19042 shard-aware |
+| Scylla internode | 7001 | scylla 節點 IP | 節點間 mTLS（明文 7000 不監聽） |
+| Scylla REST API | 10000 | scylla: 127.0.0.1 | nodetool 後端；無認證故僅本機 |
+| Scylla metrics | 9180 | scylla 節點 IP | 原生 Prometheus 端點，免 exporter |
 | NFSv4.1 | 2049 | nfs-01 | v4-only，不開 rpcbind |
 | Squid | 3128 | lb 節點；VIP 10.20.10.20 | 顯式白名單 |
 | node_exporter | 9100 | 全部主機 | |
@@ -87,6 +92,8 @@ Linux 上 wildcard（0.0.0.0）LISTEN socket 會讓另一行程綁同埠的特�
 | etcd data dir | `/var/lib/etcd`（prod 掛獨立 VMDK） | pg |
 | app compose 專案 | `/opt/email-proxy/` | app |
 | keydb compose 專案 | `/opt/keydb/` | app |
+| scylladb compose 專案 | `/opt/scylladb/` | scylla |
+| Scylla data dir | `/var/lib/scylla`（變數 `scylla_data_root`，獨立 VMDK、XFS） | scylla |
 | monitoring compose 專案 | `/opt/monitoring/` | mgmt-01 |
 
 ## 5. PKI 契約（最重要的跨 role 介面）
@@ -127,6 +134,7 @@ pki_certificates:
 | rabbitmq | `rabbitmq-server` | server | AMQPS 5671 |
 | app | `keydb-server` | peer | KeyDB TLS + cluster bus（雙向） |
 | app | `keydb-client` | client | app / keydb-cli 連線 |
+| scylladb | `scylla-server` | peer | internode 7001 mTLS + 9042 客戶端 TLS（SAN 加 127.0.0.1） |
 | lb | `svc-api` | server + `bundle_pem` | 443 終止（SAN：svc-api、VIP） |
 | gitlab | `gitlab-server` | server | GitLab/Registry HTTPS |
 
@@ -141,6 +149,8 @@ vault_postgres_app_password         vault_pgbouncer_auth_password
 vault_pgbouncer_admin_password      vault_patroni_restapi_password
 vault_rabbitmq_admin_password       vault_rabbitmq_app_user_password
 vault_rabbitmq_erlang_cookie        vault_keydb_password
+vault_scylla_admin_password         vault_scylla_app_password
+    （↑ Scylla 密碼避免含單引號與雙引號——會破壞 cqlsh 指令的引號結構，建議純英數）
 vault_vrrp_pass_svc  vault_vrrp_pass_egress  vault_vrrp_pass_pg  vault_vrrp_pass_mq
     （↑ VRRPv2 PASS 驗證只取前 8 字元，超長會被靜默截斷——請直接產 8 字元）
 vault_app_jwt_secret                vault_app_encryption_key
@@ -182,8 +192,8 @@ VIP、TLS、quorum 與 prod 完全一致——lab 的目的就是驗證拓撲）
 ## 9. 部署順序依賴（site.yml）
 
 ```
-00-bootstrap → 10-pki → { 20-storage, 30-postgres, 31-rabbitmq, 32-keydb } → 40-lb → 41-egress
+00-bootstrap → 10-pki → { 20-storage, 30-postgres, 31-rabbitmq, 32-keydb, 33-scylladb } → 40-lb → 41-egress
                                             ↓
-                                50-app（依賴 20/30/31/32/40 全就緒）→ 60-monitoring → 99-verify
+                            50-app（依賴 20/30/31/32/33/40 全就緒）→ 60-monitoring → 99-verify
 70-gitlab 獨立（僅依賴 00/10）
 ```

@@ -1,0 +1,396 @@
+---
+# =============================================================================
+# roles/scylla/tasks/main.yml — ScyllaDB 3 節點叢集（Docker、host network、TLS）
+#
+# 拓撲（junior 必讀）：
+#   3 台專用節點各跑 1 個 scylla 容器（host network），內部節點間流量走
+#   7001 全 TLS + 雙向驗證，對 app 的 CQL 走 9042 TLS（CA 驗證）。
+#   應用 keyspace 用 NetworkTopologyStrategy RF=3：任一節點整台故障，
+#   QUORUM（2/3）讀寫照常——這是 3 節點叢集存在的意義。
+#
+# 前置依賴（由 site.yml 順序保證）：
+#   05-block-storage：/var/lib/scylla 已掛獨立 XFS 資料碟
+#   08-docker：Docker Engine；10-pki：scylla-server（peer）憑證
+# =============================================================================
+
+# ---------- 0. kernel 參數 ----------
+# Seastar 以 linux-aio 做非同步 IO，需要足夠的 aio context 池。這是 Seastar 的
+# 硬需求，developer mode「不會」豁免它（實測：lab 第 3 個 scylla 節點就因池耗盡
+# 啟動失敗，錯誤明確要求 aio-max-nr）——所以這是本 role 唯一「即使 is_container
+# 也要設」的 kernel 參數，是 CONVENTIONS §7「容器跳過 kernel sysctl」的刻意例外：
+#   - fs.aio-max-nr 是「全 kernel 單一計數器」，非 per-namespace。多節點共用一個
+#     宿主 kernel（prod 各自獨立 VM；lab 的 3 個 scylla 節點共用 Docker Desktop
+#     VM kernel）時，預設 65536 會被前面啟動的節點與其他服務耗光，後啟動的節點
+#     拿不到 context → seastar「does not satisfy minimum AIO requirements」而 crash。
+#   - lab 的 scylla 節點是 privileged DinD、對宿主 VM kernel 有寫入權（實測可設、
+#     且一台設好全 VM 生效），所以這裡不跳過 is_container。
+# reload: false —— 只設運行值（sysctl_set 直接寫 /proc），不觸發 `sysctl -p` 全域
+#   重載：容器內 /etc/sysctl.conf 可能含其他無法套用的條目，全域重載會整包報錯。
+- name: 設定 fs.aio-max-nr（Seastar AIO 硬需求；lab privileged DinD 亦需，故不跳過）
+  ansible.posix.sysctl:
+    name: fs.aio-max-nr
+    value: "{{ scylla_aio_max_nr }}"
+    state: present
+    sysctl_set: true
+    reload: false
+
+# ---------- 1. 目錄結構 ----------
+# conf 由 root 持有（單一事實來源在 Ansible，容器唯讀掛載）；
+# tls 與資料目錄擁有者 999:999：scylladb/scylla 映像內的 scylla 使用者
+# 以此 UID 執行，宿主檔案不給這個 UID 讀寫就起不來。
+# 資料子目錄建在 block_storage 掛好的資料碟（scylla_data_root）之下，
+# 整個根目錄 bind mount 進容器 /var/lib/scylla。
+- name: 建立 ScyllaDB 目錄結構
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: "{{ item.group }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ scylla_home }}", owner: root, group: root, mode: "0755" }
+    - { path: "{{ scylla_home }}/conf", owner: root, group: root, mode: "0755" }
+    - { path: "{{ scylla_home }}/tls", owner: "{{ scylla_container_uid }}", group: "{{ scylla_container_gid }}", mode: "0750" }
+    - { path: "{{ scylla_data_root }}/data", owner: "{{ scylla_container_uid }}", group: "{{ scylla_container_gid }}", mode: "0750" }
+    - { path: "{{ scylla_data_root }}/commitlog", owner: "{{ scylla_container_uid }}", group: "{{ scylla_container_gid }}", mode: "0750" }
+    - { path: "{{ scylla_data_root }}/hints", owner: "{{ scylla_container_uid }}", group: "{{ scylla_container_gid }}", mode: "0750" }
+    - { path: "{{ scylla_data_root }}/view_hints", owner: "{{ scylla_container_uid }}", group: "{{ scylla_container_gid }}", mode: "0750" }
+    - { path: "{{ scylla_data_root }}/saved_caches", owner: "{{ scylla_container_uid }}", group: "{{ scylla_container_gid }}", mode: "0750" }
+  loop_control:
+    label: "{{ item.path }}"
+
+# ---------- 2. TLS 憑證 ----------
+# 為什麼 copy 一份而不直接掛 {{ pki_dir }}？
+#   pki_leaf 產出的檔案 owner 是 root（契約 §5），容器內的 scylla（999）讀不到
+#   私鑰；直接改 {{ pki_dir }} 的 ownership 會影響同機其他讀憑證的程式。
+#   複製到 /opt/scylladb/tls 並 chown 999——容器專用、互不干擾。
+# 檔名在容器內以 /etc/scylla/certs/* 出現（見 scylla.yaml.j2）。
+# 私鑰是機密：mode 0600 + no_log（防 --diff 把金鑰內容印上終端）。
+- name: 複製 TLS 憑證與私鑰到容器掛載目錄
+  ansible.builtin.copy:
+    src: "{{ pki_dir }}/{{ item.name }}"
+    dest: "{{ scylla_home }}/tls/{{ item.name }}"
+    remote_src: true
+    owner: "{{ scylla_container_uid }}"
+    group: "{{ scylla_container_gid }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { name: ca.crt, mode: "0644" }
+    - { name: scylla-server.crt, mode: "0644" }
+    - { name: scylla-server.key, mode: "0600" }
+  loop_control:
+    label: "{{ item.name }}"
+  no_log: true
+  notify: restart scylladb
+
+# PKI 契約：10-pki 重簽憑證時 pki_leaf 會設 host fact pki_certs_changed=true。
+# 正常情況上面的 copy 比對內容就會 changed→notify；這個「橋接 task」是
+# 契約要求的保險絲——確保 10-pki 重簽後重跑本 playbook 一定會 recreate
+# 容器讓新憑證生效。/bin/true 只是掛 notify 的載體，本身無副作用。
+- name: 偵測 PKI 憑證輪替並排程容器重建
+  ansible.builtin.command: /bin/true
+  changed_when: true
+  when: pki_certs_changed | default(false)
+  notify: restart scylladb
+
+# ---------- 3. 設定檔 ----------
+# scylla.yaml 含 TLS/認證/拓撲設定但無機密（密碼在 Raft 管理的系統表，不在設定檔），
+# 0644 即可；容器唯讀掛載（MIS 掛成可寫是不必要的——entrypoint 不會回寫它）。
+- name: 佈署 scylla.yaml
+  ansible.builtin.template:
+    src: scylla.yaml.j2
+    dest: "{{ scylla_home }}/conf/scylla.yaml"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart scylladb
+
+# GossipingPropertyFileSnitch 的 DC/rack 身分檔：現在 3 節點同 DC 同 rack
+# 看似多餘，但這是日後「加第二個 DC 做異地/遷移」時唯一要動的拓撲開關
+- name: 佈署 cassandra-rackdc.properties
+  ansible.builtin.template:
+    src: cassandra-rackdc.properties.j2
+    dest: "{{ scylla_home }}/conf/cassandra-rackdc.properties"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart scylladb
+
+# ---------- 4. docker compose 專案 ----------
+# 修正 MIS 的「手動 docker run、重建全靠人腦記憶」：容器規格全部落在 compose 檔，
+# 由 Ansible template 產出。健檢用 nodetool（走本機 REST API）不含任何密碼，
+# 所以本檔無機密、0644 佈署（對照 keydb 的 compose 因健檢帶密碼而 0600+no_log）。
+- name: 佈署 docker-compose.yml
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ scylla_home }}/docker-compose.yml"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart scylladb
+
+# flush 刻意排在 compose up「之前」（與 keydb 的順序相反，是有意為之）：
+# 首次部署時上面的 certs/conf task 全都 changed→notify，若先 up 再 flush，
+# 剛啟動的容器會在數秒內被 recreate 打斷——scylla 首次啟動含磁碟 IO
+# 基準測試與 Raft 叢集初次成形，boot-kill-boot 白白多花數分鐘。
+# 先 flush：有變更時由 handler（recreate: always）直接以最終設定啟動容器，
+# 語意不變、少一次重啟；沒變更就什麼都不做。
+- name: 立即套用尚未生效的容器變更
+  ansible.builtin.meta: flush_handlers
+
+# state=present ≒ docker compose up -d：容器不存在就建、存在就確保運行
+# （有變更的情境已由上面的 flush 處理；此 task 覆蓋「毫無變更但容器不在」
+# 的情境——例如有人手動 docker rm，compose 檔沒變、handler 不會觸發，
+# 這裡把它拉起來）。注意 compose「偵測不到」volume 掛載檔（conf/tls）的
+# 內容變更——那由 notify → recreate handler 補上。
+- name: 啟動 ScyllaDB 容器
+  community.docker.docker_compose_v2:
+    project_src: "{{ scylla_home }}"
+    state: present
+
+# ---------- 5. 部署自驗：埠就緒 + 叢集收斂 ----------
+# CQL 綁節點 IP（非 0.0.0.0，CONVENTIONS §3 埠共存原則；也修正 MIS 的
+# rpc_address: 0.0.0.0）。首次啟動含磁碟 IO 基準測試，等待上限刻意放大。
+- name: 等待 ScyllaDB 監聽 CQL TLS 埠
+  ansible.builtin.wait_for:
+    host: "{{ ansible_host }}"
+    port: "{{ scylla_cql_port | int }}"
+    timeout: "{{ scylla_wait_timeout }}"
+
+# 埠開了不代表叢集健康：等所有節點都進入 UN（Up/Normal）。
+# 2026.1 的拓撲變更由 Raft 序列化，三台同時首次啟動會自動排隊逐一加入，
+# 這裡就是在等那個過程收斂完。
+# 帶傷維運逃生口：某台已知故障、要 --limit 修另一台時，全員 UN 永遠等不到，
+# 用 -e scylla_expected_un_nodes=2 降低門檻（預設 = 群組全員）。
+# check_mode: false：唯讀查詢，--check 之下也真的執行——否則 register 是
+# skipped 結果，後續引用 .stdout 的 task 會直接炸
+- name: 等待叢集節點進入 UN 狀態
+  ansible.builtin.command: docker exec scylladb nodetool status
+  register: scylla_nodetool_status
+  until: >-
+    scylla_nodetool_status.stdout_lines
+    | select('match', '^UN ')
+    | list | length >= (scylla_expected_un_nodes | default(groups['scylladb'] | length) | int)
+  retries: "{{ scylla_cluster_ok_retries }}"
+  delay: "{{ scylla_cluster_ok_delay }}"
+  changed_when: false
+  check_mode: false
+  run_once: true
+
+# ---------- 6. 認證與初始資料（run_once：只在第一台執行一次） ----------
+# 目標狀態：出廠帳號 cassandra 不存在、專屬超級使用者 scylla_admin 存在、
+# 應用帳號與 keyspace 就緒。以下全部先查現況再動作（command 冪等化標準手法），
+# 指令行含密碼 → no_log（失敗除錯時可暫時拿掉 no_log 重跑）。
+# cqlsh 帶 SSL_CERTFILE 驗證伺服器憑證（不是盲信 TLS）。
+#
+# 【首次部署的已知窗口（安全審查確認、風險接受）】自叢集成形（2/3 quorum）
+# 到下面 DROP ROLE cassandra 完成之間（數分鐘，含 IO 基準測試可到 ~10 分鐘），
+# 出廠 cassandra/cassandra 可從 VLAN 30 經 9042 TLS 登入。前提是攻擊者已在
+# 資料網段有立足點、且命中一次性的部署時刻；屆時叢集也還沒有任何資料。
+# 首次部署請在維護窗口執行；部署尾聲的「角色審計」task 會偵測窗口內
+# 被植入的持久角色。（對照 MIS：出廠帳號永久可登入——本 role 的修正）
+
+# 探測專屬管理帳號可否登入：成功 = 初始化早已完成；失敗 = 全新叢集。
+# retries：CQL 口剛開時 auth 子系統可能還在初始化，重試幾次再下「全新」結論，
+# 避免把暫時性失敗誤判成全新叢集、跑進出廠帳號分支製造更混亂的錯誤訊息
+- name: 探測管理帳號是否已可登入
+  ansible.builtin.command: >-
+    docker exec -e SSL_CERTFILE=/etc/scylla/certs/ca.crt scylladb
+    cqlsh {{ ansible_host }} {{ scylla_cql_port }} --ssl
+    -u {{ scylla_admin_user }} -p '{{ scylla_admin_password }}'
+    -e "SELECT release_version FROM system.local"
+  register: scylla_admin_probe
+  until: scylla_admin_probe.rc == 0
+  retries: 3
+  delay: 10
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  run_once: true
+  no_log: true
+
+# 只有全新叢集會走到這：用出廠帳號建立專屬超級使用者。
+# 若此步也失敗（出廠帳號已改、管理密碼又不對）= 人為介入過的未知狀態，
+# 讓它大聲失敗比猜測安全。
+- name: 以出廠帳號建立專屬超級使用者（僅全新叢集執行）
+  ansible.builtin.command: >-
+    docker exec -e SSL_CERTFILE=/etc/scylla/certs/ca.crt scylladb
+    cqlsh {{ ansible_host }} {{ scylla_cql_port }} --ssl
+    -u cassandra -p cassandra
+    -e "CREATE ROLE IF NOT EXISTS {{ scylla_admin_user }}
+        WITH SUPERUSER = true AND LOGIN = true
+        AND PASSWORD = '{{ scylla_admin_password }}'"
+  when: scylla_admin_probe.rc != 0
+  changed_when: true
+  run_once: true
+  no_log: true
+
+# check_mode: false：唯讀查詢（理由同上）
+- name: 查詢現有角色清單
+  ansible.builtin.command: >-
+    docker exec -e SSL_CERTFILE=/etc/scylla/certs/ca.crt scylladb
+    cqlsh {{ ansible_host }} {{ scylla_cql_port }} --ssl
+    -u {{ scylla_admin_user }} -p '{{ scylla_admin_password }}'
+    -e "LIST ROLES"
+  register: scylla_roles
+  changed_when: false
+  check_mode: false
+  run_once: true
+  no_log: true
+
+# 把 LIST ROLES 的表格輸出解析成「角色名清單」，後續用 in / not in 精確判斷。
+# 為什麼「不」用正則 is search('\bname\b')：Jinja 字串常值會把 \b 解析成
+# backspace 控制字元（不是正則的 word-boundary），pattern 因此永遠不匹配——
+# 實測踩過（見 README §17）：DROP cassandra 的 when 恆為 false → 出廠帳號沒被刪。
+# 清單成員判斷（split '|' 取第一欄）沒有這個轉義陷阱，精確且冪等。
+- name: 解析現有角色名清單
+  ansible.builtin.set_fact:
+    scylla_existing_roles: >-
+      {{ scylla_roles.stdout_lines | select('search', '[|]')
+         | map('split', '|') | map('first') | map('trim')
+         | reject('equalto', 'role') | reject('equalto', '') | list }}
+  run_once: true
+
+# 出廠帳號 = 眾所周知的 cassandra/cassandra，留著就是後門（MIS 的已知弱點）。
+# 專屬超級使用者已就緒，出廠帳號即刪。
+- name: 刪除出廠 cassandra 帳號
+  ansible.builtin.command: >-
+    docker exec -e SSL_CERTFILE=/etc/scylla/certs/ca.crt scylladb
+    cqlsh {{ ansible_host }} {{ scylla_cql_port }} --ssl
+    -u {{ scylla_admin_user }} -p '{{ scylla_admin_password }}'
+    -e "DROP ROLE IF EXISTS cassandra"
+  when: "'cassandra' in scylla_existing_roles"
+  changed_when: true
+  run_once: true
+  no_log: true
+
+# 應用帳號：不存在才建（LIST ROLES 判斷）；密碼隨後永遠 ALTER 對齊 vault——
+# vault 換密碼重跑本 playbook 即完成輪替，不需要手動 CQL。
+# （scylla_admin 自己的密碼輪替則相反，沒有自動路徑：先用舊密碼手動
+#   ALTER ROLE，再改 vault——別直接改 vault，probe 會失敗、play 會中止）
+- name: 建立應用帳號（不存在才建）
+  ansible.builtin.command: >-
+    docker exec -e SSL_CERTFILE=/etc/scylla/certs/ca.crt scylladb
+    cqlsh {{ ansible_host }} {{ scylla_cql_port }} --ssl
+    -u {{ scylla_admin_user }} -p '{{ scylla_admin_password }}'
+    -e "CREATE ROLE IF NOT EXISTS {{ scylla_app_user }}
+        WITH LOGIN = true AND PASSWORD = '{{ scylla_app_password }}'"
+  when: scylla_app_user not in scylla_existing_roles
+  changed_when: true
+  run_once: true
+  no_log: true
+
+# 冪等語意說明：ALTER 到「與 vault 相同的密碼」對外不可觀察，視為 no-op
+- name: 對齊應用帳號密碼與 vault
+  ansible.builtin.command: >-
+    docker exec -e SSL_CERTFILE=/etc/scylla/certs/ca.crt scylladb
+    cqlsh {{ ansible_host }} {{ scylla_cql_port }} --ssl
+    -u {{ scylla_admin_user }} -p '{{ scylla_admin_password }}'
+    -e "ALTER ROLE {{ scylla_app_user }} WITH PASSWORD = '{{ scylla_app_password }}'"
+  changed_when: false
+  run_once: true
+  no_log: true
+
+- name: 查詢現有 keyspace 清單
+  ansible.builtin.command: >-
+    docker exec -e SSL_CERTFILE=/etc/scylla/certs/ca.crt scylladb
+    cqlsh {{ ansible_host }} {{ scylla_cql_port }} --ssl
+    -u {{ scylla_admin_user }} -p '{{ scylla_admin_password }}'
+    -e "SELECT keyspace_name FROM system_schema.keyspaces"
+  register: scylla_ks_list
+  changed_when: false
+  check_mode: false
+  run_once: true
+  no_log: true
+
+# 單欄查詢輸出：逐列 trim，剔除表頭 / 分隔虛線 / "(N rows)" / 空行後即 keyspace 名清單。
+# 同樣用清單成員判斷、不用 \b 正則（理由見上「解析現有角色名清單」）。
+- name: 解析現有 keyspace 名清單
+  ansible.builtin.set_fact:
+    scylla_existing_keyspaces: >-
+      {{ scylla_ks_list.stdout_lines | map('trim')
+         | reject('equalto', 'keyspace_name')
+         | reject('match', '^[-]+$') | reject('match', '^[(]')
+         | reject('equalto', '') | list }}
+  run_once: true
+
+# NetworkTopologyStrategy + 明確 DC 名：SimpleStrategy 不認識 DC，
+# 日後加第二個 DC 時無法控制副本落點，一開始就用 NTS 是免費的保險。
+# table schema 是 app 的責任（migration），keyspace 這個「容器」是基礎設施的責任。
+- name: 建立應用 keyspace（NTS RF={{ scylla_keyspace_replication_factor }}）
+  ansible.builtin.command: >-
+    docker exec -e SSL_CERTFILE=/etc/scylla/certs/ca.crt scylladb
+    cqlsh {{ ansible_host }} {{ scylla_cql_port }} --ssl
+    -u {{ scylla_admin_user }} -p '{{ scylla_admin_password }}'
+    -e "CREATE KEYSPACE IF NOT EXISTS {{ item }}
+        WITH replication = {'class': 'NetworkTopologyStrategy',
+        '{{ scylla_dc }}': {{ scylla_keyspace_replication_factor }}}"
+  loop: "{{ scylla_keyspaces }}"
+  when: item not in scylla_existing_keyspaces
+  changed_when: true
+  run_once: true
+  no_log: true
+
+# GRANT 天生冪等（重複授權無副作用）；app 帳號只拿自己 keyspace 的權限，
+# 不是超級使用者——DDL 遷移用 app 帳號跑得動（ALL 含 CREATE/ALTER），
+# 但動不了別的 keyspace 與角色管理
+- name: 授權應用帳號存取應用 keyspace
+  ansible.builtin.command: >-
+    docker exec -e SSL_CERTFILE=/etc/scylla/certs/ca.crt scylladb
+    cqlsh {{ ansible_host }} {{ scylla_cql_port }} --ssl
+    -u {{ scylla_admin_user }} -p '{{ scylla_admin_password }}'
+    -e "GRANT ALL PERMISSIONS ON KEYSPACE {{ item }} TO {{ scylla_app_user }}"
+  loop: "{{ scylla_keyspaces }}"
+  changed_when: false
+  run_once: true
+  no_log: true
+
+# ---------- 7. 角色審計 ----------
+# 對應上面第 6 節註解的「首次部署窗口」：若有人在窗口內用出廠帳號植入了
+# 持久角色，DROP cassandra 後它仍存活且原本無人會發現——這裡把「叢集上
+# 只該有 scylla_admin 與 app 帳號」變成每次部署都驗的斷言，植入即現形。
+# 輸出只含角色名（無機密），assert 訊息可安全顯示。
+#
+# until + retries：ScyllaDB 2026.1 的角色資料由 Raft group0 管理（auth-v2），
+# 且各節點有 roles cache（預設數秒）。剛 DROP 的 cassandra 可能在快取內殘留
+# 一小段時間，重查會短暫仍看到它——重試到快取刷新即可，避免把「自己剛刪的帳號
+# 尚未從快取消失」誤判成「有人植入後門」。真的有非預期角色時，重試耗盡才失敗。
+- name: 部署後重查角色清單（重試以待 auth 快取刷新）
+  ansible.builtin.command: >-
+    docker exec -e SSL_CERTFILE=/etc/scylla/certs/ca.crt scylladb
+    cqlsh {{ ansible_host }} {{ scylla_cql_port }} --ssl
+    -u {{ scylla_admin_user }} -p '{{ scylla_admin_password }}'
+    -e "LIST ROLES"
+  register: scylla_roles_audit
+  until: >-
+    scylla_roles_audit.stdout_lines | select('search', '[|]')
+    | map('split', '|') | map('first') | map('trim')
+    | reject('equalto', 'role') | reject('equalto', '')
+    | difference([scylla_admin_user, scylla_app_user]) | length == 0
+  retries: 6
+  delay: 5
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  run_once: true
+  no_log: true
+
+# until 若在重試耗盡後仍不滿足（failed_when:false 讓上一步不直接中止），
+# 這裡以可讀訊息明確斷言並列出「多出來的角色名」。解析同款 split '|' 取第一欄。
+- name: 角色審計：只允許預期角色存在
+  ansible.builtin.assert:
+    that: >-
+      scylla_roles_audit.stdout_lines
+      | select('search', '[|]')
+      | map('split', '|') | map('first') | map('trim')
+      | reject('equalto', 'role') | reject('equalto', '')
+      | difference([scylla_admin_user, scylla_app_user])
+      | length == 0
+    fail_msg: >-
+      叢集上存在預期之外的角色（可能是首次部署窗口內被植入，或有人繞過
+      Ansible 手動建帳號）：{{ scylla_roles_audit.stdout_lines
+      | select('search', '[|]') | map('split', '|') | map('first') | map('trim')
+      | reject('equalto', 'role') | reject('equalto', '')
+      | difference([scylla_admin_user, scylla_app_user]) | list }}
+    success_msg: "角色審計通過：僅 {{ scylla_admin_user }} 與 {{ scylla_app_user }}"
+  run_once: true

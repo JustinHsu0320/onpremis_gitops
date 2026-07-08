@@ -1,0 +1,24 @@
+---
+# =============================================================================
+# 33-scylladb.yml — ScyllaDB 寬欄資料層（信件/附件冷資料）
+#
+# 3 台專用節點（scylla-01..03，VLAN 30）各跑 1 個 scylla 容器：
+# Docker、host network、內部 7001 mTLS、對 app 9042 TLS、NTS RF=3。
+# 拓撲承襲 MIS 正式環境（scylladb-1..3）三個月的驗證，修正其反模式
+# （:latest、developer-mode、手動 docker run、出廠帳號未刪——清單見
+# roles/scylla/defaults 頭註）。
+#
+# 前置依賴（由 site.yml 順序保證）：
+#   05-block-storage（/var/lib/scylla 獨立 XFS 碟）→ 08-docker → 10-pki
+#
+# 滾動變更（junior 必讀）：本 playbook 全量跑會讓三台的設定變更「同時」
+# recreate 容器 = CQL 全斷。prod 憑證輪替/調參請 --limit 逐台滾動，
+# 每台之間確認 nodetool status 全 UN（詳見 roles/scylla/handlers 註解）。
+# =============================================================================
+# role 名為 scylla（變數前綴 scylla_*）、群組名為 scylladb——
+# 同 patroni role ↔ postgres 群組的既有慣例
+- name: ScyllaDB 3 節點叢集
+  hosts: scylladb
+  tags: [scylladb]
+  roles:
+    - role: scylla

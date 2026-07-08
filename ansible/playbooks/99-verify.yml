@@ -218,6 +218,69 @@
         success_msg: "KeyDB：跨節點讀寫（cluster redirect）通過"
       run_once: true
 
+# ---------- 5b. ScyllaDB：全員 UN、TLS+認證下的跨節點 QUORUM 讀寫 ----------
+- name: 驗證 ScyllaDB 叢集
+  hosts: scylladb
+  tags: [verify, verify-scylladb]
+  tasks:
+    - name: 取得叢集狀態（nodetool status）
+      ansible.builtin.command: docker exec scylladb nodetool status
+      register: scylla_status
+      changed_when: false
+      run_once: true
+
+    - name: 斷言：所有節點都是 UN（Up/Normal）
+      ansible.builtin.assert:
+        that: >-
+          scylla_status.stdout_lines | select('match', '^UN ')
+          | list | length == (groups['scylladb'] | length)
+        fail_msg: "ScyllaDB 叢集有節點不在 UN 狀態：{{ scylla_status.stdout }}"
+        success_msg: "ScyllaDB：{{ groups['scylladb'] | length }}/{{ groups['scylladb'] | length }} 節點 UN"
+      run_once: true
+
+    # 以「應用帳號」走 TLS+密碼寫入（不是管理帳號）：一次驗完
+    # 憑證鏈、PasswordAuthenticator、keyspace 授權三件事。
+    # 探測表用 IF NOT EXISTS 常駐（反覆 create/drop 會累積 schema 變更歷史）、
+    # 資料列帶 TTL 自我清理。CONSISTENCY QUORUM 是 app 的實際讀寫等級。
+    - name: 從第一台節點以應用帳號寫入探測列（QUORUM）
+      ansible.builtin.command: >-
+        docker exec -e SSL_CERTFILE=/etc/scylla/certs/ca.crt scylladb
+        cqlsh {{ ansible_host }} {{ scylla_cql_port }} --ssl
+        -u {{ scylla_app_user }} -p '{{ scylla_app_password }}'
+        -e "CONSISTENCY QUORUM;
+            CREATE TABLE IF NOT EXISTS {{ scylla_keyspaces | first }}.ansible_verify
+              (k text PRIMARY KEY, v text);
+            INSERT INTO {{ scylla_keyspaces | first }}.ansible_verify (k, v)
+              VALUES ('probe', 'pong') USING TTL 120"
+      changed_when: true
+      run_once: true
+      no_log: true
+
+    - name: 從最後一台節點讀回（QUORUM）
+      ansible.builtin.command: >-
+        docker exec -e SSL_CERTFILE=/etc/scylla/certs/ca.crt scylladb
+        cqlsh {{ hostvars[groups['scylladb'][-1]].ansible_host }} {{ scylla_cql_port }} --ssl
+        -u {{ scylla_app_user }} -p '{{ scylla_app_password }}'
+        -e "CONSISTENCY QUORUM;
+            SELECT v FROM {{ scylla_keyspaces | first }}.ansible_verify WHERE k = 'probe'"
+      register: scylla_read
+      changed_when: false
+      delegate_to: "{{ groups['scylladb'][-1] }}"
+      run_once: true
+      no_log: true
+
+    - name: 斷言：跨節點 QUORUM 讀寫一致
+      ansible.builtin.assert:
+        that: "'pong' in scylla_read.stdout"
+        fail_msg: "ScyllaDB 跨節點讀寫失敗（QUORUM 湊不齊或授權異常）"
+        success_msg: "ScyllaDB：TLS + 應用帳號 + 跨節點 QUORUM 讀寫通過"
+      run_once: true
+
+    - name: 每台節點的原生 metrics 端點可抓
+      ansible.builtin.uri:
+        url: "http://{{ ansible_host }}:{{ scylla_prometheus_port }}/metrics"
+        return_content: false
+
 # ---------- 6. NFS：跨節點附件共享（規劃書修正的核心痛點） ----------
 - name: 驗證 NFS 附件共享
   hosts: app
@@ -333,11 +396,21 @@
         url: "http://127.0.0.1:3000/api/health"
       run_once: true
 
-    - name: 抓取目標的健康比例
+    # until + retries：剛部署完的 Prometheus 還沒跑完第一輪抓取，所有 target 會
+    # 短暫顯示 down（連自我抓取 job=prometheus 都是）。這不是服務故障、是暖機——
+    # 輪詢到 >=90% up 為止（scrape_interval 15s，數輪內收斂）。全鏈部署（site.yml
+    # 末段接 99-verify）時這段最容易誤報，故在「查詢」層就等它就緒，
+    # 讓下面的 assert 面對的是穩定狀態。
+    - name: 抓取目標的健康比例（輪詢到 Prometheus 首輪抓取完成）
       ansible.builtin.uri:
         url: "http://127.0.0.1:9090/api/v1/targets?state=active"
         return_content: true
       register: prom_targets
+      until: >-
+        (prom_targets.json.data.activeTargets | selectattr('health', 'equalto', 'up') | list | length)
+        >= (prom_targets.json.data.activeTargets | length * 0.9)
+      retries: 12
+      delay: 5
       run_once: true
 
     - name: 斷言：>=90% 目標 up（容忍個別節點短暫抖動）
@@ -378,5 +451,5 @@
       ansible.builtin.debug:
         msg: >-
           ✅ 全鏈驗證通過：etcd quorum / Patroni HA / PgBouncer RW-RO 分流 /
-          RabbitMQ quorum queue 收發 / KeyDB 3M+3R / NFS 跨節點共享 /
-          邊界 VIP TLS / Egress 白名單 / 監控 / 憑證效期。
+          RabbitMQ quorum queue 收發 / KeyDB 3M+3R / ScyllaDB 3 節點 QUORUM 讀寫 /
+          NFS 跨節點共享 / 邊界 VIP TLS / Egress 白名單 / 監控 / 憑證效期。

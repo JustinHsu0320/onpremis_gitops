@@ -1,5 +1,5 @@
 # =============================================================================
-# lab/docker-compose.yml — 13 節點實驗室拓撲（1:1 對應 prod 的 VM 與 VLAN 規劃）
+# lab/docker-compose.yml — 16 節點實驗室拓撲（1:1 對應 prod 的 VM 與 VLAN 規劃）
 #
 # ┌─ 網路模擬 ────────────────────────────────────────────────────────────────┐
 # │ 每個 VLAN = 一個 Docker bridge network，網段與 prod 完全相同。            │
@@ -13,7 +13,8 @@
 # │ 3. 容器共用宿主 kernel：is_container=true 跳過 kernel 級調校              │
 # └───────────────────────────────────────────────────────────────────────────┘
 #
-# 資源註記：13 個 systemd 容器 + 服務全開約需 5-6GB RAM（Docker Desktop 建議 8GB）
+# 資源註記：16 個 systemd 容器 + 服務全開約需 8-9GB RAM（Docker Desktop 建議 12GB；
+# 其中 3 台 scylla 各吃 ~1.5GB——嫌重可 docker compose stop scylla-0{1..3} 單獨關掉）
 # =============================================================================
 ---
 name: email-proxy-lab
@@ -55,6 +56,9 @@ volumes:
   dind-app-01: {}
   dind-app-02: {}
   dind-app-03: {}
+  dind-scylla-01: {}
+  dind-scylla-02: {}
+  dind-scylla-03: {}
   dind-mgmt-01: {}
   # nfs-01 的匯出目錄：kernel nfsd 不能匯出容器的 overlayfs rootfs，
   # named volume 底層是 ext4 —— 正好對應 prod「附件放獨立資料碟」的設計
@@ -170,6 +174,40 @@ services:
     hostname: mq-03
     networks:
       vlan30: { ipv4_address: 10.20.30.23 }
+
+  # ---------- VLAN 30 資料層：ScyllaDB ----------
+  # scylla 節點跑 Docker（scylla 容器）→ 需要 DinD named volume；
+  # 只掛 vlan30：app 從自己的 vlan30 腳（10.20.30.11x）連 9042，
+  # mgmt-01 從 .254 抓 9180 metrics
+  scylla-01: &scylla-node
+    <<: *node
+    container_name: email-proxy-scylla-01
+    hostname: scylla-01
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      - dind-scylla-01:/var/lib/docker
+    networks:
+      vlan30: { ipv4_address: 10.20.30.31 }
+
+  scylla-02:
+    <<: *scylla-node
+    container_name: email-proxy-scylla-02
+    hostname: scylla-02
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      - dind-scylla-02:/var/lib/docker
+    networks:
+      vlan30: { ipv4_address: 10.20.30.32 }
+
+  scylla-03:
+    <<: *scylla-node
+    container_name: email-proxy-scylla-03
+    hostname: scylla-03
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      - dind-scylla-03:/var/lib/docker
+    networks:
+      vlan30: { ipv4_address: 10.20.30.33 }
 
   # ---------- VLAN 40 儲存層 ----------
   # NFS kernel server：nfsd 模組由 Docker Desktop 的 LinuxKit kernel 提供（已驗證）

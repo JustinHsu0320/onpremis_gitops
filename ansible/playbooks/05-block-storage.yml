@@ -14,7 +14,7 @@
 # 容器沒有 block device，本階段對實驗室是空操作。
 # =============================================================================
 - name: 格式化並掛載資料碟
-  hosts: postgres:rabbitmq:nfs:monitoring:gitlab
+  hosts: postgres:rabbitmq:scylladb:nfs:monitoring:gitlab
   tags: [bootstrap, storage, block-storage]
   roles:
     - role: block_storage

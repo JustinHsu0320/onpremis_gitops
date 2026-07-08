@@ -1,0 +1,67 @@
+{#
+  docker-compose.yml.j2 — 每台 scylladb 節點各跑 1 個 scylla 容器
+
+  為什麼用 host network？
+    Scylla 節點的位址是自己 gossip 出去的（broadcast_address），bridge NAT 下
+    「容器看到的自己」與「別人連得到的位址」不一致；host network 一次消滅
+    這個問題，埠直接綁在節點 IP 上（MIS 同做法驗證三個月）。
+
+  為什麼「不用」privileged？（對照 MIS 的修正）
+    MIS 開 privileged 只是圖省事。scylla 容器實際需要的只有 SYS_NICE
+    （Seastar 調執行緒優先權/親和性）；最小權限給到剛好即可。
+
+  機密注意：健檢走本機 REST API 的 nodetool，不含密碼——本檔無機密（0644）。
+#}
+# ===== {{ ansible_managed }} =====
+services:
+  scylladb:
+    # 版本鎖定於 defaults/main.yml（MIS 驗證過的 2026.1 版本線）；升級走 PR
+    image: "{{ scylla_image }}"
+    container_name: scylladb
+    network_mode: host
+    restart: unless-stopped
+    # entrypoint 參數與 conf/scylla.yaml 的位址欄位同源（見 scylla.yaml.j2 頭註）：
+    # --smp/--memory 是 scylla 自身用量、與下方容器 limit 從同組變數推導
+    # （修正 MIS「--memory 1G 但 limit 4G」的兩套數字）；
+    # --developer-mode 映像預設是 1，必須「顯式」關掉才是正式模式
+    command: >-
+      --seeds {{ groups['scylladb'] | sort | map('extract', hostvars, 'ansible_host') | join(',') }}
+      --listen-address {{ ansible_host }}
+      --rpc-address {{ ansible_host }}
+      --broadcast-address {{ ansible_host }}
+      --broadcast-rpc-address {{ ansible_host }}
+      --api-address 127.0.0.1
+      --smp {{ scylla_smp }}
+      --memory {{ scylla_memory }}
+      --overprovisioned {{ '1' if scylla_overprovisioned else '0' }}
+      --developer-mode {{ '1' if scylla_developer_mode else '0' }}
+    # 最小權限：只補 Seastar 需要的執行緒排程能力
+    cap_add:
+      - SYS_NICE
+    # Seastar 每 shard 開大量檔案/socket；與 common role 的主機 nofile 上限對齊
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    # 容器上限 = scylla 自身用量 + ~25% 輔助程序（nodetool/健檢）緩衝，
+    # 同源變數推導，見 defaults/main.yml 的資源配置註解
+    cpus: {{ scylla_smp }}
+    mem_limit: {{ scylla_container_memory_limit }}
+    volumes:
+      # conf / tls 唯讀：容器內任何程式都不該改它們（單一事實來源在 Ansible）
+      - {{ scylla_home }}/conf/scylla.yaml:/etc/scylla/scylla.yaml:ro
+      - {{ scylla_home }}/conf/cassandra-rackdc.properties:/etc/scylla/cassandra-rackdc.properties:ro
+      - {{ scylla_home }}/tls:/etc/scylla/certs:ro
+      # 資料根整個掛入（data/commitlog/hints/view_hints/saved_caches 都在其下），
+      # 宿主側是 block_storage 掛好的獨立 XFS 資料碟
+      - {{ scylla_data_root }}:/var/lib/scylla
+    healthcheck:
+      # nodetool statusbinary 走本機 REST API（127.0.0.1:{{ scylla_api_port }}），
+      # 回 running = CQL native transport 真的在服務——比 MIS 的「TCP 摸 API 埠」
+      # 更接近使用者視角，又不用把密碼寫進 compose（cqlsh 級驗證由 99-verify 做）
+      test: ["CMD-SHELL", "nodetool statusbinary | grep -q running"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      # 非 developer mode 首次啟動含磁碟 IO 基準測試，給足暖機時間
+      start_period: 300s

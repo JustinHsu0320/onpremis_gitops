@@ -50,6 +50,8 @@ patroni_rest_port: 8008
 rabbitmq_amqps_port: 5671
 keydb_port: 6379                  # master（TLS-only）
 keydb_replica_port: 6380          # replica（TLS-only；cluster bus 為 port+10000）
+scylla_cql_port: 9042             # ScyllaDB CQL（TLS；gocql 另會自動用 19042 shard-aware，非契約）
+scylla_prometheus_port: 9180      # ScyllaDB 原生 metrics（monitoring 抓取）
 squid_port: 3128
 
 # ---------- 路徑契約（CONVENTIONS.md §4） ----------
@@ -98,6 +100,8 @@ rabbitmq_admin_password: "{{ vault_rabbitmq_admin_password }}"
 rabbitmq_app_user_password: "{{ vault_rabbitmq_app_user_password }}"
 rabbitmq_erlang_cookie: "{{ vault_rabbitmq_erlang_cookie }}"
 keydb_password: "{{ vault_keydb_password }}"
+scylla_admin_password: "{{ vault_scylla_admin_password }}"
+scylla_app_password: "{{ vault_scylla_app_password }}"
 vrrp_pass_svc: "{{ vault_vrrp_pass_svc }}"
 vrrp_pass_egress: "{{ vault_vrrp_pass_egress }}"
 vrrp_pass_pg: "{{ vault_vrrp_pass_pg }}"

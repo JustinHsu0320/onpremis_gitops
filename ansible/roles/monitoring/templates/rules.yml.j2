@@ -137,6 +137,26 @@ groups:
           summary: "{% raw %}KeyDB master {{ $labels.instance }} 目前沒有 replica 備援{% endraw %}"
           description: "{% raw %}{{ $labels.instance }} 的 connected_slaves = {{ $value }}（預期 >=1）。此 shard 正在無備援狀態運行，再掉一個節點該 slot 就不可用。Runbook：keydb-cli cluster nodes 找失聯 replica，檢查對應容器/節點。{% endraw %}"
 
+      # ---------- ScyllaNodeNotNormal：節點不在 NORMAL 運行模式 ----------
+      # scylla_node_operation_mode 是節點自我回報的狀態機（3=NORMAL；
+      # 1/2=啟動/加入中、>3=leaving/draining/decommission 等離群狀態）。
+      # RF=3 + QUORUM 之下一台不 NORMAL 服務仍可用（所以 warning 不叫醒人），
+      # 但此時「再倒一台就 QUORUM 不足」——與 KeyDBMasterNoReplica 同一種
+      # 「無備援裸奔」告警哲學。for: 10m 容忍重啟後的 IO 基準測試與
+      # 計畫性滾動維運（逐台 --limit 時每台的暫時非 NORMAL 屬預期）。
+      # 三台全滅時本指標整組消失、expr 無輸出不觸發——那由 InstanceDown
+      # （job=scylla × 3）負責叫人。
+      # Runbook：該機 docker exec scylladb nodetool status 看叢集視圖；
+      # 卡在 JOINING 查 7001 互通與憑證，DRAINING/LEAVING 確認是否有人在做維運。
+      - alert: ScyllaNodeNotNormal
+        expr: scylla_node_operation_mode != 3
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{% raw %}ScyllaDB 節點 {{ $labels.instance }} 不在 NORMAL 狀態{% endraw %}"
+          description: "{% raw %}operation_mode = {{ $value }}（預期 3=NORMAL）持續 10 分鐘。此時再故障一台 QUORUM 即不足。Runbook：nodetool status 看叢集視圖，查 7001 mTLS 互通與該節點 docker logs。{% endraw %}"
+
       # ---------- NodeFilesystemAlmostFull：磁碟可用空間 < 15% ----------
       # avail（非 root 保留的 free）/ size < 0.15 持續 10 分鐘。
       # 排除揮發性/唯讀檔案系統：tmpfs/ramfs 是記憶體、overlay 是容器層、

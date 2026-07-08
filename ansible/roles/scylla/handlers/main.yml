@@ -1,0 +1,27 @@
+---
+# =============================================================================
+# roles/scylla/handlers/main.yml
+# =============================================================================
+
+# 為什麼是 recreate 而不是 restart？
+#   conf 與 tls 是「volume 掛進去的檔案」，內容變了 docker compose 偵測不到
+#   （compose 只比對 image / 容器設定），必須 recreate: always 強制重建，
+#   容器才會重讀新設定與新憑證。
+#
+# 影響（junior 必讀）：ScyllaDB 是「資料層」，跟 keydb 快取不同——
+#   三台同時 recreate = CQL 服務全斷（資料安全無虞，但 app 讀寫全失敗）。
+#   RF=3 + QUORUM 之下「一次只倒一台」對 app 完全透明，所以 prod 的
+#   憑證輪替 / 調參請用 `ansible-playbook ... --limit scylla-01` 逐台滾動，
+#   每台之間確認 `nodetool status` 全 UN 再動下一台。
+#   另注意：非 developer mode 下容器重建會重跑磁碟 IO 基準測試（1-2 分鐘），
+#   節點回到 UN 比一般服務慢，滾動時要有耐心。
+# throttle: 1 = 三台的 recreate 至少「錯開執行」而非同刻齊發——這只是
+# 減災不是護欄：它不等前一台回到 UN 才動下一台（那需要 play 層 serial + 健檢），
+# 快速連續重建仍可能同時有 2 台在暖機。真正安全的滾動仍是上述 --limit 流程。
+- name: Restart scylladb
+  community.docker.docker_compose_v2:
+    project_src: "{{ scylla_home }}"
+    state: present
+    recreate: always
+  listen: restart scylladb
+  throttle: 1

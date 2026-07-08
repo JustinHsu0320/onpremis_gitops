@@ -28,7 +28,7 @@ cluster    = "CL-EMAIL-PROXY"     # 運算叢集：>= 3 台 ESXi，HA + DRS 已�
 vds_name   = "vds-prod-01"        # 既存分散式交換器（uplink trunk 已含 VLAN 10/20/30/40/50/99）
 
 datastore     = "ds-prod-sas-01"  # 一般碟：lb/app/mq/nfs/mgmt/gitlab/runner
-datastore_ssd = "ds-prod-nvme-01" # SSD/NVMe：pg-01..03 整台（etcd/WAL fsync 敏感）
+datastore_ssd = "ds-prod-nvme-01" # SSD/NVMe：pg-01..03 與 scylla-01..03 整台（fsync / LSM 敏感）
 
 # ubuntu-26.04 cloud image 做成的 template：
 # 必含 cloud-init（VMware guestinfo datasource）+ open-vm-tools，OS 碟掛 PVSCSI
