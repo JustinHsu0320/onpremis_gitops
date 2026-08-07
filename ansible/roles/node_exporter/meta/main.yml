@@ -3,7 +3,7 @@
 # roles/node_exporter/meta/main.yml
 # =============================================================================
 galaxy_info:
-  author: email-proxy-infra
+  author: platform-infra
   description: >-
     Prometheus node_exporter（Ubuntu 官方 archive 套件、全主機部署、
     監聽 :9100 供 mgmt-01 的 Prometheus 抓取）。

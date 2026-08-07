@@ -6,21 +6,54 @@
 
 # ---------- Patroni / PostgreSQL ----------
 pg_version: "18"
-pg_cluster_scope: email-proxy-pg          # Patroni scope：整個叢集的識別名
-pg_app_db: email_proxy
-pg_app_user: email_proxy
+# Patroni scope：平台共用叢集的識別名。★ 對「已 bootstrap」的叢集改 scope =
+# DCS 視為全新叢集；只能在部署前改（CONVENTIONS §4 歷史相容注意）
+pg_cluster_scope: pg-main
 
 # 跨 role 共用的「單一事實來源」（patroni / pgbouncer / pgbackrest 都引用，
 # 不放 role defaults——兩個 role 各自 default 同一件事，遲早分叉）
-pg_data_dir: /var/lib/postgresql/18/email-proxy
-# WAL 獨立碟（規劃書 §2.3：WAL 順序寫，與 data 隨機讀寫分開，避免 IO 互搶）。
+pg_data_dir: /var/lib/postgresql/18/main
+# WAL 獨立碟（WAL 順序寫，與 data 隨機讀寫分開，避免 IO 互搶）。
 # prod → 獨立 50G VMDK 掛到此路徑；lab（容器無獨立碟）→ 空字串 = WAL 與 data 同碟。
 # 用 is_container 自動切換，確保 lab 的 Patroni initdb 不會 --waldir 到未掛載的路徑
 pg_wal_dir: "{{ '' if (is_container | default(false)) else ('/var/lib/postgresql/' ~ pg_version ~ '/wal') }}"
-pgbackrest_stanza: email-proxy            # patroni 的 archive_command 與 pgbackrest 設定共用
+# patroni 的 archive_command 與 pgbackrest 設定共用。
+# ★ 對「已有備份鏈」的叢集改 stanza = 備份鏈斷代、PITR 視窗歸零
+pgbackrest_stanza: pg-main
 pgbouncer_auth_user: pgbouncer_auth       # patroni 建帳號、pgbouncer 拿來連 —— 必須同名
 
-# ---------- 資料碟掛載（block_storage role，規劃書 §2.3；lab 因 is_container 跳過） ----------
+# ---------- 資料庫清單（多專案平台的核心迭代點，CONVENTIONS §10） ----------
+# pg_databases = 平台資料庫 + 各專案宣告（projects.*.pg），統一 shape：
+#   { db, user, password, extensions }
+# 消費者：roles/patroni/tasks/app_db.yml（user / db / CONNECT / extensions）、
+#         roles/pgbouncer 的 [databases] 段。
+# 含密碼引用 → 任何迭代它的 task 必須 loop label + no_log（CONVENTIONS §8-5）。
+#
+# 平台資料庫：不屬於任何專案的基礎服務所需（第一個住戶：SeaweedFS filer 元資料
+# ——這也是 34-seaweedfs 依賴 30-postgres 的原因）
+pg_platform_databases:
+  - db: seaweedfs
+    user: seaweedfs
+    password: "{{ seaweedfs_pg_password }}"
+    extensions: []
+
+pg_databases: >-
+  {{ pg_platform_databases
+     + (projects | dict2items | sort(attribute='key')
+        | selectattr('value.pg', 'defined')
+        | map(attribute='value.pg') | list) }}
+
+# ---------- PG extensions（平台能力選單） ----------
+# 套件層：pgvector 走 Ubuntu 26.04 archive（ADR-2 正軌）；pg_search（ParadeDB
+# BM25）走 GitHub release .deb（patroni role 的例外通道，版本/URL 見 role
+# defaults；egress 白名單零變更——github 兩網域已放行）。
+# 套件裝好只是 .so 全節點就位；真正 CREATE EXTENSION 由各專案在
+# projects.<name>.pg.extensions 宣告（例：[vector, pg_search]）
+patroni_extension_packages:
+  - "postgresql-{{ pg_version }}-pgvector"
+patroni_pg_search_enabled: true
+
+# ---------- 資料碟掛載（block_storage role；lab 因 is_container 跳過） ----------
 # 對應 terraform/environments/prod/main.tf 的 pg_extra_disks（200/50/10 GB，
 # 各自獨立 PVSCSI 控制器）。size_gb 是「認碟」依據，三顆容量互異可精確區分用途。
 # owner 交給 patroni/etcd role 收斂（此階段服務帳號尚未建立，見 block_storage defaults）

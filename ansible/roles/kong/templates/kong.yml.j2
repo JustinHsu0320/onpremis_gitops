@@ -1,0 +1,108 @@
+{#
+  kong.yml.j2 — Kong 宣告式組態（DB-less 的唯一真值）
+
+  資料來源：projects 登記簿（CONVENTIONS.md §10.3 的 kong 段）。
+  每個宣告了 kong 段的專案：
+    service  → Kong service（name = <project>-<service>，host 指向同名 upstream）
+    upstream → targets 由 groups[backend_group] 展開成「節點 IP:port」
+               ★ 一律用 IP、不可用主機名：host network 容器不共享宿主 /etc/hosts
+               （ADR-5 的解析進不了容器），寫主機名 = 上游永遠解析失敗。
+    routes   → hosts/paths（北向由邊界 HAProxy 以相同 host 分流進 be_kong）
+    plugins  → service/route 層原樣落地
+  所有物件掛 tags: [<project>]——指標歸戶與除錯都靠它。
+
+  零專案用 Kong 時本檔仍是合法組態（只有全域插件）——組件選單語意。
+  本檔可能含 consumer 憑證（機密）→ 佈署為 0600 + no_log。
+#}
+# ===== {{ ansible_managed }} =====
+_format_version: "3.0"
+_transform: true
+
+# 全域插件（prometheus 是監控契約，必在——monitoring 的 kong job 抓 /metrics）
+plugins:
+{% for kong_plugin in kong_global_plugins %}
+  - name: {{ kong_plugin.name }}
+{% if kong_plugin.config is defined %}
+    config:
+      {{ kong_plugin.config | to_nice_yaml(indent=2) | trim | indent(6) }}
+{% endif %}
+{% endfor %}
+
+{% set kong_projects = projects | dict2items | sort(attribute='key')
+                       | selectattr('value.kong', 'defined') | list %}
+{% if kong_projects | length > 0 %}
+services:
+{% for prj in kong_projects %}
+{% for svc in prj.value.kong.services %}
+  # ---------- 專案 {{ prj.key }} / 服務 {{ svc.name }} ----------
+  - name: {{ prj.key }}-{{ svc.name }}
+    protocol: {{ svc.protocol | default('http') }}
+    host: {{ prj.key }}-{{ svc.name }}-upstream
+    port: {{ svc.backend_port }}
+    tags: ["{{ prj.key }}"]
+    routes:
+{% for route in svc.routes %}
+      - name: {{ prj.key }}-{{ svc.name }}-{{ route.name }}
+        tags: ["{{ prj.key }}"]
+{% if route.hosts is defined %}
+        hosts: {{ route.hosts | to_json }}
+{% endif %}
+{% if route.paths is defined %}
+        paths: {{ route.paths | to_json }}
+{% endif %}
+        strip_path: {{ route.strip_path | default(false) | to_json }}
+{% if route.plugins is defined and route.plugins | length > 0 %}
+        plugins:
+          {{ route.plugins | to_nice_yaml(indent=2) | trim | indent(10) }}
+{% endif %}
+{% endfor %}
+{% if svc.plugins is defined and svc.plugins | length > 0 %}
+    plugins:
+      {{ svc.plugins | to_nice_yaml(indent=2) | trim | indent(6) }}
+{% endif %}
+{% endfor %}
+{% endfor %}
+
+upstreams:
+{% for prj in kong_projects %}
+{% for svc in prj.value.kong.services %}
+  - name: {{ prj.key }}-{{ svc.name }}-upstream
+    tags: ["{{ prj.key }}"]
+    # Kong 自己做後端摘除（主動健檢），與邊界 HAProxy 的健檢哲學一致
+    healthchecks:
+      active:
+        type: {{ svc.protocol | default('http') }}
+        http_path: {{ svc.health_path | default('/') }}
+        healthy:
+          interval: {{ kong_upstream_hc_interval }}
+          successes: {{ kong_upstream_hc_rise }}
+        unhealthy:
+          interval: {{ kong_upstream_hc_interval }}
+          http_failures: {{ kong_upstream_hc_fall }}
+          tcp_failures: {{ kong_upstream_hc_fall }}
+          timeouts: {{ kong_upstream_hc_fall }}
+    targets:
+{% for backend_host in groups[svc.backend_group] | default([]) | sort %}
+      # IP 而非主機名（見檔頭註解）；CONVENTIONS §1 的 inventory 展開慣例
+      - target: "{{ hostvars[backend_host].ansible_host }}:{{ svc.backend_port }}"
+{% endfor %}
+{% endfor %}
+{% endfor %}
+
+{% set kong_consumers = kong_projects
+   | selectattr('value.kong.consumers', 'defined')
+   | map(attribute='value.kong.consumers') | flatten | list %}
+{% if kong_consumers | length > 0 %}
+consumers:
+{% for prj in kong_projects %}
+{% for consumer in prj.value.kong.consumers | default([]) %}
+  - username: {{ consumer.username }}
+    tags: ["{{ prj.key }}"]
+{% if consumer.key_auth_key is defined %}
+    keyauth_credentials:
+      - key: "{{ consumer.key_auth_key }}"
+{% endif %}
+{% endfor %}
+{% endfor %}
+{% endif %}
+{% endif %}

@@ -1,0 +1,73 @@
+# {{ ansible_managed }}
+# =============================================================================
+# haproxy-seaweedfs.cfg — S3 物件儲存層 HAProxy（profile=seaweedfs，sw-01..03 各一份）
+#
+# 拓撲：
+#
+#   S3 客戶端（app / pgBackRest / mc）
+#     │  https://s3.{{ domain }}:{{ seaweedfs_s3_port }}（path-style；/etc/hosts 無萬用解析，
+#     │  virtual-host style 的 *.s3 名稱做不到——客戶端請設 force path style）
+#     ▼
+#   listen s3（TCP passthrough——TLS 由 weed s3 自持 seaweedfs-server 憑證，
+#     │        SAN 含 s3 名稱/VIP IP，客戶端 verify 過得了；LB 不重複終止 TLS，
+#     │        憑證管理單點留在 SeaweedFS）
+#     ▼
+#   sw-01..03 節點 IP:{{ seaweedfs_s3_port }}（filer 元資料在 PG、三台 s3 等價，
+#                     連到任一健康節點都能存取所有 bucket）
+#
+# 埠不衝突的原因：weed s3 綁「節點 IP」的 8333，HAProxy 綁「VIP」的 8333——
+# 同埠不同 IP（埠共存原則，CONVENTIONS §3）。BACKUP 節點靠
+# net.ipv4.ip_nonlocal_bind=1 預綁 VIP 埠。
+# =============================================================================
+
+global
+    maxconn {{ haproxy_s3_maxconn }}
+    # 日誌走 stdout：haproxy.service 以 -Ws 前景執行，由 systemd-journald 收容
+    log stdout local0 info
+    user haproxy
+    group haproxy
+    chroot /var/lib/haproxy
+    # expose-fd listeners：無縫 reload（監聽 fd 交棒新行程，reload 不掉 SYN）
+    stats socket /run/haproxy/admin.sock mode 660 level admin expose-fd listeners
+
+defaults
+    log global
+    mode tcp
+    option tcplog
+    option dontlognull
+    timeout connect {{ haproxy_s3_timeout_connect }}
+    # S3 大物件上傳/下載是長傳輸：單一 PUT 數 GB 可能拖數十分鐘無「來回」，
+    # 逾時放寬到 30m——設太短會把「還在傳只是慢」的傳輸斬斷
+    timeout client {{ haproxy_s3_timeout_client }}
+    timeout server {{ haproxy_s3_timeout_server }}
+
+# -----------------------------------------------------------------------------
+# S3：{{ s3_vip }}:{{ seaweedfs_s3_port }} → sw 節點（TCP passthrough）
+# -----------------------------------------------------------------------------
+listen s3
+    bind {{ s3_vip }}:{{ seaweedfs_s3_port }}
+    mode tcp
+    # roundrobin 把連線鋪到三個節點：filer/s3 無本地狀態（元資料在 PG），
+    # 三台等價——大流量傳輸的頻寬與 CPU 自然攤平
+    balance roundrobin
+    # L4 健檢（TCP 握手成功即活著）：8333 是 TLS 流量，HAProxy 看不進內容；
+    # 深度健康（volume/master 狀態）由 weed 的 :9327 metrics 在監控層把關
+    option tcp-check
+    default-server inter {{ haproxy_s3_check_inter }} fall {{ haproxy_s3_check_fall }} rise {{ haproxy_s3_check_rise }}
+{% for h in groups['seaweedfs'] | default([]) %}
+    server {{ h }} {{ hostvars[h].ansible_host }}:{{ seaweedfs_s3_port }} check
+{% endfor %}
+
+# -----------------------------------------------------------------------------
+# stats / metrics（CONVENTIONS.md §3：節點 IP:{{ haproxy_stats_port }}）
+# -----------------------------------------------------------------------------
+frontend stats
+    # 綁節點 IP：三台 sw 的 HAProxy 狀態各自獨立可看（Prometheus 逐台抓）
+    bind {{ ansible_host }}:{{ haproxy_stats_port }}
+    # defaults 是 tcp，stats 頁面與 exporter 是 HTTP 服務 → 這裡覆寫回 http
+    mode http
+    stats enable
+    stats uri /stats
+    stats refresh {{ haproxy_stats_refresh }}
+    # HAProxy 3.x 內建 Prometheus exporter：/stats 給人看、/metrics 給機器抓
+    http-request use-service prometheus-exporter if { path /metrics }

@@ -3,7 +3,7 @@
 # roles/scylla/meta/main.yml
 # =============================================================================
 galaxy_info:
-  author: email-proxy-infra
+  author: platform-infra
   description: >-
     ScyllaDB 3 節點叢集（Docker 容器、host network、內外部 TLS、
     PasswordAuthenticator/CassandraAuthorizer、NTS RF=3；

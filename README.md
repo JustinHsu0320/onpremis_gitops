@@ -1,10 +1,16 @@
-# email_proxy 地端基礎設施 — 全公司 GitOps Monorepo
+# 地端基礎平台 — 多專案 GitOps Monorepo
 
-> **Greenfield 平行重建**：VMware 起手（Terraform）→ 系統組態（Ansible）→ 工作負載（Docker Compose / K8s）
-> → 變更管線（GitLab CI）→ 應用交付（ArgoCD）。
-> 依據 [`.spec/email_proxy 正式環境重建：地端基礎設施最佳實踐規劃書.md`](.spec/) 實作，
-> **Ansible 主體已在 16 節點 Docker 實驗室完整部署並通過全鏈驗收**（見 [§12 實驗室](#12-docker-實驗室驗證過的拓撲)）——
-> 含新增的 ScyllaDB 層（33-scylladb）：`99-verify` 16 節點 `failed=0`、3 節點 UN + 跨節點 QUORUM 讀寫（過程踩雷見 §17 #18–#21）。
+> **平台定位**：VMware 起手（Terraform）→ 系統組態（Ansible）→ 工作負載（Docker Compose / K8s）
+> → 變更管線（GitLab CI）→ 應用交付（ArgoCD）的「多專案共用地端平台」。
+> 平台層 = 可選組件選單（LB / Kong / PG / MQ / KeyDB / Scylla / NFS / S3 / 監控…，
+> inventory 群組 = 開關）；專案層 = 純資料宣告（`projects` 登記簿）。
+> **email_proxy 是第一個登記的專案**，不再是 repo 的主體——新專案照
+> [`ansible/CONVENTIONS.md`](ansible/CONVENTIONS.md) §10.5 的 onboarding 清單挑組件即可啟動。
+>
+> 歷史：本 repo 源自 email_proxy 正式環境重建（`.spec/` 規劃書），16 節點時代的
+> Ansible 主體已在 Docker 實驗室完整部署並通過全鏈驗收（§12/§17 為當時實錄）。
+> 2026-08 平台化改造（去 email_proxy 耦合 + 新增 Kong/SeaweedFS/PG 擴充）**尚未跑過
+> lab 全鏈驗證**——上 prod 前請先 `make lab-up lab-deploy lab-verify` 走一輪。
 
 ---
 
@@ -27,6 +33,7 @@
 15. [維運 Runbook](#15-維運-runbook)
 16. [ADR 設計決策記錄](#16-adr-設計決策記錄)
 17. [實測踩雷實錄](#17-實測踩雷實錄除錯知識庫)
+18. [平台缺口與補齊路線圖](docs/PLATFORM-GAPS.md)（另開文件）
 
 ---
 
@@ -38,12 +45,12 @@
 |---|---|---|---|---|
 | L1 機器的存在 | Terraform（vSphere provider） | VM、Port Group（VLAN）、磁碟、反親和規則、cloud-init | [`terraform/`](terraform/) | `terraform validate`（✅ 已通過） |
 | L2 機器的內容 | Ansible | OS 基線、PKI、全部服務組態 | [`ansible/`](ansible/) | **16 節點實驗室實測**（✅ 99-verify 全綠，含 scylladb） |
-| L3 VM 上的工作負載 | Docker Compose | email_proxy app、KeyDB、監控堆疊 | `ansible/roles/*/templates/docker-compose.yml.j2` | 實驗室實測（✅） |
+| L3 VM 上的工作負載 | Docker Compose | 各專案 app（compose_app）、KeyDB、Kong、SeaweedFS、監控堆疊 | `ansible/roles/*/templates/docker-compose.yml.j2` | 實驗室實測（✅） |
 | L4 變更管線 | GitLab CI | lint → validate → plan → apply 的 GitOps 紀律 | [`.gitlab-ci.yml`](.gitlab-ci.yml)、[`gitlab/`](gitlab/) | YAML 驗證（✅） |
 | L5 K8s 應用交付 | ArgoCD | 公司前後端應用的 App-of-Apps GitOps | [`argocd/`](argocd/) | kubeconform + kustomize render（✅） |
 
 ```text
-ansible_email_proxy/
+onpremis_gitops/
 ├── README.md                 ← 你在這裡
 ├── Makefile                  ← 統一操作入口（make help）
 ├── .gitlab-ci.yml            ← 本 repo 自身的 GitOps 管線
@@ -54,9 +61,10 @@ ansible_email_proxy/
 │   ├── CONVENTIONS.md        ← ★ 跨 role 契約（變數/埠號/路徑/PKI）——新人必讀第一份文件
 │   ├── ansible.cfg / requirements.yml
 │   ├── inventories/{prod,lab}/   ← lab 拓撲 symlink prod（單一事實來源）
+│   │   └── group_vars/all/projects.yml + project_<name>.yml ← ★ 專案登記簿（§10 契約）
 │   ├── playbooks/            ← site.yml + 00→99 階段
-│   ├── roles/                ← 20 個 role，每個都有豐富的「為什麼」註解
-│   └── lab/                  ← 16 節點 Docker 實驗室（Dockerfile + compose）
+│   ├── roles/                ← 23 個 role，每個都有豐富的「為什麼」註解
+│   └── lab/                  ← 21 節點 Docker 實驗室（Dockerfile + compose）
 ├── gitlab/ci-templates/      ← L4：可 include 的 CI 模板（kaniko/前後端/部署）
 └── argocd/                   ← L5：bootstrap + projects + apps + k8s manifests
 ```
@@ -77,7 +85,7 @@ graph TB
 
     subgraph GITLAB["GitLab CE（gitlab-01, VLAN 50）"]
         REPO_INFRA["infra monorepo<br/>（本 repo）"]
-        REPO_APP["email-proxy app repo<br/>（Go：api/worker/smtp）"]
+        REPO_APP["各專案 app repos<br/>（compose-app 模板，如 email_proxy）"]
         REPO_WEB["前後端 app repos<br/>（web-frontend / web-backend）"]
         REG[("Container Registry<br/>registry.ptc-nec.com.tw:5050")]
         RUNNER["gitlab-runner（runner-01）<br/>docker executor + kaniko"]
@@ -87,12 +95,12 @@ graph TB
         TF["Terraform plan/apply<br/>（state 存 GitLab-managed TF state）"]
         VC["vCenter / ESXi ×3"]
         ANS["Ansible（mgmt-01）<br/>site.yml"]
-        VMS["16+2 台 VM"]
+        VMS["21+2 台 VM"]
     end
 
-    subgraph APP_PATH["email_proxy 應用路徑（VM + Compose）"]
+    subgraph APP_PATH["compose 專案應用路徑（VM + Compose）"]
         TRIG["pipeline trigger<br/>app_image_tag=git-sha"]
-        DEPLOY["ansible-playbook 50-app.yml<br/>serial:1 滾動更新"]
+        DEPLOY["ansible-playbook 50-apps.yml<br/>serial:1 滾動更新"]
     end
 
     subgraph K8S_PATH["平台應用路徑（K8s + ArgoCD）"]
@@ -116,16 +124,19 @@ graph TB
 
 **兩條應用交付路徑的分工（ADR-4）**：
 
-- **email_proxy 本體**（Go、有狀態依賴多、規劃書標的）：VM + Docker Compose，由 CI 觸發
-  Ansible `50-app.yml` 滾動部署。CI build 一次 → push registry → 各節點 pull（ADR-6）。
+- **VM+Compose 型專案**（如 email_proxy：有狀態依賴多）：VM + Docker Compose，由 CI 觸發
+  Ansible `50-apps.yml` 滾動部署。CI build 一次 → push registry → 各節點 pull（ADR-6）。
 - **公司前後端**（無狀態 web 應用）：K8s + ArgoCD，CI 只負責 build image + 改 gitops repo
   的 image tag，ArgoCD 負責同步與自癒。
 
 ---
 
-## 3. email_proxy 系統架構
+## 3. 平台組件架構（以 email_proxy 專案的資訊流為例）
 
-與規劃書 §1 一致，並標注實測驗證過的資訊流：
+平台組件全貌 + 第一個專案（email_proxy）的資訊流。新加入的組件：
+**Kong API Gateway**（kong-01/02 @ VLAN 20，DB-less，北向由邊界 HAProxy 依 host 分流、
+東西向走 kong-vip:8443）與 **SeaweedFS S3**（sw-01..03 @ VLAN 40，S3 VIP
+`s3.{{domain}}:8333`，filer 元資料存 Patroni PG）。下圖為 email_proxy 使用中的組件：
 
 ```mermaid
 graph TB
@@ -219,10 +230,10 @@ sequenceDiagram
 
 | VLAN | 網段 | 用途 | 對外可達性 |
 |---|---|---|---|
-| 10 邊界 | `10.20.10.0/24` | 服務 VIP、egress VIP、lb-01/02 | 用戶端可達 443/465 |
-| 20 應用 | `10.20.20.0/24` | app-01/02/03 + KeyDB | 僅 LB → App |
-| 30 資料 | `10.20.30.0/24` | pg/mq/scylla 節點與 VIP | 僅 App、mgmt |
-| 40 儲存 | `10.20.40.0/24` | nfs-01 | 僅 App、PG、mgmt |
+| 10 邊界 | `10.20.10.0/24` | 服務 VIP、egress VIP、lb-01/02 | 用戶端可達（專案宣告的埠，現為 443/465） |
+| 20 應用 | `10.20.20.0/24` | kong VIP + kong-01/02、各專案 app 節點（app-01..03 + KeyDB） | 僅 LB → Kong/App |
+| 30 資料 | `10.20.30.0/24` | pg/mq/scylla 節點與 VIP | 僅 App、Kong、SW、mgmt |
+| 40 儲存 | `10.20.40.0/24` | S3 VIP + sw-01..03、nfs-01 | 僅 App、PG、mgmt |
 | 50 DevOps | `10.20.50.0/24` | gitlab-01、runner-01 | 開發者可達 443 |
 | 60 平台 K8s | `10.20.60.0/24` | K8s 叢集（參考架構，見 §10） | Ingress |
 | 99 管理 | `10.20.99.0/24` | mgmt-01、iLO/IPMI | 僅維運跳板 |
@@ -236,13 +247,17 @@ sequenceDiagram
 10.20.10.10   svc-api.ptc-nec.com.tw        服務 VIP（443/465，keepalived vrid 10）
 10.20.10.20   egress-proxy.ptc-nec.com.tw   Squid VIP（3128，vrid 12）
 10.20.10.11-12  lb-01 / lb-02
-10.20.20.11-13  app-01 / app-02 / app-03
+10.20.20.20   kong-vip.ptc-nec.com.tw       Kong 東西向 VIP（8443，vrid 20）
+10.20.20.21-22  kong-01 / kong-02
+10.20.20.11-13  app-01 / app-02 / app-03（email_proxy 專案）
 10.20.30.10   pgbouncer-vip.ptc-nec.com.tw  PG VIP（6432 RW / 6433 RO，vrid 30）
 10.20.30.11-13  pg-01 / pg-02 / pg-03
 10.20.30.20   rabbitmq-vip.ptc-nec.com.tw   MQ VIP（5671，vrid 31）
 10.20.30.21-23  mq-01 / mq-02 / mq-03
 10.20.30.31-33  scylla-01 / scylla-02 / scylla-03（無 VIP：gocql 多 host 原生 failover）
+10.20.40.10   s3.ptc-nec.com.tw             SeaweedFS S3 VIP（8333，vrid 40）
 10.20.40.11   nfs-01
+10.20.40.21-23  sw-01 / sw-02 / sw-03
 10.20.50.11   gitlab-01（gitlab.* 與 registry.* 同機）
 10.20.50.12   runner-01
 10.20.99.11   mgmt-01
@@ -263,6 +278,13 @@ sequenceDiagram
 | mq ↔ mq | mq | 25672, 4369 | Erlang 叢集 |
 | app | scylla | 9042, 19042 | CQL over TLS（19042 = gocql shard-aware） |
 | scylla ↔ scylla | scylla | 7001 | internode mTLS（明文 7000 不監聽） |
+| lb | kong | 8000, 8100 | 北向 API 轉發 + status 健檢（`check port 8100`） |
+| app / 內部服務 | kong-vip | 8443 | 東西向 API 呼叫（TLS） |
+| kong | 各專案後端 | 專案埠 | 例：kong → app:8080（依 projects 宣告逐行增列） |
+| kong ↔ kong | kong | VRRP(112) | keepalived 單播心跳（ADR-7） |
+| app / pg | s3 VIP + sw 節點 | 8333 | S3 API（TLS passthrough 後落節點 8333） |
+| sw ↔ sw | sw | 9333/19333, 8380/18380, 8888/18888 | master raft / volume / filer（VLAN 40 內部） |
+| sw | pgbouncer-vip | 6432 | filer 元資料庫（TLS） |
 | app / lb | egress VIP | 3128 | 唯一對外出口 |
 | mgmt | 全部 | 22 | Ansible / 維運 |
 | mgmt | 全部 | 9100, 8008, 15692, 8404, 9180, 9090.. | 監控抓取（詳見 §14） |
@@ -286,22 +308,26 @@ sequenceDiagram
 | `AA-postgres` | pg-01/02/03 | Patroni + etcd quorum |
 | `AA-rabbitmq` | mq-01/02/03 | quorum queue Raft 多數 |
 | `AA-scylladb` | scylla-01/02/03 | RF=3 + QUORUM 讀寫多數 |
+| `AA-seaweedfs` | sw-01/02/03 | master raft 多數 + 010 複寫的兩副本落點分散 |
 | `AA-app` | app-01/02/03 | 同居的 KeyDB cluster 也要分散 |
 | `AA-lb` | lb-01/02 | VIP 主備不可同機 |
+| `AA-kong` | kong-01/02 | VI_KONG 主備不可同機 |
 
 > 反親和用 `mandatory=false`（should 規則）：3 台 ESXi = 叢集成員數時，must 規則會擋
 > 維護模式 vMotion 與 HA 故障重啟。ESXi > 3 台時可覆寫變數改成 must。（模組內有完整註解）
 
-### 5.2 VM 清單（18 台 = 規劃書 13 台 + GitLab 2 台 + ScyllaDB 3 台）
+### 5.2 VM 清單（23 台 = 邊界 2 + Kong 2 + app 3 + 資料層 9 + 儲存 4 + DevOps 2 + 管理 1）
 
 | VM | 角色 | vCPU | RAM | OS 碟 | 資料碟 | VLAN |
 |---|---|---|---|---|---|---|
 | lb-01/02 | HAProxy+Keepalived+Squid | 2 | 4G | 40G | — | 10 |
-| app-01..03 | api/worker/smtp + KeyDB | 4 | 8G | 60G | — | 20 |
+| kong-01/02 | Kong DB-less（Docker）+Keepalived | 2 | 4G | 40G | — | 20 |
+| app-01..03 | email_proxy：api/worker/smtp + KeyDB | 4 | 8G | 60G | — | 20 |
 | pg-01..03 | Patroni/PG18+etcd+PgBouncer+HAProxy | 6 | 16G | 40G | 200G data + 50G WAL + 10G etcd（**各自獨立 PVSCSI 控制器**，SSD） | 30 |
 | mq-01..03 | RabbitMQ 4.x | 4 | 8G | 40G | 100G | 30 |
 | scylla-01..03 | ScyllaDB 2026.1（Docker） | 4 | 16G | 40G | 500G（獨立 PVSCSI 控制器，SSD，XFS） | 30 |
 | nfs-01 | NFSv4.1 | 2 | 8G | 40G | 500G–1T | 40 |
+| sw-01..03 | SeaweedFS（master+volume+filer+s3，Docker） | 4 | 8G | 40G | 1T（thin，獨立 PVSCSI） | 40 |
 | gitlab-01 | GitLab CE + Registry | 4 | 8G | 100G | 200G | 50 |
 | runner-01 | gitlab-runner | 4 | 8G | 60G | — | 50 |
 | mgmt-01 | Ansible+PKI+監控 | 4 | 8G | 100G | 200G TSDB | 99 |
@@ -345,13 +371,13 @@ graph LR
 
 ```mermaid
 graph TD
-    ROOT["Root CA（效期 20 年）<br/>建立後私鑰離線保存<br/>（internal_ca role 支援私鑰離線的日常運轉）"]
-    ISSUING["Issuing CA（效期 5 年，pathlen:0）<br/>私鑰在 mgmt-01 的 /opt/email-proxy-ca（0700）"]
+    ROOT["PTC-NEC Internal Root CA（效期 20 年）<br/>建立後私鑰離線保存<br/>（internal_ca role 支援私鑰離線的日常運轉）"]
+    ISSUING["Issuing CA（效期 5 年，pathlen:0）<br/>私鑰在 mgmt-01 的 /opt/platform-ca（0700）"]
     ROOT -->|簽發| ISSUING
     ISSUING -->|"server profile<br/>(serverAuth)"| S1["postgres-server / pgbouncer-server<br/>rabbitmq-server / svc-api / gitlab-server"]
     ISSUING -->|"client profile<br/>(clientAuth)"| S2["patroni-etcd-client / keydb-client"]
     ISSUING -->|"peer profile<br/>(server+client)"| S3["etcd（叢集互連）<br/>keydb-server（cluster bus mTLS）"]
-    S1 & S2 & S3 -->|"397 天效期<br/>每季輪替"| HOSTS["各主機 /etc/email-proxy/pki/<br/>+ 系統信任庫（update-ca-certificates）"]
+    S1 & S2 & S3 -->|"397 天效期<br/>每季輪替"| HOSTS["各主機 /etc/platform/pki/<br/>+ 系統信任庫（update-ca-certificates）"]
 ```
 
 關鍵設計（`roles/internal_ca` + `roles/pki_leaf`）：
@@ -467,7 +493,7 @@ sequenceDiagram
 
 ### 8.1 前置需求（prod）
 
-1. vCenter 就緒、≥3 台 ESXi、SSD datastore、ubuntu-26.04 VM template（含 cloud-init）。
+1. vCenter 就緒、≥3 台 ESXi、SSD datastore、ubuntu-26.04 VM template（含 cloud-init）。OS 全平台統一 Ubuntu。
 2. GitLab 專案建立（本 repo push 上去）、runner 註冊、CI variables 設定（見 §9.3）。
 3. `ansible/.vault_pass`：**產生新密碼並 rekey**（repo 附的 vault 是佔位值，見 §11）。
 4. mgmt-01 由 Terraform 先建出來後，成為之後所有 Ansible 操作的控制節點。
@@ -476,7 +502,7 @@ sequenceDiagram
 
 ```mermaid
 graph LR
-    TF["Terraform apply<br/>（L1：18 台 VM）"] --> B["00 bootstrap<br/>系統基線 common"]
+    TF["Terraform apply<br/>（L1：23 台 VM）"] --> B["00 bootstrap<br/>系統基線 common"]
     B --> BS["05 block-storage<br/>資料碟格式化+掛載"]
     BS --> DK["08 docker"]
     DK --> P["10 PKI"]
@@ -484,11 +510,13 @@ graph LR
     P --> PG["30 postgres"]
     P --> MQ["31 rabbitmq"]
     P --> KD["32 keydb"]
+    P --> KG["35 kong"]
     P --> GL["70 gitlab"]
     S --> PG
+    PG --> SW["34 seaweedfs<br/>（filer store 在 PG）"]
     PG --> LB["40 lb"]
     LB --> EG["41 egress"]
-    S & PG & MQ & KD & LB --> APP["50 app"]
+    S & PG & MQ & KD & SW & KG & LB --> APP["50 apps<br/>（各專案）"]
     APP --> M["60 monitoring"]
     M --> V["99 verify<br/>全鏈驗收"]
 ```
@@ -565,11 +593,11 @@ graph LR
 | 模板 | 用途 | 交付終點 |
 |---|---|---|
 | `docker-build.gitlab-ci.yml` | **kaniko** 建映像（無需 privileged/DinD——地端 runner 安全最佳實踐） | registry |
-| `email-proxy-app.gitlab-ci.yml` | Go app：test → build → image → **trigger 本 repo 的 50-app 部署** | VM（Compose） |
+| `compose-app.gitlab-ci.yml` | VM+Compose 型專案（PROJECT_SLUG 參數化）：test → build → image → **trigger 本 repo 的 50-apps 部署** | VM（Compose） |
 | `backend.gitlab-ci.yml` | Go 後端：test → image → **kustomize bump gitops repo** | K8s（ArgoCD） |
 | `frontend.gitlab-ci.yml` | Node 前端：lint/test/build → image → bump | K8s（ArgoCD） |
 
-email_proxy 的映像流（ADR-6，回答規劃書 §10.6）：
+compose 型專案的映像流（ADR-6；以 email_proxy 為例）：
 
 ```mermaid
 sequenceDiagram
@@ -583,7 +611,7 @@ sequenceDiagram
     DEV->>CI: test → build
     CI->>REG: push api/worker/smtp:{git-sha}
     DEV->>INFRA: pipeline trigger（APP_IMAGE_TAG=git-sha）
-    INFRA->>ANS: ansible-playbook 50-app.yml -e app_image_tag=git-sha
+    INFRA->>ANS: ansible-playbook 50-apps.yml -e app_image_tag=git-sha
     ANS->>APP: serial:1 滾動（LB 健檢自動摘除/回掛）
     APP->>REG: docker pull（節點不再自行 build）
 ```
@@ -619,22 +647,23 @@ graph TB
 
 - 部署三步驟見 [`argocd/bootstrap/README.md`](argocd/bootstrap/README.md)（含離線環境映像搬運）。
 - CI 的 bump job 用 `kustomize edit set image` 改 overlay 的 tag → commit → ArgoCD 自動同步。
-- **email_proxy 本體刻意不在 K8s**（ADR-4）：詳見 §16。
+- **VM+Compose 型專案（如 email_proxy）刻意不在 K8s**（ADR-4）：詳見 §16。
 
 ---
 
 ## 11. 機密管理（ansible-vault）
 
-- 機密真值只存在 `inventories/*/group_vars/all/vault.yml`（**Git 內是密文**）；
-  `vars.yml` 只放 `postgres_superuser_password: "{{ vault_postgres_superuser_password }}"`
-  這種別名，role 一律引用別名。
+- 機密分兩層（CONVENTIONS §6）：**平台機密** `vault.yml` + **每專案一檔**的
+  `vault_prj_<name>.yml`（Git 內都是密文）。`vars.yml`（平台）與
+  `project_<name>.yml`（專案）只放 `xxx: "{{ vault_xxx }}"` 別名，role 一律引用別名。
 - **每個服務獨立強密碼**（修正舊環境共用弱密碼）；VRRP 密碼固定 8 字元（協定上限）。
 - 兩把鑰匙：`prod@ansible/.vault_pass`（**不進 Git**）、`lab@ansible/lab/vault_pass.txt`
   （刻意進 Git——lab 機密只是佔位值，任何人可一鍵起實驗室）。
 
 ```bash
 # 日常操作（在 ansible/ 目錄）
-ansible-vault view  inventories/prod/group_vars/all/vault.yml
+ansible-vault view  inventories/prod/group_vars/all/vault.yml            # 平台機密
+ansible-vault view  inventories/prod/group_vars/all/vault_prj_email_proxy.yml  # 專案機密
 ansible-vault edit  inventories/prod/group_vars/all/vault.yml
 
 # ★ 接手本 repo 的第一件事：換掉佔位機密
@@ -644,23 +673,24 @@ ansible-vault edit inventories/prod/group_vars/all/vault.yml     # 逐項換新�
 # 然後重跑 site.yml 讓新密碼佈達（服務密碼輪替 runbook 見 §15）
 ```
 
-明文結構範本：`inventories/prod/group_vars/all/vault.yml.example`。
+明文結構範本：`vault.yml.example`（平台）與 `vault_prj_email_proxy.yml.example`（專案）。
 
 ---
 
 ## 12. Docker 實驗室（驗證過的拓撲）
 
-**「實驗室驗證的就是正式環境的拓撲」**：16 節點、5 VLAN、IP 與 prod 完全相同、
+**「實驗室驗證的就是正式環境的拓撲」**：21 節點、5 VLAN、IP 與 prod 完全相同、
 TLS/quorum/VIP 一個不少。lab inventory 的拓撲檔全部 **symlink** 到 prod（單一事實來源），
 只覆寫降規參數（`zz_lab_overrides.yml`）。
 
 ```mermaid
 graph TB
-    subgraph HOST["你的機器（Docker Desktop，建議 12GB）"]
+    subgraph HOST["你的機器（Docker Desktop，建議 14GB）"]
         subgraph V10["bridge: vlan10（10.20.10.0/24）"]
             LLB1["lb-01/02<br/>(+VIP .10/.20)"]
         end
         subgraph V20["vlan20（10.20.20.0/24）"]
+            LKONG["kong-01/02（DinD：kong）<br/>(+VIP .20)"]
             LAPP["app-01..03<br/>（DinD：KeyDB+mock app）"]
         end
         subgraph V30["vlan30（10.20.30.0/24）"]
@@ -670,17 +700,18 @@ graph TB
         end
         subgraph V40["vlan40（10.20.40.0/24）"]
             LNFS["nfs-01（kernel nfsd）"]
+            LSW["sw-01..03（DinD：weed）<br/>(+S3 VIP .10)"]
         end
         subgraph V99["vlan99（10.20.99.0/24）"]
             LMGMT["mgmt-01 = Ansible 控制節點<br/>（repo bind-mount 於 /work）"]
         end
     end
-    LMGMT -.->|"ssh（掛全部 vlan）"| LLB1 & LAPP & LPG & LMQ & LNFS
+    LMGMT -.->|"ssh（掛全部 vlan）"| LLB1 & LKONG & LAPP & LPG & LMQ & LNFS & LSW
 ```
 
 ```bash
-make lab-up        # build 映像（ubuntu:26.04+systemd+sshd）→ 起 13 容器 → ssh 就緒檢查
-make lab-deploy    # 在 mgmt-01 內對全實驗室跑 site.yml（15-20 分鐘）
+make lab-up        # build 映像（ubuntu:26.04+systemd+sshd）→ 起 21 容器 → ssh 就緒檢查
+make lab-deploy    # 在 mgmt-01 內對全實驗室跑 site.yml（20-25 分鐘）
 make lab-verify    # 99-verify 全鏈驗收
 make lab-sh        # 進 mgmt-01（cd /work/ansible 改了就能重跑——bind mount 同一份 code）
 make lab-destroy
@@ -694,12 +725,15 @@ make lab-destroy
 | NFS export ACL 來源網段 | 節點的 vlan40 腳 | 真實 app/資料網段 | `nfs_*_clients` 變數，lab 覆寫 |
 | kernel 級調校 | 跳過（共用宿主 kernel） | 全套 | `is_container` guard |
 | GitLab / runner | 不部署（記憶體） | 部署 | lab inventory 無此群組，自動跳過 |
-| app 映像 | 本地 build mock（/health+SMTP banner） | registry pull | `app_stack_mock` 開關 |
+| app 映像 | 本地 build mock（/health+SMTP banner） | registry pull | `compose_app_mock_projects` 開關 |
 | Docker 影像存放層 | overlay2（巢狀相容） | 預設 | `docker_storage_driver` 變數 |
 | ScyllaDB 運行模式 | developer mode（DinD/overlay 過不了 XFS/AIO 檢查）+ smp1/768M | **正式模式**（dev mode 是 MIS 反模式，prod 必 false）+ smp2/8G | `scylla_developer_mode` 等，lab 覆寫 |
 
-**驗收證據（最後一次完整跑）**：`site.yml` 全綠、`99-verify` 十個子系統全過、
+**驗收證據（16 節點時代最後一次完整跑）**：`site.yml` 全綠、`99-verify` 十個子系統全過、
 `ansible-lint` production profile 0 findings、site.yml 重跑收斂（冪等）。
+> ⚠️ 2026-08 平台化改造（projects 層、Kong、SeaweedFS、PG 擴充、21 節點）後
+> **尚未重跑 lab 全鏈**——static 檢查全綠（lint/syntax/模板渲染/變數求值），
+> 但「lab 全鏈實測是唯一可信驗證」是本 repo 的一貫哲學，上 prod 前必補。
 
 ---
 
@@ -707,11 +741,12 @@ make lab-destroy
 
 | 面向 | 做法 | 位置 |
 |---|---|---|
-| **PostgreSQL** | pgBackRest：WAL 連續歸檔（`archive_command`）+ 每週日全備 + 每日差異備，`repo1-retention-full=2` ≈ 兩週 PITR 窗口；repo **AES-256 加密**（NFS 上靜態加密） | nfs-01 `/export/mail-proxy/pgbackup` |
+| **PostgreSQL** | pgBackRest：WAL 連續歸檔（`archive_command`）+ 每週日全備 + 每日差異備，`repo1-retention-full=2` ≈ 兩週 PITR 窗口；repo **AES-256 加密**（NFS 上靜態加密）。S3（SeaweedFS）只能當 repo2 次要庫——filer 元資料在 PG 內，還原主路徑必須是 NFS（CONVENTIONS §10.6） | nfs-01 `/export/pgbackup` |
 | **RabbitMQ** | definitions（vhost/user/queue/policy）由 Ansible 冪等重建 = 設定即備份；quorum queue 資料靠叢集多數複寫 | Git（本 repo） |
 | **KeyDB** | 純快取（TTL 語意），不備份 | — |
 | **ScyllaDB** | RF=3 保「節點故障」不保「邏輯錯誤」（誤刪表全叢集同步刪）。**快照策略待決策**：`nodetool snapshot` + 異地拷貝的排程尚未實作（MIS 現況亦無備份——這是已知債，不是刻意設計）；上線承載正式資料前必須補上 | TODO |
-| **附件** | NFS 卷每日增量備份到異地（站點既有備份系統，掛載點即備份源） | nfs-01 |
+| **附件（email_proxy）** | NFS 卷每日增量備份到異地（站點既有備份系統，掛載點即備份源） | nfs-01 |
+| **SeaweedFS** | replication=010 保「節點故障」不保「邏輯錯誤」；物件層備份策略待決策（比照 Scylla 的已知債） | TODO |
 | **GitLab** | `gitlab-backup create` + 異地同步（runbook TODO 註記於 role） | gitlab-01 |
 | **CA** | Root CA 私鑰離線保存（建立後搬離 mgmt-01）；Issuing CA 隨 mgmt-01 的檔案系統備份 | 離線媒體 |
 
@@ -720,10 +755,10 @@ make lab-destroy
 ```bash
 # 在目標 pg 節點（假設整叢集重建）：
 sudo systemctl stop patroni
-sudo -u postgres pgbackrest --stanza=email-proxy --delta \
+sudo -u postgres pgbackrest --stanza=pg-main --delta \
      --type=time "--target=2026-07-05 08:00:00+08" restore
 # Patroni 需要先清 DCS 叢集狀態再以還原後的資料目錄重新 bootstrap：
-patronictl -c /etc/patroni/config.yml remove email-proxy-pg   # 確認提示
+patronictl -c /etc/patroni/config.yml remove pg-main   # 確認提示
 sudo systemctl start patroni    # 首節點成為新 leader，其他節點自動重建副本
 ```
 
@@ -745,7 +780,9 @@ mgmt-01 上的 compose（`roles/monitoring`）：Prometheus + Grafana + Alertman
 | **KeyDB** | app 節點 `:9121`（redis_exporter，mTLS 連本機 master） | redis_up、**connected_slaves**（replica 備援）、記憶體 |
 | HAProxy | lb/pg/mq 節點 `:8404/metrics`（內建 exporter） | 後端健康、連線數、5xx |
 | **ScyllaDB** | scylla 節點 `:9180/metrics`（Seastar 原生，免 exporter） | operation_mode、讀寫 timeout、壓實/空間壓力 |
-| Blackbox | `https://svc-api/health`、`amqps VIP:5671`（TLS）、`pgbouncer VIP:6432`、`egress VIP:3128`（tcp）、scylla 各節點 `:9042`（TLS） | VIP／CQL 端到端可達性 + **憑證到期天數** |
+| **Kong** | kong 節點 `:8100/metrics`（prometheus plugin） | 請求量/延遲/5xx 比率、upstream target 健康 |
+| **SeaweedFS** | sw 節點 `:9327/metrics`（weed 原生） | volume 空間、S3 請求、filer 延遲 |
+| Blackbox | 各專案宣告的探測（如 `https://svc-api/health`）、`amqps VIP:5671`（TLS）、`kong-vip:8443`（TLS）、`s3:8333`（TLS）、`pgbouncer VIP:6432`、`egress VIP:3128`（tcp）、scylla 各節點 `:9042`（TLS） | VIP／CQL 端到端可達性 + **憑證到期天數** |
 
 **告警規則**（`roles/monitoring/templates/rules.yml.j2`，每條附中文註解）：
 
@@ -759,7 +796,9 @@ mgmt-01 上的 compose（`roles/monitoring`）：Prometheus + Grafana + Alertman
 | RabbitNodeDown | 叢集在線節點 < 3 for 3m | critical |
 | **KeyDBMasterNoReplica** | `redis_connected_slaves < 1`（master 失去備援即告警，補審查點名盲點） | warning |
 | **ScyllaNodeNotNormal** | `scylla_node_operation_mode != 3` for 10m（節點離開 NORMAL＝再倒一台就 QUORUM 不足） | warning |
-| ProbeFailed | 端到端探測失敗 for 3m（涵蓋 4 個 VIP「沒人持有」） | critical |
+| ProbeFailed | 端到端探測失敗 for 3m（涵蓋 6 個 VIP「沒人持有」） | critical |
+| **KongUpstreamTargetUnhealthy** | Kong 視角的後端 target 不健康 for 5m | warning |
+| **KongHigh5xxRatio** | 經 Kong 的 5xx 比率 > 5% for 5m | warning |
 | NodeFilesystemAlmostFull | 可用 < 15% for 10m | warning |
 
 Grafana：`http://mgmt-01:3000`（admin 密碼在 vault）；Prometheus：`:9090`；Alertmanager：`:9093`
@@ -802,9 +841,9 @@ ansible-playbook playbooks/30-postgres.yml --limit pg-01
 ### 15.4 Failover 演練（實驗室隨時可做）
 
 ```bash
-docker stop email-proxy-pg-02        # 模擬 leader 整機死亡
+docker stop platform-pg-02           # 模擬 leader 整機死亡
 make lab-verify                      # ~40 秒內（TTL 30s + 健檢窗）新 leader 上任，全鏈仍綠
-docker start email-proxy-pg-02       # 舊 leader pg_rewind 後以 replica 回歸
+docker start platform-pg-02          # 舊 leader pg_rewind 後以 replica 回歸
 ```
 
 ### 15.5 新機納管
@@ -833,7 +872,7 @@ ansible-playbook playbooks/site.yml        # 冪等收斂：PG 使用者、Rabbi
 | **ADR-1** | 網段沿用 `10.20.0.0/16` 示範值，全參數化 | 規劃書 §10.1：真實網段只改 `group_vars/all/vars.yml` + terraform 變數，一處一改 |
 | **ADR-2** | 全部基礎服務用 **Ubuntu 26.04 官方 archive 套件**（PG18/Patroni 4.1/RabbitMQ 4.0.5/etcd 3.5/HAProxy 3.2…），Docker 只裝在跑容器的節點（app/mgmt/runner） | 地端封閉環境最小化第三方 repo = 最小化供應鏈與 egress 依賴。實測 26.04 archive 版本全數符合規劃書要求。PGDG 作為次要選項保留（要 minor 版鎖定時） |
 | **ADR-3** | egress Squid **與 lb 同居** + 獨立 VIP（規劃書 §10.3） | 主備 VIP 消除單台 Squid SPOF，又不用多開 2 台 VM；兩者同為無狀態邊界元件，故障域重疊可接受 |
-| **ADR-4** | PKI 先落地 **openssl（community.crypto）版**（規劃書 §10.4）；ArgoCD 只管平台 K8s，email_proxy 留在 VM+Compose | step-ca/Vault PKI 留為中期演進（role 介面已預留）；email_proxy 依賴 NFS/host network/VIP 拓撲，強行進 K8s 是為了工具而工具 |
+| **ADR-4** | PKI 先落地 **openssl（community.crypto）版**；ArgoCD 只管平台 K8s，VM+Compose 型專案（如 email_proxy）留在 VM | step-ca/Vault PKI 留為中期演進（role 介面已預留）；依賴 NFS/host network/VIP 拓撲的專案強行進 K8s 是為了工具而工具 |
 | **ADR-5** | 名稱解析：**Ansible 管理 /etc/hosts**（規劃書 §10.5） | 16 台規模下比自建 DNS 簡單可靠；公司 DNS 就緒後設 `manage_etc_hosts=false` 即可切換 |
 | **ADR-6** | 映像：**CI build 一次 → push 內部 registry → 節點 pull**（規劃書 §10.6），registry = GitLab 內建 | 消除「各節點自行 build」的版本漂移與重複勞動；GitLab 已自建，registry 零額外成本 |
 | ADR-7 | Keepalived 用 **unicast VRRP**（顯式 peers） | 不依賴交換器放行 224.0.0.18 多播；跨機房/容器/雲一體適用；peers 由 inventory 動態展開 |
@@ -843,6 +882,9 @@ ansible-playbook playbooks/site.yml        # 冪等收斂：PG 使用者、Rabbi
 | ADR-11 | 反親和 should（非 must） | 3 台 ESXi = 成員數時 must 擋維護模式與 HA 重啟；>3 台可覆寫 |
 | ADR-12 | lab 拓撲檔 symlink prod | 「驗證的就是部署的」——兩份拓撲遲早漂移 |
 | ADR-13 | 資料碟由 `block_storage` role 在 guest 內 mkfs+掛載（xfs，依容量認碟，UUID 寫 fstab） | Terraform 只負責「掛 VMDK」，guest 內格式化/掛載是 OS 組態職責。同機資料碟容量互異 → 用容量精確認碟，不賭裝置命名順序或 PCI by-path。對抗式審查抓到的原設計缺口（見 §17-16） |
+| **ADR-14** | 多專案化：平台層 = inventory 空群組開關的組件選單；專案層 = `projects` 登記簿純資料宣告（CONVENTIONS §10） | 專案不擁有 play/role，加專案 = 加宣告檔；`hash_behaviour=replace` 之下用「每專案一檔 + 聚合器」避免 dict 覆蓋地雷。email_proxy 降為第一個專案實例 |
+| **ADR-15** | Kong 走 **DB-less**（宣告式 kong.yml 由 projects 渲染）+ 專用 kong-01/02 @ VLAN 20 | Admin API 唯讀 = 結構性消滅路由 drift；不反向依賴資料層。已知限制：oauth2 plugin 不支援 DB-less（JWT/key-auth/ACL/限流都支援），需要時才重訪 DB-backed。否決同居 lb（故障域重疊、擴 Kong 被迫動邊界） |
+| **ADR-16** | 物件儲存選 **SeaweedFS**（Apache-2.0）而非原規劃的 MinIO：3 節點 master raft + volume（replication=010）+ filer/S3（元資料在 Patroni PG） | MinIO 社群版 2026-04 遭上游 archive（無 CVE 修補、console 遭閹割）——供應鏈風險不適合全新平台。對外只暴露 S3 endpoint + projects 宣告，日後換牌只動 role 內部。代價：filer 依賴 PG → S3 永遠只能當 pgBackRest 的次要備份庫 |
 
 ### 對抗式審查（多維度 + 逐項驗證）
 
@@ -897,5 +939,20 @@ ansible-playbook playbooks/site.yml        # 冪等收斂：PG 使用者、Rabbi
 
 ---
 
-*本 repo 全程遵循規劃書四原則：故障域隔離、狀態與無狀態分離、單一信任根、IaC 為唯一事實來源。*
+## 18. 平台缺口與補齊路線圖
+
+平台完整度的專業盤點（現有組件之外還缺什麼、為什麼會痛、選型建議與落點）獨立成文件：
+**[`docs/PLATFORM-GAPS.md`](docs/PLATFORM-GAPS.md)**。摘要：
+
+- **P0（不補有明顯運營風險）**：告警通知落地（Alertmanager 目前是 `ops-null`，
+  critical 告警沒有任何人收得到）、集中式日誌（現在只有 metrics）、
+  備份完整性（Scylla/SeaweedFS/GitLab/CA 的已知債）。
+- **P1（多專案化後很快需要）**：內部 DNS（/etc/hosts 的天花板）、機密管理（OpenBao）、
+  SSO（Keycloak）、供應鏈封閉迴路（apt/映像快取 + 漏洞掃描）、K8s 實作（VLAN 60 目前只是藍圖）。
+- **P2（成熟度）**：分散式追蹤、IPAM、跳板稽核、ACME 憑證自動化、狀態頁、帶外監控。
+
+---
+
+*本 repo 全程遵循四原則：故障域隔離、狀態與無狀態分離、單一信任根、IaC 為唯一事實來源；*
+*平台化後追加第五原則：平台與專案分層——平台提供組件選單，專案只做資料宣告。*
 *所有機密只存於 ansible-vault 密文；文件內不含任何真實密碼/金鑰。*

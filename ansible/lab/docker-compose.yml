@@ -1,5 +1,5 @@
 # =============================================================================
-# lab/docker-compose.yml — 16 節點實驗室拓撲（1:1 對應 prod 的 VM 與 VLAN 規劃）
+# lab/docker-compose.yml — 21 節點實驗室拓撲（1:1 對應 prod 的 VM 與 VLAN 規劃）
 #
 # ┌─ 網路模擬 ────────────────────────────────────────────────────────────────┐
 # │ 每個 VLAN = 一個 Docker bridge network，網段與 prod 完全相同。            │
@@ -13,11 +13,12 @@
 # │ 3. 容器共用宿主 kernel：is_container=true 跳過 kernel 級調校              │
 # └───────────────────────────────────────────────────────────────────────────┘
 #
-# 資源註記：16 個 systemd 容器 + 服務全開約需 8-9GB RAM（Docker Desktop 建議 12GB；
-# 其中 3 台 scylla 各吃 ~1.5GB——嫌重可 docker compose stop scylla-0{1..3} 單獨關掉）
+# 資源註記：21 個 systemd 容器 + 服務全開約需 10-11GB RAM（Docker Desktop 建議
+# 14GB；其中 3 台 scylla 各吃 ~1.5GB——嫌重可 docker compose stop
+# scylla-0{1..3} 或 sw-0{1..3} 單獨關掉——空群組語意下 99-verify 對應段會 skip）
 # =============================================================================
 ---
-name: email-proxy-lab
+name: platform-lab
 
 # ---------- 共用節點設定（YAML anchor） ----------
 # privileged + cgroup 掛載：讓 systemd 能在容器內當 PID 1 正常管理服務
@@ -41,11 +42,11 @@ x-node: &node
 networks:
   vlan10:   # 邊界層：服務 VIP + egress VIP + lb
     ipam: { config: [{ subnet: 10.20.10.0/24 }] }
-  vlan20:   # 應用層：app + KeyDB
+  vlan20:   # 應用層：kong + 各專案 app（含同居 KeyDB）
     ipam: { config: [{ subnet: 10.20.20.0/24 }] }
-  vlan30:   # 資料層：pg / mq 與其 VIP
+  vlan30:   # 資料層：pg / mq / scylla 與其 VIP
     ipam: { config: [{ subnet: 10.20.30.0/24 }] }
-  vlan40:   # 儲存層：nfs
+  vlan40:   # 儲存層：nfs + seaweedfs 與 S3 VIP
     ipam: { config: [{ subnet: 10.20.40.0/24 }] }
   vlan99:   # 管理層：mgmt
     ipam: { config: [{ subnet: 10.20.99.0/24 }] }
@@ -59,17 +60,27 @@ volumes:
   dind-scylla-01: {}
   dind-scylla-02: {}
   dind-scylla-03: {}
+  dind-kong-01: {}
+  dind-kong-02: {}
+  dind-sw-01: {}
+  dind-sw-02: {}
+  dind-sw-03: {}
   dind-mgmt-01: {}
   # nfs-01 的匯出目錄：kernel nfsd 不能匯出容器的 overlayfs rootfs，
   # named volume 底層是 ext4 —— 正好對應 prod「附件放獨立資料碟」的設計
   nfs-export: {}
+  # seaweedfs 的 volume 資料：named volume（ext4）對應 prod 的獨立資料碟，
+  # 也繞開 overlayfs 對 O_DIRECT 類操作的限制（同 nfs-export 的理由）
+  sw-data-01: {}
+  sw-data-02: {}
+  sw-data-03: {}
 
 services:
   # ---------- VLAN 10 邊界層 ----------
-  # lb 同時掛 vlan20：對應防火牆規則「lb → app:8080/2525」
+  # lb 同時掛 vlan20：對應防火牆規則「lb → app:8080/2525、lb → kong:8000/8100」
   lb-01:
     <<: *node
-    container_name: email-proxy-lb-01
+    container_name: platform-lb-01
     hostname: lb-01
     networks:
       vlan10: { ipv4_address: 10.20.10.11 }
@@ -77,18 +88,41 @@ services:
 
   lb-02:
     <<: *node
-    container_name: email-proxy-lb-02
+    container_name: platform-lb-02
     hostname: lb-02
     networks:
       vlan10: { ipv4_address: 10.20.10.12 }
       vlan20: { ipv4_address: 10.20.20.202 }
 
-  # ---------- VLAN 20 應用層 ----------
-  # app 掛 vlan30（→ pg/mq VIP）、vlan40（→ NFS）、vlan10（→ egress proxy VIP）
+  # ---------- VLAN 20 應用層：Kong API Gateway ----------
+  # kong 節點跑 Docker（kong 容器）→ DinD named volume；
+  # 掛 vlan30/vlan40 對應「kong → 各專案後端」的東西向可達性（未來專案）
+  kong-01: &kong-node
+    <<: *node
+    container_name: platform-kong-01
+    hostname: kong-01
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      - dind-kong-01:/var/lib/docker
+    networks:
+      vlan20: { ipv4_address: 10.20.20.21 }
+
+  kong-02:
+    <<: *kong-node
+    container_name: platform-kong-02
+    hostname: kong-02
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      - dind-kong-02:/var/lib/docker
+    networks:
+      vlan20: { ipv4_address: 10.20.20.22 }
+
+  # ---------- VLAN 20 應用層：email_proxy 專案 app 節點 ----------
+  # app 掛 vlan30（→ pg/mq VIP）、vlan40（→ NFS/S3）、vlan10（→ egress proxy VIP）
   # = 防火牆矩陣的 app 列
   app-01: &app-node
     <<: *node
-    container_name: email-proxy-app-01
+    container_name: platform-app-01
     hostname: app-01
     volumes:
       - /sys/fs/cgroup:/sys/fs/cgroup:rw
@@ -101,7 +135,7 @@ services:
 
   app-02:
     <<: *app-node
-    container_name: email-proxy-app-02
+    container_name: platform-app-02
     hostname: app-02
     volumes:
       - /sys/fs/cgroup:/sys/fs/cgroup:rw
@@ -114,7 +148,7 @@ services:
 
   app-03:
     <<: *app-node
-    container_name: email-proxy-app-03
+    container_name: platform-app-03
     hostname: app-03
     volumes:
       - /sys/fs/cgroup:/sys/fs/cgroup:rw
@@ -130,7 +164,7 @@ services:
   # Docker 預設 64MB 不夠並行查詢用
   pg-01: &pg-node
     <<: *node
-    container_name: email-proxy-pg-01
+    container_name: platform-pg-01
     hostname: pg-01
     shm_size: 256m
     networks:
@@ -139,7 +173,7 @@ services:
 
   pg-02:
     <<: *pg-node
-    container_name: email-proxy-pg-02
+    container_name: platform-pg-02
     hostname: pg-02
     networks:
       vlan30: { ipv4_address: 10.20.30.12 }
@@ -147,7 +181,7 @@ services:
 
   pg-03:
     <<: *pg-node
-    container_name: email-proxy-pg-03
+    container_name: platform-pg-03
     hostname: pg-03
     networks:
       vlan30: { ipv4_address: 10.20.30.13 }
@@ -156,21 +190,21 @@ services:
   # ---------- VLAN 30 資料層：RabbitMQ ----------
   mq-01:
     <<: *node
-    container_name: email-proxy-mq-01
+    container_name: platform-mq-01
     hostname: mq-01
     networks:
       vlan30: { ipv4_address: 10.20.30.21 }
 
   mq-02:
     <<: *node
-    container_name: email-proxy-mq-02
+    container_name: platform-mq-02
     hostname: mq-02
     networks:
       vlan30: { ipv4_address: 10.20.30.22 }
 
   mq-03:
     <<: *node
-    container_name: email-proxy-mq-03
+    container_name: platform-mq-03
     hostname: mq-03
     networks:
       vlan30: { ipv4_address: 10.20.30.23 }
@@ -181,7 +215,7 @@ services:
   # mgmt-01 從 .254 抓 9180 metrics
   scylla-01: &scylla-node
     <<: *node
-    container_name: email-proxy-scylla-01
+    container_name: platform-scylla-01
     hostname: scylla-01
     volumes:
       - /sys/fs/cgroup:/sys/fs/cgroup:rw
@@ -191,7 +225,7 @@ services:
 
   scylla-02:
     <<: *scylla-node
-    container_name: email-proxy-scylla-02
+    container_name: platform-scylla-02
     hostname: scylla-02
     volumes:
       - /sys/fs/cgroup:/sys/fs/cgroup:rw
@@ -201,7 +235,7 @@ services:
 
   scylla-03:
     <<: *scylla-node
-    container_name: email-proxy-scylla-03
+    container_name: platform-scylla-03
     hostname: scylla-03
     volumes:
       - /sys/fs/cgroup:/sys/fs/cgroup:rw
@@ -209,17 +243,57 @@ services:
     networks:
       vlan30: { ipv4_address: 10.20.30.33 }
 
-  # ---------- VLAN 40 儲存層 ----------
+  # ---------- VLAN 40 儲存層：NFS ----------
   # NFS kernel server：nfsd 模組由 Docker Desktop 的 LinuxKit kernel 提供（已驗證）
   nfs-01:
     <<: *node
-    container_name: email-proxy-nfs-01
+    container_name: platform-nfs-01
     hostname: nfs-01
     volumes:
       - /sys/fs/cgroup:/sys/fs/cgroup:rw
       - nfs-export:/export
     networks:
       vlan40: { ipv4_address: 10.20.40.11 }
+
+  # ---------- VLAN 40 儲存層：SeaweedFS ----------
+  # sw 節點跑 Docker（weed server 容器）→ DinD named volume + 資料 named volume
+  # （/var/lib/seaweedfs，對應 prod 的獨立資料碟）。掛 vlan30 對應防火牆規則
+  # 「sw → pgbouncer-vip:6432」（filer 元資料在 PG）
+  sw-01: &sw-node
+    <<: *node
+    container_name: platform-sw-01
+    hostname: sw-01
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      - dind-sw-01:/var/lib/docker
+      - sw-data-01:/var/lib/seaweedfs
+    networks:
+      vlan40: { ipv4_address: 10.20.40.21 }
+      vlan30: { ipv4_address: 10.20.30.121 }
+
+  sw-02:
+    <<: *sw-node
+    container_name: platform-sw-02
+    hostname: sw-02
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      - dind-sw-02:/var/lib/docker
+      - sw-data-02:/var/lib/seaweedfs
+    networks:
+      vlan40: { ipv4_address: 10.20.40.22 }
+      vlan30: { ipv4_address: 10.20.30.122 }
+
+  sw-03:
+    <<: *sw-node
+    container_name: platform-sw-03
+    hostname: sw-03
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      - dind-sw-03:/var/lib/docker
+      - sw-data-03:/var/lib/seaweedfs
+    networks:
+      vlan40: { ipv4_address: 10.20.40.23 }
+      vlan30: { ipv4_address: 10.20.30.123 }
 
   # ---------- VLAN 99 管理層 ----------
   # mgmt-01 = 實驗室的 Ansible 控制節點 + Issuing CA + 監控主機。
@@ -229,7 +303,7 @@ services:
     build:
       context: .
       target: controller
-    container_name: email-proxy-mgmt-01
+    container_name: platform-mgmt-01
     hostname: mgmt-01
     volumes:
       - /sys/fs/cgroup:/sys/fs/cgroup:rw

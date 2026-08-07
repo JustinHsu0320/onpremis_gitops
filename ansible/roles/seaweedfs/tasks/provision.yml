@@ -1,0 +1,41 @@
+---
+# =============================================================================
+# roles/seaweedfs/tasks/provision.yml — 專案 bucket 的冪等佈建
+#
+# 身分/授權「不在」這裡建：identities 走宣告式 s3.json（tasks/main.yml 佈署，
+# 改宣告 = 改檔 + recreate），這裡只補「bucket 目錄」的存在性——
+# bucket 在 SeaweedFS 裡是 filer 的 /buckets/<name> 目錄，用 weed shell 建。
+#
+# 冪等手法（command 模組標準三段式，比照 scylla 的角色/keyspace 佈建）：
+# 先 s3.bucket.list 查現況 → 缺的才 s3.bucket.create → changed 精準。
+# =============================================================================
+
+# weed shell 是互動式 REPL：用 stdin 餵指令、-master 指向本機 master。
+# 查詢類 → changed_when: false + check_mode: false（--check 下也要真跑，
+# 否則後續引用 stdout 直接炸）
+- name: 查詢現有 bucket 清單
+  ansible.builtin.command:
+    cmd: docker exec -i seaweedfs weed shell -master={{ ansible_host }}:{{ seaweedfs_master_port }}
+    stdin: "s3.bucket.list"
+  register: seaweedfs_bucket_list
+  changed_when: false
+  check_mode: false
+  run_once: true
+
+# 每個宣告的 bucket 逐一比對：已存在（輸出含該名）就跳過。
+# subelements 把 projects 的 s3.buckets 攤平成 (project, bucket) 對
+- name: 建立缺少的 bucket
+  ansible.builtin.command:
+    cmd: docker exec -i seaweedfs weed shell -master={{ ansible_host }}:{{ seaweedfs_master_port }}
+    stdin: "s3.bucket.create -name {{ seaweedfs_tenant.1 }}"
+  loop: >-
+    {{ projects | dict2items | sort(attribute='key')
+       | selectattr('value.s3', 'defined')
+       | map(attribute='value') | list
+       | subelements('s3.buckets') }}
+  loop_control:
+    loop_var: seaweedfs_tenant
+    label: "{{ seaweedfs_tenant.0.name }}/{{ seaweedfs_tenant.1 }}"
+  when: seaweedfs_tenant.1 not in seaweedfs_bucket_list.stdout
+  changed_when: true
+  run_once: true

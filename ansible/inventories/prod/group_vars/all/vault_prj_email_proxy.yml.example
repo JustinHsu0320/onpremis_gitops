@@ -1,0 +1,22 @@
+---
+# =============================================================================
+# vault_prj_email_proxy.yml — email_proxy「專案」機密（Git 內必須是密文）
+# 建立方式（用與平台 vault 同一把 prod 鑰匙）：
+#   cp vault_prj_email_proxy.yml.example vault_prj_email_proxy.yml
+#   ansible-vault encrypt --encrypt-vault-id prod \
+#     inventories/prod/group_vars/all/vault_prj_email_proxy.yml
+#   ansible-vault edit inventories/prod/group_vars/all/vault_prj_email_proxy.yml
+#
+# 命名規約（CONVENTIONS §6/§10.4）：vault_prj_<project>_<用途>。
+# 每專案一檔的理由：MR diff 獨立、onboarding 是「加檔案」不是「編輯共用密文」
+# （vault 密文的 merge conflict 無法人工調解）。
+# =============================================================================
+vault_prj_email_proxy_pg_password: "CHANGEME"
+vault_prj_email_proxy_mq_password: "CHANGEME"
+# Scylla 密碼避免單/雙引號（cqlsh 引號結構），建議純英數
+vault_prj_email_proxy_scylla_password: "CHANGEME"
+vault_prj_email_proxy_jwt_secret: "CHANGEME"
+vault_prj_email_proxy_encryption_key: "CHANGEME"
+# 以下兩個是外部服務憑證，真值請向服務申請後填入
+vault_prj_email_proxy_microsoft_client_secret: "CHANGEME"
+vault_prj_email_proxy_sendgrid_api_key: "CHANGEME"

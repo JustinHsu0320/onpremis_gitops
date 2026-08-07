@@ -3,7 +3,7 @@
 # roles/pgbouncer/meta/main.yml
 # =============================================================================
 galaxy_info:
-  author: email-proxy-infra
+  author: platform-infra
   description: >-
     PgBouncer transaction-pooling 連線池（本機 PG 前置；上層 HAProxy 依
     Patroni 角色分流 RW/RO），客戶端 TLS + SCRAM + auth_query 動態驗證。

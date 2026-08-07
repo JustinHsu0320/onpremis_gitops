@@ -2,7 +2,7 @@
 # =============================================================================
 # roles/pgbouncer/defaults/main.yml — PgBouncer 可調參數（單一服務的 knob）
 #
-# 跨 role 契約變數（pgbouncer_port、pki_dir、pg_app_db、
+# 跨 role 契約變數（pgbouncer_port、pki_dir、pg_databases、
 # pgbouncer_auth_password、pgbouncer_admin_password）定義於
 # inventories/*/group_vars/，本檔只放「僅本 role 關心」的預設值。
 # =============================================================================
@@ -32,6 +32,10 @@ pgbouncer_default_pool_size: 20
 pgbouncer_min_pool_size: 5
 # 池滿時的額外緩衝連線數（撐過短暫尖峰，超過 reserve_pool_timeout 才動用）
 pgbouncer_reserve_pool_size: 5
+# 協定級 prepared statements（PgBouncer >= 1.21；Ubuntu 26.04 archive 版本符合）：
+# transaction pooling 下代客戶端追蹤/重放具名 PREPARE。SeaweedFS filer 的
+# postgres store 依賴它；0 = 停用（回到「app 不可用具名 PS」的舊語意）
+pgbouncer_max_prepared_statements: 200
 
 # ---------- auth_query 相關身分 ----------
 # 這兩個「PgBouncer 專用身分」是唯二進 userlist.txt 的帳號：

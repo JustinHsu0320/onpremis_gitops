@@ -21,7 +21,7 @@
 - name: 管理 /etc/hosts（inventory 主機 + VIP/服務別名）
   ansible.builtin.blockinfile:
     path: /etc/hosts
-    marker: "# {mark} email-proxy hosts — 此區塊由 Ansible（common role）管理，手動修改必被覆蓋"
+    marker: "# {mark} platform hosts — 此區塊由 Ansible（common role）管理，手動修改必被覆蓋"
     block: "{{ lookup('ansible.builtin.template', 'hosts.j2') }}"
     # 容器內 /etc/hosts 是 Docker 的 bind mount，原子性「寫暫存檔再 rename」會吃
     # EBUSY——只有這種環境才放棄原子寫入改為就地覆寫；prod VM 維持原子寫入保障
@@ -117,7 +117,7 @@
   ansible.posix.sysctl:
     name: "{{ item.key }}"
     value: "{{ item.value }}"
-    sysctl_file: /etc/sysctl.d/99-email-proxy.conf
+    sysctl_file: /etc/sysctl.d/99-platform.conf
     sysctl_set: true
     reload: true
     state: present
@@ -152,8 +152,8 @@
 # ---------- 8. 檔案描述子上限 ----------
 - name: 佈署 nofile limits 設定
   ansible.builtin.template:
-    src: limits-99-email-proxy.conf.j2
-    dest: /etc/security/limits.d/99-email-proxy.conf
+    src: limits-99-platform.conf.j2
+    dest: /etc/security/limits.d/99-platform.conf
     owner: root
     group: root
     mode: "0644"

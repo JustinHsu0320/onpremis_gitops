@@ -56,15 +56,15 @@ lab-up: lab-build ## 啟動 16 節點實驗室拓撲
 	cd ansible/lab && docker compose up -d && ./lab-wait-ready.sh
 
 lab-deploy: ## 在 mgmt-01 內對整個實驗室跑 site.yml（真正的端到端部署）
-	docker exec email-proxy-mgmt-01 bash -lc \
+	docker exec platform-mgmt-01 bash -lc \
 	  'cd /work/ansible && ansible-playbook -i $(LAB_INV) playbooks/site.yml'
 
 lab-verify: ## 只跑全鏈健檢
-	docker exec email-proxy-mgmt-01 bash -lc \
+	docker exec platform-mgmt-01 bash -lc \
 	  'cd /work/ansible && ansible-playbook -i $(LAB_INV) playbooks/99-verify.yml'
 
 lab-sh: ## 進入 mgmt-01（實驗室的 Ansible 控制節點）
-	docker exec -it email-proxy-mgmt-01 bash
+	docker exec -it platform-mgmt-01 bash
 
 lab-destroy: ## 銷毀實驗室（含 volume）
 	cd ansible/lab && docker compose down -v --remove-orphans

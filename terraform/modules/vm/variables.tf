@@ -169,7 +169,7 @@ variable "domain" {
 }
 
 variable "ansible_public_key" {
-  description = "ansible 自動化帳號的 SSH 公鑰（一行 authorized_keys 格式）。對應 mgmt-01 上的 ~/.ssh/id_email_proxy——這是 Layer 1 交棒給 Layer 2（Ansible）的唯一憑證"
+  description = "ansible 自動化帳號的 SSH 公鑰（一行 authorized_keys 格式）。對應 mgmt-01 上的 ~/.ssh/id_platform——這是 Layer 1 交棒給 Layer 2（Ansible）的唯一憑證"
   type        = string
 
   validation {

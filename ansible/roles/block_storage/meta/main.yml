@@ -1,7 +1,7 @@
 ---
 galaxy_info:
   role_name: block_storage
-  author: email-proxy infra team
+  author: platform-infra
   description: 將 Terraform 掛上的資料 VMDK 在 guest 內格式化並掛載（規劃書 §2.3）
   license: MIT
   min_ansible_version: "2.15"

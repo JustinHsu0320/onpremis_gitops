@@ -7,8 +7,10 @@
 # =============================================================================
 
 # ---------- stanza（pgBackRest 對「一套 PG 叢集」的命名） ----------
-# 必須與 Patroni 設定的 archive_command 中 --stanza= 一致（跨 role 契約）
-pgbackrest_stanza: email-proxy
+# 必須與 Patroni 設定的 archive_command 中 --stanza= 一致（跨 role 契約）。
+# ★ 對「已有備份鏈」的叢集改 stanza = 備份鏈斷代（需 stanza-create + 立即全備，
+# PITR 視窗歸零）——只能在部署前或維護窗改
+pgbackrest_stanza: pg-main
 
 # ---------- repo（備份存放處） ----------
 # NFS 掛載點下的子目錄；掛載本身由 20-storage（nfs_client role）完成

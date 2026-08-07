@@ -4,7 +4,7 @@
 # =============================================================================
 galaxy_info:
   role_name: nfs_server
-  author: email_proxy_infra
+  author: platform-infra
   description: NFSv4.1-only file server for shared attachments and pgBackRest repo (nfs-01)
   license: MIT
   min_ansible_version: "2.16"

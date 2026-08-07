@@ -264,29 +264,38 @@
   run_once: true
   no_log: true
 
-# 應用帳號：不存在才建（LIST ROLES 判斷）；密碼隨後永遠 ALTER 對齊 vault——
+# 各租戶應用帳號（CONVENTIONS §10：scylla_tenants 由 group_vars 從 projects
+# 推導）：不存在才建（LIST ROLES 判斷）；密碼隨後永遠 ALTER 對齊 vault——
 # vault 換密碼重跑本 playbook 即完成輪替，不需要手動 CQL。
 # （scylla_admin 自己的密碼輪替則相反，沒有自動路徑：先用舊密碼手動
 #   ALTER ROLE，再改 vault——別直接改 vault，probe 會失敗、play 會中止）
-- name: 建立應用帳號（不存在才建）
+- name: 建立各租戶應用帳號（不存在才建）
   ansible.builtin.command: >-
     docker exec -e SSL_CERTFILE=/etc/scylla/certs/ca.crt scylladb
     cqlsh {{ ansible_host }} {{ scylla_cql_port }} --ssl
     -u {{ scylla_admin_user }} -p '{{ scylla_admin_password }}'
-    -e "CREATE ROLE IF NOT EXISTS {{ scylla_app_user }}
-        WITH LOGIN = true AND PASSWORD = '{{ scylla_app_password }}'"
-  when: scylla_app_user not in scylla_existing_roles
+    -e "CREATE ROLE IF NOT EXISTS {{ scylla_tenant.user }}
+        WITH LOGIN = true AND PASSWORD = '{{ scylla_tenant.password }}'"
+  loop: "{{ scylla_tenants }}"
+  loop_control:
+    loop_var: scylla_tenant
+    label: "{{ scylla_tenant.user }}"
+  when: scylla_tenant.user not in scylla_existing_roles
   changed_when: true
   run_once: true
   no_log: true
 
 # 冪等語意說明：ALTER 到「與 vault 相同的密碼」對外不可觀察，視為 no-op
-- name: 對齊應用帳號密碼與 vault
+- name: 對齊各租戶帳號密碼與 vault
   ansible.builtin.command: >-
     docker exec -e SSL_CERTFILE=/etc/scylla/certs/ca.crt scylladb
     cqlsh {{ ansible_host }} {{ scylla_cql_port }} --ssl
     -u {{ scylla_admin_user }} -p '{{ scylla_admin_password }}'
-    -e "ALTER ROLE {{ scylla_app_user }} WITH PASSWORD = '{{ scylla_app_password }}'"
+    -e "ALTER ROLE {{ scylla_tenant.user }} WITH PASSWORD = '{{ scylla_tenant.password }}'"
+  loop: "{{ scylla_tenants }}"
+  loop_control:
+    loop_var: scylla_tenant
+    label: "{{ scylla_tenant.user }}"
   changed_when: false
   run_once: true
   no_log: true
@@ -317,30 +326,37 @@
 # NetworkTopologyStrategy + 明確 DC 名：SimpleStrategy 不認識 DC，
 # 日後加第二個 DC 時無法控制副本落點，一開始就用 NTS 是免費的保險。
 # table schema 是 app 的責任（migration），keyspace 這個「容器」是基礎設施的責任。
-- name: 建立應用 keyspace（NTS RF={{ scylla_keyspace_replication_factor }}）
+# subelements 把租戶 × keyspaces 攤平成 (tenant, keyspace) 對
+- name: 建立各租戶 keyspace（NTS RF={{ scylla_keyspace_replication_factor }}）
   ansible.builtin.command: >-
     docker exec -e SSL_CERTFILE=/etc/scylla/certs/ca.crt scylladb
     cqlsh {{ ansible_host }} {{ scylla_cql_port }} --ssl
     -u {{ scylla_admin_user }} -p '{{ scylla_admin_password }}'
-    -e "CREATE KEYSPACE IF NOT EXISTS {{ item }}
+    -e "CREATE KEYSPACE IF NOT EXISTS {{ scylla_tks.1 }}
         WITH replication = {'class': 'NetworkTopologyStrategy',
         '{{ scylla_dc }}': {{ scylla_keyspace_replication_factor }}}"
-  loop: "{{ scylla_keyspaces }}"
-  when: item not in scylla_existing_keyspaces
+  loop: "{{ scylla_tenants | subelements('keyspaces') }}"
+  loop_control:
+    loop_var: scylla_tks
+    label: "{{ scylla_tks.1 }}"
+  when: scylla_tks.1 not in scylla_existing_keyspaces
   changed_when: true
   run_once: true
   no_log: true
 
-# GRANT 天生冪等（重複授權無副作用）；app 帳號只拿自己 keyspace 的權限，
-# 不是超級使用者——DDL 遷移用 app 帳號跑得動（ALL 含 CREATE/ALTER），
-# 但動不了別的 keyspace 與角色管理
-- name: 授權應用帳號存取應用 keyspace
+# GRANT 天生冪等（重複授權無副作用）；租戶帳號只拿自己 keyspace 的權限，
+# 不是超級使用者——DDL 遷移用租戶帳號跑得動（ALL 含 CREATE/ALTER），
+# 但動不了別的 keyspace 與角色管理——這就是寬欄層的多專案租戶邊界
+- name: 授權各租戶帳號存取自身 keyspace
   ansible.builtin.command: >-
     docker exec -e SSL_CERTFILE=/etc/scylla/certs/ca.crt scylladb
     cqlsh {{ ansible_host }} {{ scylla_cql_port }} --ssl
     -u {{ scylla_admin_user }} -p '{{ scylla_admin_password }}'
-    -e "GRANT ALL PERMISSIONS ON KEYSPACE {{ item }} TO {{ scylla_app_user }}"
-  loop: "{{ scylla_keyspaces }}"
+    -e "GRANT ALL PERMISSIONS ON KEYSPACE {{ scylla_tks.1 }} TO {{ scylla_tks.0.user }}"
+  loop: "{{ scylla_tenants | subelements('keyspaces') }}"
+  loop_control:
+    loop_var: scylla_tks
+    label: "{{ scylla_tks.1 }} → {{ scylla_tks.0.user }}"
   changed_when: false
   run_once: true
   no_log: true
@@ -366,7 +382,8 @@
     scylla_roles_audit.stdout_lines | select('search', '[|]')
     | map('split', '|') | map('first') | map('trim')
     | reject('equalto', 'role') | reject('equalto', '')
-    | difference([scylla_admin_user, scylla_app_user]) | length == 0
+    | difference([scylla_admin_user] + (scylla_tenants | map(attribute='user') | list))
+    | length == 0
   retries: 6
   delay: 5
   changed_when: false
@@ -377,20 +394,22 @@
 
 # until 若在重試耗盡後仍不滿足（failed_when:false 讓上一步不直接中止），
 # 這裡以可讀訊息明確斷言並列出「多出來的角色名」。解析同款 split '|' 取第一欄。
-- name: 角色審計：只允許預期角色存在
+- name: 角色審計：只允許預期角色存在（admin + 全部租戶帳號）
   ansible.builtin.assert:
     that: >-
       scylla_roles_audit.stdout_lines
       | select('search', '[|]')
       | map('split', '|') | map('first') | map('trim')
       | reject('equalto', 'role') | reject('equalto', '')
-      | difference([scylla_admin_user, scylla_app_user])
+      | difference([scylla_admin_user] + (scylla_tenants | map(attribute='user') | list))
       | length == 0
     fail_msg: >-
       叢集上存在預期之外的角色（可能是首次部署窗口內被植入，或有人繞過
       Ansible 手動建帳號）：{{ scylla_roles_audit.stdout_lines
       | select('search', '[|]') | map('split', '|') | map('first') | map('trim')
       | reject('equalto', 'role') | reject('equalto', '')
-      | difference([scylla_admin_user, scylla_app_user]) | list }}
-    success_msg: "角色審計通過：僅 {{ scylla_admin_user }} 與 {{ scylla_app_user }}"
+      | difference([scylla_admin_user] + (scylla_tenants | map(attribute='user') | list)) | list }}
+    success_msg: >-
+      角色審計通過：僅 {{ scylla_admin_user }} 與租戶帳號
+      {{ scylla_tenants | map(attribute='user') | list | join(', ') }}
   run_once: true

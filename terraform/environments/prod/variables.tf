@@ -68,7 +68,7 @@ variable "template_name" {
 variable "vm_folder" {
   description = "收納本專案 VM 的 vSphere inventory 資料夾名稱（由本 root module 建立），方便 vCenter 內權限切分與視覺歸類"
   type        = string
-  default     = "email-proxy"
+  default     = "platform"
 
   validation {
     condition     = length(var.vm_folder) > 0
@@ -85,7 +85,7 @@ variable "domain" {
 }
 
 variable "ansible_public_key" {
-  description = "ansible 自動化帳號的 SSH 公鑰（一行 authorized_keys 格式）。私鑰只存在 mgmt-01 的 ~/.ssh/id_email_proxy——這是 Terraform 交棒給 Ansible 的唯一憑證"
+  description = "ansible 自動化帳號的 SSH 公鑰（一行 authorized_keys 格式）。私鑰只存在 mgmt-01 的 ~/.ssh/id_platform——這是 Terraform 交棒給 Ansible 的唯一憑證"
   type        = string
 }
 
@@ -98,9 +98,9 @@ variable "dns_servers" {
 # ---- 4. 網路參數 ---------------------------------------------------------------
 
 variable "port_group_prefix" {
-  description = "port group 命名前綴（完整名 = <prefix>-vlan<id>，例 email-proxy-vlan30）。同一 vDS 上可能還有別的專案，前綴避免命名衝突"
+  description = "port group 命名前綴（完整名 = <prefix>-vlan<id>，例 platform-vlan30）。同一 vDS 上可能還有別的專案，前綴避免命名衝突"
   type        = string
-  default     = "email-proxy"
+  default     = "platform"
 }
 
 variable "vlan_prefix_length" {

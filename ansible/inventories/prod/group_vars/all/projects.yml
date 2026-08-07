@@ -1,0 +1,16 @@
+---
+# =============================================================================
+# projects.yml — 專案登記簿（聚合器）。★ 全 repo 只有這裡定義 `projects`。
+#
+# 為什麼要聚合器（junior 必讀）：Ansible 預設 hash_behaviour=replace——
+# 兩個 group_vars 檔案都定義 `projects:` 時，後載入者「整包」覆蓋前者，
+# 且不會有任何警告。所以每個專案檔只定義自己的 project_<name>，由本檔
+# 顯式收編：新專案 = 加一個 project_<name>.yml + 在這裡登記一行，
+# PR diff 一目了然、零魔法。
+#
+# projects 是跨 role 契約變數（CONVENTIONS.md §10）；內含機密引用 →
+# 任何 loop 過它的 task 必須 loop_control label，落密碼者 no_log（§8-5）。
+# 新專案 onboarding 完整清單見 CONVENTIONS.md §10.5。
+# =============================================================================
+projects:  # noqa: var-naming[no-role-prefix] CONVENTIONS.md §10 契約變數，跨 role 介面
+  email_proxy: "{{ project_email_proxy }}"

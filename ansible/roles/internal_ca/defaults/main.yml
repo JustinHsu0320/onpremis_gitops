@@ -15,9 +15,11 @@
 # 葉憑證才用 2048（一年一換、講究握手效能，見 pki_leaf 的 pki_key_size）
 internal_ca_key_size: 4096
 
-# CN 命名（規劃書 §5 指定，不建議修改：全站信任庫與稽核文件都以此名稱識別）
-internal_ca_root_cn: email-proxy Root CA
-internal_ca_issuing_cn: email-proxy Issuing CA
+# CN 命名（CONVENTIONS.md §5；不建議修改：全站信任庫與稽核文件都以此名稱識別。
+# 注意改 CN = 全站 PKI 重建：Root/Issuing 重簽 → 所有葉憑證重簽 → 全服務 reload，
+# 只能在維護窗以 pki_leaf_force_renew=true 全站輪替執行）
+internal_ca_root_cn: PTC-NEC Internal Root CA
+internal_ca_issuing_cn: PTC-NEC Internal Issuing CA
 
 # 效期：Root +7300d（約 20 年）、Issuing +1825d（約 5 年）
 # Root 拉長是因為「換 Root = 全站 13 台重佈信任庫」成本極高；

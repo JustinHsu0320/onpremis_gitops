@@ -3,7 +3,7 @@
 # roles/keepalived/meta/main.yml
 # =============================================================================
 galaxy_info:
-  author: email-proxy-infra
+  author: platform-infra
   description: >-
     Keepalived 單播 VRRP（ADR-7）：由 group_vars 的 keepalived_instances 驅動的
     泛用 VIP 漂移 role——lb（服務/egress VIP）、postgres（PgBouncer VIP）、

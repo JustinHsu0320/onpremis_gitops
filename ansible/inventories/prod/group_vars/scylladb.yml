@@ -1,6 +1,6 @@
 ---
 # =============================================================================
-# group_vars/scylladb.yml — ScyllaDB 寬欄資料層（信件/附件冷資料）
+# group_vars/scylladb.yml — ScyllaDB 寬欄資料層
 # =============================================================================
 
 # ---------- PKI ----------
@@ -25,12 +25,15 @@ pki_certificates:
 storage_volumes:
   - { mountpoint: /var/lib/scylla, size_gb: 500 }
 
-# ---------- 應用 keyspace 與帳號 ----------
-# 兩個 keyspace 沿用 MIS 現況（set_usc：主要業務表；email_service：
-# emails_by_user / attachments_by_email 查詢表），都是 NTS RF=3。
-# app 端的對應別名：roles/app_stack/defaults 的 app_scylla_keyspace /
-# app_scylla_user（契約檢查點）；99-verify 也引用這兩個變數
-scylla_keyspaces:
-  - set_usc
-  - email_service
-scylla_app_user: set_usc_admin
+# ---------- 租戶清單（多專案平台的迭代點，CONVENTIONS §10） ----------
+# scylla_tenants 從 projects 推導：每個宣告 scylla 段的專案一個租戶
+#   { keyspaces: [...], user, password }
+# 消費者：roles/scylla/tasks/main.yml §6（app role / keyspace / GRANT 全部
+# per-tenant 迴圈）與角色審計白名單。含密碼引用 → 迭代方須 label + no_log。
+# email_proxy 的 keyspace 值（set_usc / email_service）沿用 MIS 現況——
+# keyspace 無法 rename，且日後以「加 DC」方式從 MIS 線上遷移時值必須一致
+# （宣告見 project_email_proxy.yml，此處只推導不定值）。
+scylla_tenants: >-
+  {{ projects | dict2items | sort(attribute='key')
+     | selectattr('value.scylla', 'defined')
+     | map(attribute='value.scylla') | list }}

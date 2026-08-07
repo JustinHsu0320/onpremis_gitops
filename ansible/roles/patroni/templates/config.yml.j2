@@ -33,6 +33,13 @@
    ] %}
 {# PG 參數 = role 預設 dict + 環境覆寫 dict（lab 降規只需覆寫少數 key） #}
 {% set _pg_params = patroni_pg_parameters | combine(patroni_pg_parameters_extra | default({})) %}
+{# shared_preload_libraries 保險口（extensions 用）：pgvector / pg_search 目前版本
+   都不需要 preload，此 list 預設空；若日後某 extension 版本要求 preload，
+   只改 group_vars 的 patroni_shared_preload_libraries。
+   注意「兩層真相」：對既有叢集改這裡無效，走 patronictl edit-config #}
+{% if patroni_shared_preload_libraries | default([]) | length > 0 %}
+{% set _pg_params = _pg_params | combine({'shared_preload_libraries': patroni_shared_preload_libraries | join(',')}) %}
+{% endif %}
 
 # scope：叢集識別名。同一個 etcd 可以住多個 PG 叢集，
 # Patroni 以 /<namespace>/<scope>/ 為 key 前綴讀寫 DCS，scope 就是「這一個叢集」

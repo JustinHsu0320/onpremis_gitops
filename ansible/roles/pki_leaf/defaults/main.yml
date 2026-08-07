@@ -56,5 +56,7 @@ pki_leaf_issuing_ca_cert: "{{ ca_root }}/issuing-ca.crt"
 pki_leaf_issuing_ca_key: "{{ ca_root }}/issuing-ca.key"
 pki_leaf_issued_dir: "{{ ca_root }}/issued"
 
-# 系統信任錨路徑（CONVENTIONS.md §4）：讓 curl / psql / docker 等系統工具信任內部 CA
-pki_leaf_trust_anchor: /usr/local/share/ca-certificates/email-proxy-internal-ca.crt
+# 系統信任錨路徑（CONVENTIONS.md §4）：讓 curl / psql / docker 等系統工具信任內部 CA。
+# 改檔名注意：update-ca-certificates「不會」自動刪舊檔——已部署環境改名時
+# 需先 file state=absent 清掉舊路徑，否則舊 CA 永久留在系統信任庫
+pki_leaf_trust_anchor: /usr/local/share/ca-certificates/platform-internal-ca.crt

@@ -6,7 +6,7 @@
 # nginx/caddy 托靜態檔的 multi-stage image）。
 # app repo 的 .gitlab-ci.yml 只需要：
 #   include:
-#     - project: "infra/email-proxy-infra"
+#     - project: "infra/onpremis-gitops"
 #       ref: main
 #       file: "gitlab/ci-templates/frontend.gitlab-ci.yml"
 #   variables:
@@ -34,7 +34,7 @@ variables:
   NPM_CONFIG_CACHE: "${CI_PROJECT_DIR}/.npm"
   # --- gitops repo 與 kustomize overlay 位置（契約說明見 backend 模板）---
   GITOPS_REPO_HOST: "gitlab.ptc-nec.com.tw"
-  GITOPS_REPO_PATH: "infra/email-proxy-infra"
+  GITOPS_REPO_PATH: "infra/onpremis-gitops"
   GITOPS_BRANCH: "main"
   GITOPS_KUSTOMIZE_DIR: "argocd/k8s/web-frontend/overlays/prod"
   KUSTOMIZE_IMAGE_NAME: "registry.ptc-nec.com.tw:5050/web/frontend"

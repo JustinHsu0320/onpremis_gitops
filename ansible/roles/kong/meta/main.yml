@@ -1,0 +1,20 @@
+---
+# =============================================================================
+# roles/kong/meta/main.yml
+# =============================================================================
+galaxy_info:
+  author: platform-infra
+  description: >-
+    Kong API Gateway（DB-less、Docker 容器、host network）：路由真值 = Git 內
+    的 projects 宣告（渲染 kong.yml 後 reload，Admin API 唯讀且僅綁 127.0.0.1）。
+    北向由邊界 HAProxy 分流、東西向走 keepalived VIP + kong-server 憑證。
+  license: MIT
+  min_ansible_version: "2.16"
+  platforms:
+    - name: Ubuntu
+      versions:
+        - all
+
+# 執行順序依賴（08-docker、10-pki）由 site.yml 的 play 順序保證，
+# 不用 meta dependencies 硬綁（同 keydb 的理由：--tags kong 單跑不拖 bootstrap）
+dependencies: []

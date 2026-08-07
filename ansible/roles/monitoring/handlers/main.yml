@@ -4,7 +4,7 @@
 #
 # 為什麼統一 state=restarted 而不是熱載入（kill -HUP）？
 #   Prometheus/Alertmanager 支援 SIGHUP reload 設定，但 compose 場景下得繞過
-#   compose 抽象去 docker kill -s HUP email-proxy-prometheus；而 Grafana 與
+#   compose 抽象去 docker kill -s HUP platform-prometheus；而 Grafana 與
 #   Blackbox 的部分設定又只吃重啟。與其兩套機制，不如統一 restart——
 #   單一服務中斷 < 2 秒，監控端短暫斷點可接受（被監控的服務本身不受影響），
 #   Prometheus TSDB 在 named volume，重啟不掉資料。

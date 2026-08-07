@@ -1,0 +1,19 @@
+---
+# =============================================================================
+# 50-apps.yml — 各專案應用堆疊（compose_app，宣告驅動）
+#
+# 舊 50-app.yml（email_proxy 專屬 app_stack）的多專案後繼者：
+# hosts = compose_apps parent 群組（children：app_email_proxy、未來的
+# app_<project>…），role 對每台主機只部署「宣告落在它身上」的專案。
+#
+# 前置依賴：該專案宣告用到的組件全就緒（email_proxy = 20/30/31/32/33/40）。
+# CI 部署：pipeline trigger 以 -e app_image_tag=<git-sha> 覆寫映像 tag。
+#
+# serial: 1 滾動：一次只動一台，LB 健檢自動摘除/回掛——正是零停機滾動的機制
+# =============================================================================
+- name: 佈署各專案應用堆疊（滾動）
+  hosts: compose_apps
+  tags: [app, apps]
+  serial: 1
+  roles:
+    - role: compose_app

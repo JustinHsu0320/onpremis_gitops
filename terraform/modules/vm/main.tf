@@ -194,7 +194,7 @@ resource "vsphere_virtual_machine" "vm" {
   }
 
   # 在 vCenter UI 的備註欄提醒人類：這台機器是 IaC 管的
-  annotation = "Managed by Terraform (email_proxy Layer 1)。手動改規格 = drift，請改 terraform/ 後 apply。"
+  annotation = "Managed by Terraform (platform Layer 1)。手動改規格 = drift，請改 terraform/ 後 apply。"
 
   lifecycle {
     # cloud-init 只在首次開機作用；之後若調整模板內容（例如換公鑰），

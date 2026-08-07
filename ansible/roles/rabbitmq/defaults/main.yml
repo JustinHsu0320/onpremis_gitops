@@ -4,7 +4,7 @@
 #
 # 分工原則（group_vars/all/vars.yml 檔頭）：
 #   - 「拓撲事實」與跨 role 契約變數放 inventories/*/group_vars/
-#     （rabbitmq_vhost / rabbitmq_app_user / rabbitmq_queues /
+#     （rabbitmq_tenants /
 #      rabbitmq_delayed_plugin_enabled 定義於 group_vars/rabbitmq.yml；
 #      rabbitmq_amqps_port / pki_dir / 機密別名定義於 group_vars/all/vars.yml）
 #   - 這裡只放「單一服務自己的 knob」，全部可被 inventory 覆寫
@@ -39,9 +39,10 @@ rabbitmq_disk_free_limit: 2GB
 # 涵蓋首次 bootstrap（三台先後啟動 + 互相發現）與設定變更後的重啟
 rabbitmq_startup_timeout: 120
 
-# ---------- 死信拓撲名稱（與 group_vars/rabbitmq.yml 的 rabbitmq_queues.dlx 對應） ----------
-rabbitmq_dlx_exchange: email_proxy_dlx     # fanout 死信 exchange
-rabbitmq_dlq_queue: email_proxy_dlq        # 死信最終落點 queue
+# ---------- 租戶宣告（驅動變數；真值由 group_vars/rabbitmq.yml 從 projects 推導） ----------
+# 每個租戶 { vhost, user, password, dlx_exchange, dlq_queue, queues: [{name, dlx}] }。
+# 空清單讓本 role 可獨立測試（只建叢集、不建任何租戶資源）
+rabbitmq_tenants: []
 
 # ---------- delayed message exchange plugin（重試機制依賴） ----------
 # 預設關閉（role 單獨使用時不強迫外網依賴）；prod/lab 由 group_vars/rabbitmq.yml 開啟

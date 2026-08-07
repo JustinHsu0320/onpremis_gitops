@@ -1,6 +1,6 @@
 ---
 # =============================================================================
-# .gitlab-ci.yml — email_proxy infra monorepo 的 GitOps 核心管線
+# .gitlab-ci.yml — 地端平台 infra monorepo 的 GitOps 核心管線
 #
 # 設計原則（第一次接手的人必讀）：
 #   1. stages 固定四段：lint → validate → plan → apply
@@ -27,7 +27,7 @@
 # workflow：整條 pipeline 的准入規則（避免 MR pipeline + branch pipeline 重複跑）
 #   - merge_request_event：MR 管線（lint / validate / plan 供 review）
 #   - push 到 main：完整管線（含 manual 的 apply 階段）
-#   - trigger：email_proxy app repo 透過 Pipeline Trigger API 觸發的
+#   - trigger：各專案 app repo 透過 Pipeline Trigger API 觸發的
 #     「部署新映像」管線（ADR-6，見檔尾 ansible-deploy-app）
 #   - web：允許從 GitLab UI 手動起管線（維運救火 / 重跑 apply 的通道）
 # -----------------------------------------------------------------------------
@@ -339,13 +339,13 @@ ansible-deploy:
 # ansible-deploy-app —— ADR-6 的下半段：app repo CI 觸發的映像更新部署
 #
 # 流程全貌：
-#   email_proxy app repo：test → build → kaniko 推 registry → curl 打
+#   專案 app repo（compose-app 模板）：test → build → kaniko 推 registry → curl 打
 #   本 repo 的 Pipeline Trigger API，帶 APP_IMAGE_TAG=<short-sha>
 #   → 本 job（rules 僅接受 trigger 來源）跑
-#     ansible-playbook playbooks/50-app.yml -e app_image_tag=<short-sha>
+#     ansible-playbook playbooks/50-apps.yml -e app_image_tag=<short-sha>
 #   → group_vars/all/vars.yml 的 app_images 契約
-#     （registry_host/email-proxy/{api,worker,smtp}:{{ app_image_tag }}）
-#     渲染出新 compose → 50-app.yml 的 serial: 1 配合 HAProxy 健檢滾動更新。
+#     （registry_host/<project-slug>/{api,worker,smtp}:{{ app_image_tag }}）
+#     渲染出新 compose → 50-apps.yml 的 serial: 1 配合 HAProxy 健檢滾動更新。
 #
 # 為什麼 app repo 不自己跑 ansible？權限最小化：inventory、vault 密碼、
 # SSH 金鑰只存在本 repo 的 CI context；app repo 只拿得到一個「只能觸發
@@ -365,8 +365,8 @@ ansible-deploy-app:
   resource_group: ansible-prod
   script:
     - cd ansible
-    # 只跑 50-app.yml（不是整個 site.yml）：映像更新不需要動資料層 / LB，
+    # 只跑 50-apps.yml（不是整個 site.yml）：映像更新不需要動資料層 / LB，
     # 部署面積越小、爆炸半徑越小
-    - ansible-playbook playbooks/50-app.yml -e "app_image_tag=${APP_IMAGE_TAG}"
+    - ansible-playbook playbooks/50-apps.yml -e "app_image_tag=${APP_IMAGE_TAG}"
   environment:
     name: production

@@ -1,0 +1,4 @@
+---
+# sw-02：S3 VIP 第一備援（BACKUP, 120）
+keepalived_state: BACKUP
+keepalived_priority: 120

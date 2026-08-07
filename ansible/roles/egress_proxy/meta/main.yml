@@ -3,7 +3,7 @@
 # roles/egress_proxy/meta/main.yml
 # =============================================================================
 galaxy_info:
-  author: email-proxy-infra
+  author: platform-infra
   description: >-
     Squid 顯式白名單正向代理（規劃書 §4）：地端環境唯一合法出網通道。
     預設拒絕、白名單放行（dstdomain 檔案由 egress_allowlist 驅動）、

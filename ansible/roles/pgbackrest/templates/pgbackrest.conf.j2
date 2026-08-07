@@ -50,7 +50,7 @@ start-fast=y
 # 名稱必須與 Patroni 的 archive_command --stanza= 一致（跨 role 契約），
 # 三台 pg 節點的本檔完全相同——failover 後新 leader 直接無縫接手備份。
 # =============================================================================
-[{{ pgbackrest_stanza | default('email-proxy') }}]
+[{{ pgbackrest_stanza | default('pg-main') }}]
 # 本機 PG data dir（pgBackRest 從這裡讀資料檔；連線用 libpq 預設的
 # 本機 unix socket + postgres peer auth，不需要密碼）
-pg1-path={{ pg_data_dir | default('/var/lib/postgresql/18/email-proxy') }}
+pg1-path={{ pg_data_dir | default('/var/lib/postgresql/18/main') }}

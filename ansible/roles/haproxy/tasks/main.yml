@@ -23,6 +23,24 @@
       目前值：{{ haproxy_profile | default('未定義') }}（請檢查該群組的 group_vars）
     success_msg: "haproxy_profile={{ haproxy_profile }}"
 
+# 邊界埠是「全 lb 共享的稀缺資源」（CONVENTIONS §3 埠登記紀律）：兩個專案宣告
+# 同一個 frontend 埠 = 部署後 haproxy 綁埠衝突。在「部署前」就爆出人話錯誤，
+# 而不是等 haproxy -c 或 reload 才炸
+- name: Edge profile：斷言專案 frontend 埠不跨專案重複
+  ansible.builtin.assert:
+    that:
+      - haproxy_edge_ports | length == (haproxy_edge_ports | unique | length)
+    fail_msg: >-
+      projects 的 edge frontends 埠有重複：{{ haproxy_edge_ports }}——
+      請先在 CONVENTIONS §3 登記唯一埠再宣告
+    success_msg: "edge frontend 埠無衝突：{{ haproxy_edge_ports | join(', ') }}"
+  vars:
+    haproxy_edge_ports: >-
+      {{ projects | default({}) | dict2items | selectattr('value.edge', 'defined')
+         | map(attribute='value.edge.frontends') | flatten
+         | map(attribute='port') | list }}
+  when: haproxy_profile == 'edge'
+
 # Ubuntu 26.04 官方 archive 的 haproxy 3.2：不加第三方 repo（規劃書鐵律）。
 # cache_valid_time 避免每次重跑都 apt update（冪等 + 提速）。
 - name: 安裝 HAProxy 套件

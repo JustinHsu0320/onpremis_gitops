@@ -3,7 +3,7 @@
 # roles/pgbackrest/meta/main.yml
 # =============================================================================
 galaxy_info:
-  author: email-proxy-infra
+  author: platform-infra
   description: >-
     pgBackRest 備份體系（規劃書 §9）：WAL 歸檔 + 每週日全備/每日差異備份到
     NFS（AES-256 靜態加密），保留 2 份全備 = 兩週 PITR 窗口。

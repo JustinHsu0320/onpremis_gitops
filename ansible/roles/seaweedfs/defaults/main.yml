@@ -1,0 +1,75 @@
+---
+# =============================================================================
+# roles/seaweedfs/defaults/main.yml — SeaweedFS S3 物件儲存可調參數
+#
+# 跨 role 契約變數（s3_vip、seaweedfs_s3_port、vrrp_pass_s3、pki_dir、
+# seaweedfs_pg_password、seaweedfs_s3_admin_access_key/secret_key、
+# pgbouncer_port）定義於 inventories/*/group_vars/all/vars.yml，本檔不重複定義。
+#
+# 【架構定位（junior 必讀）】
+#   3 節點，每台一個 `weed server` 容器同時跑 master(raft ×3) + volume +
+#   filer + s3。filer 元資料存 Patroni PG（database=seaweedfs）→ filer/s3
+#   層無本地狀態、三台等價可同時服務；HAProxy 綁 s3 VIP:8333 roundrobin。
+#   物件資料在本地 volume（獨立 XFS 資料碟），replication=010 跨節點 2 副本。
+#
+#   ★ 選型備註：原規劃 MinIO，因其社群版 2026-04 被上游 archive（無 CVE 修補）
+#   改用上游活躍的 SeaweedFS（Apache-2.0）。對外只暴露「S3 endpoint + projects
+#   宣告」——未來換牌只動本 role 內部，消費者契約不變。
+#
+#   ★ 架構約束（CONVENTIONS §10.6）：filer 元資料在 PG 內 → pgBackRest 的
+#   S3 repo 永遠只能當「次要」備份庫，PG 還原主路徑必須是 NFS repo1
+#   （否則循環依賴：還原 PG 需要讀 S3、讀 S3 需要 PG）。
+# =============================================================================
+
+# ---------- 容器映像 ----------
+# pin 版本（絕不用 :latest）；升級 = 改這行走 PR。
+# ★ 部署前查證當下最新穩定版並鎖定（chrislusf/seaweedfs 為官方映像，
+#   amd64/arm64 multi-arch——lab Apple Silicon 與 prod x86 都可直接 pull）
+seaweedfs_image: "chrislusf/seaweedfs:3.80"
+
+# ---------- 佈署路徑（CONVENTIONS.md §4） ----------
+seaweedfs_home: /opt/seaweedfs
+# block_storage 掛好的獨立 XFS 資料碟；volume 資料放其下子目錄後 bind mount 進容器
+seaweedfs_data_root: /var/lib/seaweedfs
+
+# 官方映像以 root 執行（entrypoint 無降權）；tls/conf 掛載目錄擁有者對齊 root。
+# 若日後要降權跑，先查證映像的 user 支援再改這組
+seaweedfs_container_uid: "0"
+seaweedfs_container_gid: "0"
+
+# ---------- 埠（8333 是跨 role 契約放 group_vars/all；其餘是 role 內部 knob） ----------
+# volume 上游預設 8080 與 app 契約埠（CONVENTIONS §3）衝突 → 改 8380。
+# gRPC 埠 = HTTP 埠 + 10000（SeaweedFS 慣例：19333 / 18380 / 18888）
+seaweedfs_master_port: 9333
+seaweedfs_volume_port: 8380
+seaweedfs_filer_port: 8888
+seaweedfs_metrics_port: 9327
+
+# ---------- 複寫拓撲 ----------
+# replication XYZ 語意：X=其他 DC 副本數 / Y=同 DC 其他 rack / Z=同 rack 其他機。
+# 每節點自成一個 rack（-volume.rack=<hostname>）→ "010" = 每物件 2 副本落在
+# 「不同節點」：掉任一節點讀寫皆不中斷、可用容量 = 原始容量 / 2。
+# 要 3 副本（更高耐久、容量 / 3）改 "020"。
+seaweedfs_replication: "010"
+seaweedfs_dc: dc1
+
+# ---------- filer 元資料庫（Patroni PG） ----------
+# 資料庫與帳號由 patroni role 的平台資料庫清單建立（group_vars/postgres.yml 的
+# pg_platform_databases）——34-seaweedfs 必須排在 30-postgres 之後。
+# 連線經 pgbouncer VIP（RW 口）：failover 對 filer 透明。
+seaweedfs_pg_database: seaweedfs
+seaweedfs_pg_user: seaweedfs
+# filer 對 PG 的連線池上限：3 節點各自持有，保守值避免吃掉 PgBouncer 池
+seaweedfs_pg_max_open: 20
+seaweedfs_pg_max_idle: 5
+
+# ---------- 部署後健檢 ----------
+seaweedfs_wait_timeout: 120
+# master 叢集收斂輪詢（leader 選出 + 三成員到齊）
+seaweedfs_cluster_ok_retries: 30
+seaweedfs_cluster_ok_delay: 5
+
+# ---------- 專案宣告（驅動變數） ----------
+# 真值在 group_vars/all/projects.yml；空 dict 讓本 role 可獨立測試——
+# 零租戶時 s3.json 仍渲染合法內容（只有 admin identity）、provision 整段 skip
+projects: {}  # noqa: var-naming[no-role-prefix] CONVENTIONS.md §10 契約變數，跨 role 介面不可加前綴

@@ -53,7 +53,7 @@ scrape_configs:
   - job_name: patroni
     metrics_path: /metrics
     static_configs:
-{% for h in groups['postgres'] | sort %}
+{% for h in groups['postgres'] | default([]) | sort %}
       - targets: ["{{ hostvars[h].ansible_host }}:{{ patroni_rest_port }}"]
         labels:
           instance: {{ h }}
@@ -65,20 +65,21 @@ scrape_configs:
   - job_name: rabbitmq
     metrics_path: /metrics
     static_configs:
-{% for h in groups['rabbitmq'] | sort %}
+{% for h in groups['rabbitmq'] | default([]) | sort %}
       - targets: ["{{ hostvars[h].ansible_host }}:{{ monitoring_rabbitmq_metrics_port }}"]
         labels:
           instance: {{ h }}
 {% endfor %}
 
-  # ---------- job: haproxy —— 三組 LB 的後端健康（內建 :8404 /metrics） ----------
-  # HAProxy 跑在三個地方（CONVENTIONS.md §1）：lb（邊界 443/465）、
-  # postgres（PgBouncer VIP RW/RO 分流）、rabbitmq（AMQPS VIP）——
-  # 後端 server UP/DOWN、佇列、連線數是「VIP 後面還剩幾台活的」的直接證據
+  # ---------- job: haproxy —— 各組 LB 的後端健康（內建 :8404 /metrics） ----------
+  # HAProxy 跑在四個地方（CONVENTIONS.md §1）：lb（邊界，專案 frontends）、
+  # postgres（PgBouncer VIP RW/RO 分流）、rabbitmq（AMQPS VIP）、
+  # seaweedfs（S3 VIP）——後端 server UP/DOWN、佇列、連線數是
+  # 「VIP 後面還剩幾台活的」的直接證據
   - job_name: haproxy
     metrics_path: /metrics
     static_configs:
-{% for h in (groups['lb'] + groups['postgres'] + groups['rabbitmq']) | sort %}
+{% for h in (groups['lb'] | default([]) + groups['postgres'] | default([]) + groups['rabbitmq'] | default([]) + groups['seaweedfs'] | default([])) | sort %}
       - targets: ["{{ hostvars[h].ansible_host }}:{{ monitoring_haproxy_metrics_port }}"]
         labels:
           instance: {{ h }}
@@ -92,7 +93,7 @@ scrape_configs:
   - job_name: etcd
     metrics_path: /metrics
     static_configs:
-{% for h in groups['etcd'] | sort %}
+{% for h in groups['etcd'] | default([]) | sort %}
       - targets: ["{{ hostvars[h].ansible_host }}:{{ monitoring_etcd_metrics_port }}"]
         labels:
           instance: {{ h }}
@@ -106,7 +107,7 @@ scrape_configs:
   - job_name: keydb
     metrics_path: /metrics
     static_configs:
-{% for h in groups['keydb'] | sort %}
+{% for h in groups['keydb'] | default([]) | sort %}
       - targets: ["{{ hostvars[h].ansible_host }}:{{ monitoring_keydb_exporter_port }}"]
         labels:
           instance: {{ h }}
@@ -120,27 +121,64 @@ scrape_configs:
   - job_name: scylla
     metrics_path: /metrics
     static_configs:
-{% for h in groups['scylladb'] | sort %}
+{% for h in groups['scylladb'] | default([]) | sort %}
       - targets: ["{{ hostvars[h].ansible_host }}:{{ monitoring_scylla_metrics_port }}"]
         labels:
           instance: {{ h }}
 {% endfor %}
 
+  # ---------- job: kong —— API gateway 指標（prometheus plugin，status 口 /metrics） ----------
+  # 全域 prometheus plugin（kong role 的 kong_global_plugins）輸出請求量/延遲/
+  # 5xx 比率 + kong_upstream_target_health（Kong 視角的後端健康）
+{% if groups['kong'] | default([]) | length > 0 %}
+  - job_name: kong
+    metrics_path: /metrics
+    static_configs:
+{% for h in groups['kong'] | default([]) | sort %}
+      - targets: ["{{ hostvars[h].ansible_host }}:{{ monitoring_kong_metrics_port }}"]
+        labels:
+          instance: {{ h }}
+{% endfor %}
+{% endif %}
+
+  # ---------- job: seaweedfs —— S3 物件儲存指標（weed server :9327 /metrics） ----------
+  # master/volume/filer/s3 的統一 metrics 口：volume 空間、S3 請求量、
+  # filer 延遲；碟容量由 node_exporter 的 NodeFilesystemAlmostFull 既有規則涵蓋
+{% if groups['seaweedfs'] | default([]) | length > 0 %}
+  - job_name: seaweedfs
+    metrics_path: /metrics
+    static_configs:
+{% for h in groups['seaweedfs'] | default([]) | sort %}
+      - targets: ["{{ hostvars[h].ansible_host }}:{{ monitoring_seaweedfs_metrics_port }}"]
+        labels:
+          instance: {{ h }}
+{% endfor %}
+{% endif %}
+
   # ---------- job: blackbox-https —— 使用者視角的端到端 HTTPS 探測 ----------
-  # 探 https://svc-api.{{ domain }}/health：一次驗完 VIP 漂移、HAProxy TLS 終止、
-  # 憑證有效性（probe_ssl_earliest_cert_expiry → CertExpirySoon）、後端 app 分流。
+  # 探測清單由 projects 登記簿的 monitoring.blackbox_probes 展開（CONVENTIONS §10）：
+  # 一次驗完 VIP 漂移、HAProxy TLS 終止、憑證有效性
+  # （probe_ssl_earliest_cert_expiry → CertExpirySoon）、後端分流。
   # relabel 三步驟是 blackbox exporter 的標準接法：
   #   1. 原 target（URL）塞進 /probe 的 ?target= 查詢參數
   #   2. instance 改回 URL——否則全部探測的 instance 都是 blackbox:9115，告警分不清探誰
   #   3. 實際抓取位址改成 compose 網路內的 blackbox 服務（service 名解析）
-  # blackbox 容器對 svc-api 等內部名稱的解析由 compose 的 extra_hosts 提供
+  # blackbox 容器對 svc-* 等內部名稱的解析由 compose 的 extra_hosts 提供
   # （與主機 /etc/hosts 相同的 VIP 條目，見 docker-compose.yml.j2）
+{% set monitoring_bb_http = projects | dict2items | sort(attribute='key')
+     | selectattr('value.monitoring.blackbox_probes', 'defined')
+     | map(attribute='value.monitoring.blackbox_probes') | flatten
+     | selectattr('module', 'equalto', 'http_2xx_internal_ca') | list %}
+{% if monitoring_bb_http | length > 0 %}
   - job_name: blackbox-https
     metrics_path: /probe
     params:
       module: [http_2xx_internal_ca]
     static_configs:
-      - targets: ["https://svc-api.{{ domain }}/health"]
+      - targets:
+{% for probe in monitoring_bb_http %}
+          - "{{ probe.target }}"
+{% endfor %}
     relabel_configs:
       - source_labels: [__address__]
         target_label: __param_target
@@ -148,11 +186,42 @@ scrape_configs:
         target_label: instance
       - target_label: __address__
         replacement: "blackbox:{{ monitoring_blackbox_port }}"
+{% endif %}
+
+  # ---------- job: blackbox-gateway-s3 —— Kong VIP 與 S3 VIP 的 TLS 探測 ----------
+  # 兩者都是 implicit TLS：一條探測同時涵蓋「VIP 沒人持有」（ProbeFailed）
+  # 與憑證到期（CertExpirySoon 自動涵蓋 kong-server / seaweedfs-server 憑證）
+{% set monitoring_gw_targets = [] %}
+{% if groups['kong'] | default([]) | length > 0 %}
+{% set _ = monitoring_gw_targets.append('kong-vip.' ~ domain ~ ':' ~ kong_proxy_tls_port) %}
+{% endif %}
+{% if groups['seaweedfs'] | default([]) | length > 0 %}
+{% set _ = monitoring_gw_targets.append('s3.' ~ domain ~ ':' ~ seaweedfs_s3_port) %}
+{% endif %}
+{% if monitoring_gw_targets | length > 0 %}
+  - job_name: blackbox-gateway-s3
+    metrics_path: /probe
+    params:
+      module: [tcp_tls_internal_ca]
+    static_configs:
+      - targets:
+{% for gw_target in monitoring_gw_targets %}
+          - "{{ gw_target }}"
+{% endfor %}
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: "blackbox:{{ monitoring_blackbox_port }}"
+{% endif %}
 
   # ---------- job: blackbox-amqps —— AMQPS VIP 的 TCP+TLS 探測 ----------
   # 探 rabbitmq-vip:5671 的 TLS 握手（不講 AMQP 協定）：驗 VIP 可達 +
   # rabbitmq-server 憑證有效；同樣產出 probe_ssl_earliest_cert_expiry，
-  # 讓 CertExpirySoon 一條規則同時覆蓋 svc-api 與 rabbitmq 兩張憑證
+  # 讓 CertExpirySoon 一條規則同時覆蓋各專案 edge 與 rabbitmq 憑證
+{% if groups['rabbitmq'] | default([]) | length > 0 %}
   - job_name: blackbox-amqps
     metrics_path: /probe
     params:
@@ -166,6 +235,7 @@ scrape_configs:
         target_label: instance
       - target_label: __address__
         replacement: "blackbox:{{ monitoring_blackbox_port }}"
+{% endif %}
 
   # ---------- job: blackbox-cql —— ScyllaDB 9042 的 TCP+TLS 探測 ----------
   # scylla 沒有 VIP（gocql 多 host 原生 failover），逐節點探 9042 的 TLS 握手：
@@ -174,13 +244,14 @@ scrape_configs:
   # 只有 scylla 是 implicit TLS、可零成本這樣探；PG 是 STARTTLS 式探不了）。
   # 用 IP 而非 FQDN：blackbox 容器的名稱解析只有 compose extra_hosts 的 VIP 條目，
   # 沒有各主機名；scylla-server 憑證的 SAN 含節點 IP（pki_leaf 預設），IP 探測可過驗證
+{% if groups['scylladb'] | default([]) | length > 0 %}
   - job_name: blackbox-cql
     metrics_path: /probe
     params:
       module: [tcp_tls_internal_ca]
     static_configs:
       - targets:
-{% for h in groups['scylladb'] | sort %}
+{% for h in groups['scylladb'] | default([]) | sort %}
           - "{{ hostvars[h].ansible_host }}:{{ scylla_cql_port }}"
 {% endfor %}
     relabel_configs:
@@ -190,6 +261,7 @@ scrape_configs:
         target_label: instance
       - target_label: __address__
         replacement: "blackbox:{{ monitoring_blackbox_port }}"
+{% endif %}
 
   # ---------- job: blackbox-vip-tcp —— 其餘兩個 VIP 的可達性探測 ----------
   # 補齊規劃書 §9 的「VIP 位置告警」：pgbouncer VIP(6432) 與 egress VIP(3128)
@@ -199,14 +271,23 @@ scrape_configs:
   #     不是 implicit TLS，blackbox 的 tcp+tls 握不了手 → 只驗 TCP 可達即可
   #   - egress 3128 是明文 HTTP proxy 埠，本就 tcp_connect
   # 探測失敗 → 下方 rules 的 ProbeFailed 告警（涵蓋「VIP 沒人持有」的主要故障）
+{% set monitoring_vip_tcp_targets = [] %}
+{% if groups['postgres'] | default([]) | length > 0 %}
+{% set _ = monitoring_vip_tcp_targets.append('pgbouncer-vip.' ~ domain ~ ':' ~ pgbouncer_port) %}
+{% endif %}
+{% if groups['egress'] | default([]) | length > 0 %}
+{% set _ = monitoring_vip_tcp_targets.append('egress-proxy.' ~ domain ~ ':' ~ squid_port) %}
+{% endif %}
+{% if monitoring_vip_tcp_targets | length > 0 %}
   - job_name: blackbox-vip-tcp
     metrics_path: /probe
     params:
       module: [tcp_connect]
     static_configs:
       - targets:
-          - "pgbouncer-vip.{{ domain }}:{{ pgbouncer_port }}"
-          - "egress-proxy.{{ domain }}:{{ squid_port }}"
+{% for vip_target in monitoring_vip_tcp_targets %}
+          - "{{ vip_target }}"
+{% endfor %}
     relabel_configs:
       - source_labels: [__address__]
         target_label: __param_target
@@ -214,3 +295,4 @@ scrape_configs:
         target_label: instance
       - target_label: __address__
         replacement: "blackbox:{{ monitoring_blackbox_port }}"
+{% endif %}

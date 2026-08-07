@@ -4,7 +4,7 @@
 #
 # 分工原則（同 group_vars/all/vars.yml 檔頭）：
 #   - 跨 role 契約變數「不在」這裡定義，只引用：
-#       pg_version / pg_cluster_scope / pg_app_db / pg_app_user
+#       pg_version / pg_cluster_scope / pg_databases
 #         → inventories/*/group_vars/postgres.yml
 #       pki_dir / patroni_rest_port / vlan_data_cidr / 各密碼別名
 #         → inventories/*/group_vars/all/vars.yml
@@ -37,7 +37,7 @@ patroni_packages:
 # 這裡包一層 default，讓 inventory 沒特別覆寫時也落在契約路徑上。
 # 刻意「不」直接定義 pg_data_dir：契約變數屬於 group_vars 的地盤，
 # role defaults 只做 fallback，避免兩處定義互搶
-patroni_pg_data_dir: "{{ pg_data_dir | default('/var/lib/postgresql/' ~ (pg_version | default('18')) ~ '/email-proxy') }}"
+patroni_pg_data_dir: "{{ pg_data_dir | default('/var/lib/postgresql/' ~ (pg_version | default('18')) ~ '/main') }}"
 
 # PG 二進位目錄：Debian/Ubuntu 多版本並存的固定佈局（/usr/lib/postgresql/<ver>/bin）。
 # Patroni 需要明確指定，否則會拿 PATH 上碰運氣找到的版本跑 initdb
@@ -128,7 +128,7 @@ patroni_pg_parameters:
   # archive_command 會失敗、WAL 在 pg_wal 累積——這是「預期行為」，
   # stanza-create 之後歸檔自動追上，不需人工介入
   archive_mode: "on"
-  archive_command: "pgbackrest --stanza={{ pgbackrest_stanza | default('email-proxy') }} archive-push %p"
+  archive_command: "pgbackrest --stanza={{ pgbackrest_stanza | default('pg-main') }} archive-push %p"
   # 低流量時段也強制每 60 秒切一次 WAL 段：PITR 的最壞資料視窗上限
   archive_timeout: 60s
   # 日誌交給 logging collector 落地（stderr → pg_log），journal 裡是 Patroni 自己的日誌
@@ -138,3 +138,46 @@ patroni_pg_parameters:
 # lab / 特殊環境的參數覆寫口（zz_lab_overrides.yml 定義降規值）；
 # template 內 combine 蓋上去，同 key 以 extra 為準
 patroni_pg_parameters_extra: {}
+
+# ---------- PG extensions（多專案平台的資料庫能力選單） ----------
+# Ubuntu archive 的 extension 套件走這個 list（ADR-2 正軌）：prod/lab 由
+# group_vars/postgres.yml 設 ["postgresql-{{ pg_version }}-pgvector"]。
+# 用 list 讓未來 postgis / pg_partman 等同一入口。
+# .so 必須「全部節點」就位（CREATE EXTENSION 只在 leader 跑，但 catalog 經
+# WAL 複寫到副本後，副本查詢 / failover 後的新 leader 都要載得到 .so）
+patroni_extension_packages: []
+
+# pg_search（ParadeDB BM25 全文檢索）：archive/PGDG 皆無此套件 → 比照
+# rabbitmq delayed plugin 的既有例外通道：GitHub release .deb + 版本釘死。
+# egress 白名單零變更（github.com + .githubusercontent.com 已放行）。
+# 預設關閉（role 單獨使用不強迫外網依賴）；prod/lab 由 group_vars 開啟。
+patroni_pg_search_enabled: false
+# ParadeDB 對 PG18 + Ubuntu 26.04 已出官方 .deb（postgresql-18-pg-search，
+# 2026-08 查證）；換版本請連 URL 檔名格式一起確認（上游命名不保證穩定，
+# 同 rabbitmq delayed plugin v4.0.7 的教訓）
+patroni_pg_search_version: "0.25.1"
+# lab（Apple Silicon DinD）是 aarch64、prod 是 x86_64——arch 段依 facts 自動判斷
+patroni_pg_search_deb_arch: "{{ 'arm64' if ansible_architecture == 'aarch64' else 'amd64' }}"
+patroni_pg_search_deb_codename: "{{ ansible_distribution_release }}"
+patroni_pg_search_deb_url: >-
+  https://github.com/paradedb/paradedb/releases/download/v{{
+  patroni_pg_search_version }}/postgresql-{{ pg_version | default('18')
+  }}-pg-search_{{ patroni_pg_search_version }}-1PARADEDB-{{
+  patroni_pg_search_deb_codename }}_{{ patroni_pg_search_deb_arch }}.deb
+# 建議釘 "sha256:..."（以 root 安裝的 .deb，來源完整性值得多這一行）；
+# 留空 = 不驗（首次導入時先實測拿到雜湊再回填）
+patroni_pg_search_deb_checksum: ""
+patroni_pg_search_download_retries: 3
+patroni_pg_search_download_delay: 5
+# proxy 三件套（use_egress_proxy=true 時套在 get_url 上），格式比照 rabbitmq role
+patroni_proxy_env:
+  http_proxy: "{{ egress_proxy_url }}"
+  https_proxy: "{{ egress_proxy_url }}"
+  no_proxy: "{{ no_proxy_list }}"
+
+# shared_preload_libraries 保險口：pgvector 不需要 preload；pg_search 0.15+
+# 在 PG17+ 也不需要（PG18 的目前版本同樣免 preload——若日後版本改變此性質，
+# 只改 group_vars 這個 list，不動 role）。非空時 template combine 進 PG 參數。
+# 注意：改這個對「既有叢集」無效（bootstrap.dcs 兩層真相，見 config.yml.j2
+# 檔頭註解），既有叢集走 patronictl edit-config + patronictl restart --pending
+patroni_shared_preload_libraries: []

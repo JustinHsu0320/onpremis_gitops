@@ -3,7 +3,7 @@
 # roles/haproxy/meta/main.yml
 # =============================================================================
 galaxy_info:
-  author: email-proxy-infra
+  author: platform-infra
   description: >-
     HAProxy「一份 role 三種面孔」：edge（443 TLS 終止 / 465 TCP passthrough）、
     postgres（Patroni REST 健檢驅動的 RW/RO 分流）、rabbitmq（AMQPS VIP +

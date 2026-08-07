@@ -129,7 +129,7 @@
 
 # ---------- 5. 部署自驗：埠就緒 ----------
 # 只驗 TCP 可達（TLS 握手與認證由 compose healthcheck 和 99-verify 驗）；
-# keydb-server SAN 含 127.0.0.1（group_vars/app.yml），本機迴環即可驗。
+# keydb-server SAN 含 127.0.0.1（group_vars/app_email_proxy.yml），本機迴環即可驗。
 - name: 等待 KeyDB 監聽 TLS 埠
   ansible.builtin.wait_for:
     host: 127.0.0.1

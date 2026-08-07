@@ -1,0 +1,37 @@
+---
+# =============================================================================
+# roles/compose_app/defaults/main.yml — 通用 compose 應用部署（宣告驅動）
+#
+# 【定位（junior 必讀）】本 role 是 email_proxy 專屬 app_stack 的泛化：
+# 「哪些容器、什麼映像、掛什麼、給什麼 env」全部來自 projects 登記簿的
+# compose_app 段（CONVENTIONS.md §10.3），role 本身不含任何專案名。
+# 一台主機可承載多個專案（各自獨立的 /opt/<project> compose 目錄）；
+# 本 role 迭代「宣告落在本機」的專案逐一部署。
+#
+# 跨 role 契約變數（registry_host、app_image_tag、pki_dir 等）在 group_vars；
+# 專案 env 內的機密引用 vault_prj_*（宣告檔的責任，role 只透傳）。
+# =============================================================================
+
+# ---------- 部署後自驗 ----------
+# 等待宣告的 wait_ports 開始監聽的上限（秒）；mock 首次 build + 容器啟動
+# 在低規 lab 上可能吃到數十秒
+compose_app_wait_timeout: 90
+# health 輪詢：埠開了不代表 handler 就緒，再輪詢到 200 為止
+compose_app_health_retries: 12
+compose_app_health_delay: 5
+
+# ---------- registry 認證（prod、可選） ----------
+# 兩者都有定義時才執行 docker_login；未定義 = registry 允許內網匿名 pull。
+# 需要認證時在 group_vars 或 -e 提供（密碼值務必放 vault）：
+#   compose_app_registry_username: deploy-token-user
+#   compose_app_registry_password: "{{ vault_compose_app_registry_password }}"
+# 刻意不給空字串預設——tasks 用 `is defined` 判斷，空字串會造成
+# 「看似有帳密其實是空值」的登入失敗誤導。
+
+# ---------- 驅動變數（安全空預設，真值在 group_vars/all） ----------
+projects: {}  # noqa: var-naming[no-role-prefix] CONVENTIONS.md §10 契約變數，跨 role 介面不可加前綴
+# mock 模式的專案清單（lab 由 zz_lab_overrides 覆寫）：列名的專案改用本地
+# build 的極簡模擬器（驗鏈路不驗商業邏輯）。泛化邊界：mock_service.py 只
+# 支援 api / smtp / worker 三種 service key——其他 key 的 service 在 mock
+# 模式下以 worker（no-op 心跳迴圈）行為執行
+compose_app_mock_projects: []  # noqa: var-naming[no-role-prefix] 跨 role 契約（vars.yml 定義、lab 覆寫）

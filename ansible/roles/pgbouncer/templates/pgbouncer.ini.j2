@@ -17,7 +17,12 @@
 [databases]
 ; 只連「本機」PostgreSQL。若本機是 replica，HAProxy 的 RW 健檢自然不會把
 ; 寫入流量送進來；千萬不要在這裡寫 VIP 或別台主機（會造成路由迴圈/腦裂風險）。
-{{ pg_app_db }} = host={{ pgbouncer_backend_host }} port={{ pgbouncer_backend_port }} dbname={{ pg_app_db }}
+; 資料庫清單由 pg_databases 展開（平台 + 各專案，group_vars/postgres.yml 組裝）
+{% for pgb_db in pg_databases %}
+{{ pgb_db.db }} = host={{ pgbouncer_backend_host }} port={{ pgbouncer_backend_port }} dbname={{ pgb_db.db }}
+{% endfor %}
+; auth_query 的落點（auth_dbname，見下）也要是可連的 database
+postgres = host={{ pgbouncer_backend_host }} port={{ pgbouncer_backend_port }} dbname=postgres
 
 [pgbouncer]
 ; ---------- 監聽 ----------
@@ -32,13 +37,15 @@ unix_socket_dir = /var/run/postgresql
 ; SCRAM：與 PG18 的預設密碼雜湊法一致，杜絕 md5 弱雜湊
 auth_type = scram-sha-256
 ; userlist.txt 只放 pgbouncer_auth / pgbouncer_admin 兩個「內部帳號」；
-; 一般使用者（如 {{ pg_app_user }}）改由下面的 auth_query 動態查——
+; 一般使用者（各專案的 db owner）改由下面的 auth_query 動態查——
 ; 好處：app 使用者改密碼只要改 PG，不用重佈 userlist（少一個機密散佈點）
 auth_file = /etc/pgbouncer/userlist.txt
 ; auth_query 用這個低權身分連 PG 執行（僅有 EXECUTE pgbouncer.get_auth 的權限）
 auth_user = {{ pgbouncer_auth_user }}
-; auth_query 固定打這個 db（而不是跟著客戶端要連的 db 跑）
-auth_dbname = {{ pg_app_db }}
+; auth_query 固定打 postgres 系統庫（而不是跟著客戶端要連的 db 跑）——
+; 多專案後認證鏈需要一個「永遠存在、不屬於任何專案」的落點，get_auth 函數
+; 由 patroni role 佈建在 postgres 庫（roles/patroni/tasks/app_db.yml）
+auth_dbname = postgres
 ; SECURITY DEFINER 函式：只回傳「單一使用者」的驗證資訊，
 ; 避免 auth_user 需要讀整張 pg_shadow 的過大權限（函式由 patroni role 佈建）
 auth_query = SELECT username, password FROM pgbouncer.get_auth($1)
@@ -70,6 +77,11 @@ server_reset_query =
 ; 各家驅動（JDBC/psycopg/Npgsql）愛送 extra_float_digits 這個 startup 參數，
 ; PgBouncer 不認得就會拒連——忽略它（PG 端行為不受影響）
 ignore_startup_parameters = extra_float_digits
+; 協定級 prepared statements 支援（PgBouncer >= 1.21）：transaction pooling 下
+; PgBouncer 代客戶端追蹤具名 prepared statements、在連線切換時重放 PREPARE。
+; 需要它的消費者：SeaweedFS filer 的 postgres store（Go database/sql 慣用
+; prepared statements）。一般 app 仍建議避免依賴 session 狀態（見上）
+max_prepared_statements = {{ pgbouncer_max_prepared_statements }}
 
 ; ---------- 管理/統計 ----------
 ; 只有 pgbouncer_admin 能連管理 console（psql -p {{ pgbouncer_port }} pgbouncer）

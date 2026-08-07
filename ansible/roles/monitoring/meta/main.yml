@@ -3,7 +3,7 @@
 # roles/monitoring/meta/main.yml
 # =============================================================================
 galaxy_info:
-  author: email-proxy-infra
+  author: platform-infra
   description: >-
     mgmt-01 監控堆疊：Prometheus + Grafana + Alertmanager + Blackbox
     （docker compose、映像版本 pin 死、內部 CA 端到端 TLS 探測與

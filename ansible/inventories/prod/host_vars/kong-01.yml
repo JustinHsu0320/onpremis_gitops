@@ -1,0 +1,5 @@
+---
+# kong-01：東西向 API gateway VIP（kong-vip:8443）的常態持有者（MASTER, 150）。
+# 北向流量不經 VIP（邊界 HAProxy roundrobin 直打兩台的 8000）——VIP 只服務東西向
+keepalived_state: MASTER
+keepalived_priority: 150

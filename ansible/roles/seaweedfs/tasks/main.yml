@@ -1,0 +1,132 @@
+---
+# =============================================================================
+# roles/seaweedfs/tasks/main.yml — SeaweedFS 3 節點 S3 物件儲存
+#
+# 前置依賴（由 site.yml 順序保證）：
+#   05-block-storage：/var/lib/seaweedfs 已掛獨立 XFS 資料碟
+#   08-docker：Docker Engine；10-pki：seaweedfs-server 憑證
+#   30-postgres：filer 元資料庫（database=seaweedfs）已由 patroni role 建立
+#
+# 首次成形（比照 rabbitmq 的註解）：master raft 三成員要「同時」啟動互相選主
+# ——34-seaweedfs.yml 刻意不用 serial，linear strategy 讓 compose up 在三台
+# 並行執行。副作用：對已運行叢集改設定重跑全群組時三台會同時 recreate →
+# S3 短暫全斷；計畫性變更請 --limit sw-01/02/03 逐台套用。
+# =============================================================================
+
+# ---------- 1. 目錄結構 ----------
+# conf 由 root 持有（單一事實來源在 Ansible，容器唯讀掛載）；
+# 資料子目錄建在 block_storage 掛好的資料碟之下（bind mount 進容器 /data）
+- name: 建立 SeaweedFS 目錄結構
+  ansible.builtin.file:
+    path: "{{ seaweedfs_item.path }}"
+    state: directory
+    owner: "{{ seaweedfs_item.owner }}"
+    group: "{{ seaweedfs_item.group }}"
+    mode: "{{ seaweedfs_item.mode }}"
+  loop:
+    - { path: "{{ seaweedfs_home }}", owner: root, group: root, mode: "0755" }
+    - { path: "{{ seaweedfs_home }}/conf", owner: root, group: root, mode: "0750" }
+    - { path: "{{ seaweedfs_home }}/tls", owner: "{{ seaweedfs_container_uid }}", group: "{{ seaweedfs_container_gid }}", mode: "0750" }
+    - { path: "{{ seaweedfs_data_root }}/data", owner: "{{ seaweedfs_container_uid }}", group: "{{ seaweedfs_container_gid }}", mode: "0750" }
+  loop_control:
+    loop_var: seaweedfs_item
+    label: "{{ seaweedfs_item.path }}"
+
+# ---------- 2. TLS 憑證（S3 口原生 TLS） ----------
+# copy 而非直掛 pki_dir 的理由同 keydb/scylla：pki_leaf 落地 root:root，
+# 容器專用一份、互不干擾。master/volume/filer/gRPC 走 VLAN 40 內部明文
+# （防火牆隔離的刻意取捨；gRPC TLS via security.toml 列為 TODO）
+- name: 複製 TLS 憑證與私鑰到容器掛載目錄
+  ansible.builtin.copy:
+    src: "{{ pki_dir }}/{{ seaweedfs_item.name }}"
+    dest: "{{ seaweedfs_home }}/tls/{{ seaweedfs_item.name }}"
+    remote_src: true
+    owner: "{{ seaweedfs_container_uid }}"
+    group: "{{ seaweedfs_container_gid }}"
+    mode: "{{ seaweedfs_item.mode }}"
+  loop:
+    - { name: ca.crt, mode: "0644" }
+    - { name: seaweedfs-server.crt, mode: "0644" }
+    - { name: seaweedfs-server.key, mode: "0600" }
+  loop_control:
+    loop_var: seaweedfs_item
+    label: "{{ seaweedfs_item.name }}"
+  no_log: true
+  notify: restart seaweedfs
+
+# PKI 契約保險絲（CONVENTIONS §5）：pki_certs_changed → recreate。
+# ★ prod 憑證輪替請 --limit 逐台（三台同時 recreate = S3 全斷 + raft quorum 失守）
+- name: 偵測 PKI 憑證輪替並排程容器重建
+  ansible.builtin.command: /bin/true
+  changed_when: true
+  when: pki_certs_changed | default(false)
+  notify: restart seaweedfs
+
+# ---------- 3. 設定檔 ----------
+# filer.toml 含 PG 密碼 → 0600 + no_log；s3.json 含 S3 憑證 → 同樣待遇
+- name: 佈署 filer.toml（filer 元資料庫連線）
+  ansible.builtin.template:
+    src: filer.toml.j2
+    dest: "{{ seaweedfs_home }}/conf/filer.toml"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  notify: restart seaweedfs
+
+- name: 佈署 s3.json（S3 身分與 bucket 授權）
+  ansible.builtin.template:
+    src: s3-config.json.j2
+    dest: "{{ seaweedfs_home }}/conf/s3.json"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  notify: restart seaweedfs
+
+- name: 佈署 docker-compose.yml
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ seaweedfs_home }}/docker-compose.yml"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart seaweedfs
+
+# ---------- 4. 啟動（三台並行；先 flush 讓首次部署以最終設定直接起） ----------
+- name: 立即套用尚未生效的容器變更
+  ansible.builtin.meta: flush_handlers
+
+- name: 啟動 SeaweedFS 容器
+  community.docker.docker_compose_v2:
+    project_src: "{{ seaweedfs_home }}"
+    state: present
+
+# ---------- 5. 部署自驗：S3 口就緒 + master 叢集收斂 ----------
+- name: 等待 SeaweedFS 監聽 S3 TLS 埠
+  ansible.builtin.wait_for:
+    host: "{{ ansible_host }}"
+    port: "{{ seaweedfs_s3_port | int }}"
+    timeout: "{{ seaweedfs_wait_timeout }}"
+
+# master /cluster/status 回 JSON（Leader 欄位非空 = raft 已選主）。
+# check_mode: false：唯讀查詢，--check 下也要真跑（比照 scylla 的 UN 輪詢）
+- name: 等待 master raft 叢集收斂（leader 選出）
+  ansible.builtin.uri:
+    url: "http://{{ ansible_host }}:{{ seaweedfs_master_port }}/cluster/status"
+    return_content: true
+  register: seaweedfs_cluster_status
+  until: >-
+    seaweedfs_cluster_status.status == 200 and
+    (seaweedfs_cluster_status.json.Leader | default('') | length) > 0
+  retries: "{{ seaweedfs_cluster_ok_retries }}"
+  delay: "{{ seaweedfs_cluster_ok_delay }}"
+  changed_when: false
+  check_mode: false
+  run_once: true
+
+# ---------- 6. 租戶 provisioning（bucket；run_once 對第一台） ----------
+- name: 佈建各專案的 S3 bucket
+  ansible.builtin.include_tasks: provision.yml
+  when: >-
+    projects | dict2items | selectattr('value.s3', 'defined') | list | length > 0

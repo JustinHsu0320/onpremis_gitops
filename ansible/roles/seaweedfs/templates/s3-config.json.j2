@@ -1,0 +1,46 @@
+{#
+  s3-config.json.j2 — SeaweedFS S3 身分與授權（宣告式，GitOps 真值）
+
+  admin identity：維運/佈建用（憑證在 vault：seaweedfs_s3_admin_*）。
+  每個宣告 s3 段的專案一個 identity：actions 限縮到「只能碰自己的 buckets」
+  ——這就是多專案的租戶邊界。改宣告 = 改 projects → 重跑 34 → recreate 生效。
+  含機密 → 佈署為 0600 + no_log（tasks/main.yml）。
+#}
+{% set s3_tenants = projects | dict2items | sort(attribute='key')
+                    | selectattr('value.s3', 'defined') | list %}
+{
+  "identities": [
+    {
+      "name": "admin",
+      "credentials": [
+        {
+          "accessKey": "{{ seaweedfs_s3_admin_access_key }}",
+          "secretKey": "{{ seaweedfs_s3_admin_secret_key }}"
+        }
+      ],
+      "actions": ["Admin", "Read", "Write", "List", "Tagging"]
+    }{% if s3_tenants | length > 0 %},{% endif %}
+
+{% for prj in s3_tenants %}
+    {
+      "name": "{{ prj.value.s3.user }}",
+      "credentials": [
+        {
+          "accessKey": "{{ prj.value.s3.access_key }}",
+          "secretKey": "{{ prj.value.s3.secret_key }}"
+        }
+      ],
+      "actions": [
+{% for bucket in prj.value.s3.buckets %}
+        "Read:{{ bucket }}",
+        "Write:{{ bucket }}",
+        "List:{{ bucket }}",
+        "Tagging:{{ bucket }}"{% if not loop.last %},{% endif %}
+
+{% endfor %}
+      ]
+    }{% if not loop.last %},{% endif %}
+
+{% endfor %}
+  ]
+}

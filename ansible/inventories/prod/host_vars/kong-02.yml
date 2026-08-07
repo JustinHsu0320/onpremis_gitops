@@ -1,0 +1,4 @@
+---
+# kong-02：東西向 API gateway VIP 的備援（BACKUP, 100）
+keepalived_state: BACKUP
+keepalived_priority: 100

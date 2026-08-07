@@ -24,7 +24,7 @@ vcenter_allow_unverified_ssl = false
 # ---- 2. vSphere 既存物件名稱（開始前先在 vCenter 確認這些名字都存在） -------------
 
 datacenter = "DC-TPE-01"          # Datacenter
-cluster    = "CL-EMAIL-PROXY"     # 運算叢集：>= 3 台 ESXi，HA + DRS 已啟用
+cluster    = "CL-PLATFORM"        # 運算叢集：>= 3 台 ESXi，HA + DRS 已啟用（vCenter 既有物件名，依實際環境填）
 vds_name   = "vds-prod-01"        # 既存分散式交換器（uplink trunk 已含 VLAN 10/20/30/40/50/99）
 
 datastore     = "ds-prod-sas-01"  # 一般碟：lb/app/mq/nfs/mgmt/gitlab/runner
@@ -34,13 +34,13 @@ datastore_ssd = "ds-prod-nvme-01" # SSD/NVMe：pg-01..03 與 scylla-01..03 整�
 # 必含 cloud-init（VMware guestinfo datasource）+ open-vm-tools，OS 碟掛 PVSCSI
 template_name = "tpl-ubuntu-26.04-cloudimg"
 
-vm_folder = "email-proxy" # vCenter 裡收納本專案 VM 的資料夾
+vm_folder = "platform" # vCenter 裡收納本平台 VM 的資料夾
 
 # ---- 3. VM 共用參數 ------------------------------------------------------------
 
 domain = "ptc-nec.com.tw"
 
-# mgmt-01 上 `cat ~/.ssh/id_email_proxy.pub` 的完整一行
+# mgmt-01 上 `cat ~/.ssh/id_platform.pub` 的完整一行
 ansible_public_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBOGUsExampleExampleExampleExampleExample ansible@mgmt-01"
 
 # 公司內部 DNS（只影響對外解析；主機互解走 Ansible 管的 /etc/hosts，ADR-5）
@@ -48,7 +48,7 @@ dns_servers = ["10.1.1.53", "10.1.1.54"]
 
 # ---- 4. 網路參數 ---------------------------------------------------------------
 
-port_group_prefix  = "email-proxy" # port group 全名 = email-proxy-vlan<id>
+port_group_prefix  = "platform" # port group 全名 = platform-vlan<id>
 vlan_prefix_length = 24            # CONVENTIONS.md §2：全部 /24
 
 # 每網段閘道 .1（L3 交換器）。機房慣例不同（如 .254）時整個 map 覆寫

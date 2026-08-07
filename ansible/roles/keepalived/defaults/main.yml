@@ -5,7 +5,7 @@
 # 跨 role 契約變數（CONVENTIONS.md §7 / group_vars 定義，本檔不重複給預設值）：
 #   keepalived_instances —— 本 role 的驅動變數（list of dict），
 #     欄位：name / vrid / vip / state / priority / auth_pass / peers_group /
-#           track_haproxy / track_squid（flags 可省略，省略視為 false）
+#           track_haproxy / track_squid / track_kong（flags 可省略，省略視為 false）
 #   keepalived_state、keepalived_priority —— host_vars 決定誰是 MASTER
 # =============================================================================
 

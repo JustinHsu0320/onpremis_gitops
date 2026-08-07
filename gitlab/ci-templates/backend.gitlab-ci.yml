@@ -5,7 +5,7 @@
 # 適用對象：公司各 Go 後端服務 repo（部署到 K8s、由 ArgoCD 同步）。
 # app repo 的 .gitlab-ci.yml 只需要：
 #   include:
-#     - project: "infra/email-proxy-infra"
+#     - project: "infra/onpremis-gitops"
 #       ref: main
 #       file: "gitlab/ci-templates/backend.gitlab-ci.yml"
 #   variables:
@@ -40,7 +40,7 @@ variables:
   GOPATH: "${CI_PROJECT_DIR}/.go"
   # --- gitops repo（= infra monorepo）與 kustomize overlay 位置 ---
   GITOPS_REPO_HOST: "gitlab.ptc-nec.com.tw"
-  GITOPS_REPO_PATH: "infra/email-proxy-infra"
+  GITOPS_REPO_PATH: "infra/onpremis-gitops"
   GITOPS_BRANCH: "main"
   GITOPS_KUSTOMIZE_DIR: "argocd/k8s/web-backend/overlays/prod"
   # kustomization.yaml 裡 images[].name 的「鍵」（deployment 引用的原始

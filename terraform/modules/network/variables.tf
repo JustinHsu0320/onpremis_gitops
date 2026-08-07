@@ -19,7 +19,7 @@ variable "vds_name" {
 variable "vlans" {
   description = <<-EOT
     要建立的 port group 清單（map）：
-      key   = port group 名稱（例如 "email-proxy-vlan10"）
+      key   = port group 名稱（例如 "platform-vlan10"）
       value = { vlan_id = VLAN 標籤號碼, description = 用途說明 }
     對照 CONVENTIONS.md §2：VLAN 10/20/30/40/50/99 共六個。
   EOT

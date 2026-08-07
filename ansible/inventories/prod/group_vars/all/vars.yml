@@ -1,11 +1,12 @@
 ---
 # =============================================================================
-# group_vars/all/vars.yml — 全站共用「非機密」變數（規劃書 §6.5）
+# group_vars/all/vars.yml — 全平台共用「非機密」變數
 #
 # 分工原則：
-#   - 這裡放「拓撲事實」（VIP、埠、路徑）與「機密別名」
+#   - 這裡放「平台拓撲事實」（VIP、埠、路徑）與「平台機密別名」
+#   - 專案資源宣告放 project_<name>.yml（CONVENTIONS.md §10），不放這裡
 #   - 可調參數的預設值放在各 role 的 defaults/main.yml（單一服務的 knob）
-#   - 機密真值只存在 vault.yml（密文），這裡以 vault_* 別名引用
+#   - 機密真值只存在 vault.yml / vault_prj_*.yml（密文），這裡以 vault_* 別名引用
 #   - lab 環境的降規覆寫在 inventories/lab/group_vars/all/zz_lab_overrides.yml
 # =============================================================================
 
@@ -36,14 +37,22 @@ vlan_storage_cidr: 10.20.40.0/24
 vlan_devops_cidr: 10.20.50.0/24
 vlan_mgmt_cidr: 10.20.99.0/24
 
+# vrid 配置表（CONVENTIONS §7）：VI_SVC=10 / VI_EGRESS=12 / VI_KONG=20 /
+# VI_PG=30 / VI_MQ=31 / VI_S3=40
 service_vip: 10.20.10.10          # 443/465 對外入口（keepalived VI_SVC, vrid 10）
 egress_vip: 10.20.10.20           # Squid 3128（keepalived VI_EGRESS, vrid 12）
+kong_vip: 10.20.20.20             # 東西向 API gateway 8443（keepalived VI_KONG, vrid 20）
 pgbouncer_vip: 10.20.30.10        # 6432 RW / 6433 RO（keepalived VI_PG, vrid 30）
 rabbitmq_vip: 10.20.30.20         # 5671 AMQPS（keepalived VI_MQ, vrid 31）
+s3_vip: 10.20.40.10               # SeaweedFS S3 8333（keepalived VI_S3, vrid 40）
 
 # ---------- 服務埠（跨 role 引用的才放這裡） ----------
 app_http_port: 8080
 app_smtp_port: 2525
+kong_proxy_port: 8000             # 北向（邊界 HAProxy → Kong，明文）
+kong_proxy_tls_port: 8443         # 東西向（TLS 由 Kong 自持 kong-server 憑證）
+kong_admin_port: 8001             # 僅 127.0.0.1（DB-less 唯讀；99-verify 斷言不外露）
+kong_status_port: 8100            # /status 健檢 + /metrics
 pgbouncer_port: 6432
 pgbouncer_ro_port: 6433
 patroni_rest_port: 8008
@@ -52,73 +61,79 @@ keydb_port: 6379                  # master（TLS-only）
 keydb_replica_port: 6380          # replica（TLS-only；cluster bus 為 port+10000）
 scylla_cql_port: 9042             # ScyllaDB CQL（TLS；gocql 另會自動用 19042 shard-aware，非契約）
 scylla_prometheus_port: 9180      # ScyllaDB 原生 metrics（monitoring 抓取）
+seaweedfs_s3_port: 8333           # S3 契約口（master/volume/filer 埠是 seaweedfs role 的內部 knob）
 squid_port: 3128
 
 # ---------- 路徑契約（CONVENTIONS.md §4） ----------
-pki_dir: /etc/email-proxy/pki
-ca_root: /opt/email-proxy-ca
-# 伺服器端實體路徑（nfs-01 本機看到的）
-nfs_v4_root: /export                     # NFSv4 pseudo-root（fsid=0），見 nfs_server 模板註解
-nfs_attachments_export: /export/mail-proxy/attachments
-nfs_pgbackup_export: /export/mail-proxy/pgbackup
+pki_dir: /etc/platform/pki
+ca_root: /opt/platform-ca
+# NFSv4 pseudo-root（fsid=0）；見 nfs_server 模板註解
+nfs_v4_root: /export
+# PG 備份庫（平台資源；專案的檔案共享匯出宣告在各 project_<name>.yml 的 nfs 段）
+nfs_pgbackup_export: /export/pgbackup
 # client 端掛載路徑 = 伺服器路徑去掉 pseudo-root 前綴（NFSv4 掛載語意）
-nfs_attachments_v4path: /mail-proxy/attachments
-nfs_pgbackup_v4path: /mail-proxy/pgbackup
+nfs_pgbackup_v4path: /pgbackup
 # NFS export 的客戶端 ACL（= NFS 伺服器「看到的」來源網段）。
 # prod：跨 VLAN 路由，來源就是 app/資料層的真實網段；
-# lab：多重掛網模擬，節點從 vlan40 的腳連 NFS → zz_lab_overrides 覆寫成儲存網段
+# lab：多重掛網模擬，節點從 vlan40 的腳連 NFS → zz_lab_overrides 覆寫成儲存網段。
+# nfs_attachments_clients 被 project_email_proxy.yml 的 nfs.exports 引用
+# （ACL 網段是「環境事實」而非專案決策，所以留在這裡讓 lab 可覆寫）
 nfs_attachments_clients: "{{ vlan_app_cidr }}"
 nfs_pgbackup_clients: "{{ vlan_data_cidr }}"
-attachments_mount: /mnt/attachments
 pgbackup_mount: /mnt/pgbackup
 
 # PKI 簽發主機（Issuing CA 所在）：永遠取 monitoring 群組第一台
 internal_ca_host: "{{ groups['monitoring'][0] }}"
 
-# ---------- 對外 proxy 三件套（規劃書 §4） ----------
+# ---------- 對外 proxy 三件套 ----------
 egress_proxy_url: "http://egress-proxy.{{ domain }}:{{ squid_port }}"
 # NO_PROXY 用「網域字尾 + 內網 CIDR」一次涵蓋，避免逐台列 host 的漏列風險
 no_proxy_list: "localhost,127.0.0.1,.{{ domain }},{{ internal_cidr }}"
 
 # ---------- 內部 Registry（GitLab Container Registry，ADR-6） ----------
 registry_host: "registry.{{ domain }}"
-# app 映像：CI build 一次 → push registry → 各節點 pull（取代各節點自行 build）
-app_image_tag: latest             # CI 部署時以 -e app_image_tag=<git-sha> 覆寫
-app_images:
-  api: "{{ registry_host }}/email-proxy/api:{{ app_image_tag }}"
-  worker: "{{ registry_host }}/email-proxy/worker:{{ app_image_tag }}"
-  smtp: "{{ registry_host }}/email-proxy/smtp:{{ app_image_tag }}"
+# 專案映像 tag：CI 部署時以 -e app_image_tag=<git-sha> 覆寫（project_<name>.yml
+# 的 compose_app.services 引用）。已知邊界：目前是全域值，多 compose 專案
+# 獨立部署時需拆 per-project tag（CONVENTIONS §10.6）
+app_image_tag: latest
 
-# ---------- 機密別名（規劃書 §6.5：role 一律引用這些別名，不直接碰 vault_*） ----------
+# ---------- compose_app 的 mock 開關（lab 覆寫） ----------
+# 列在這裡的專案，其 compose_app 走「本地 build mock 模擬器」模式
+# （lab 沒有 registry；驗鏈路不驗商業邏輯）。zz_lab_overrides 覆寫成 [email_proxy]
+compose_app_mock_projects: []
+
+# ---------- 平台機密別名（role 一律引用這些別名，不直接碰 vault_*） ----------
+# 專案機密別名不在這裡：各 project_<name>.yml 直接引用 vault_prj_<name>_*
 postgres_superuser_password: "{{ vault_postgres_superuser_password }}"
 postgres_replicator_password: "{{ vault_postgres_replicator_password }}"
-postgres_app_password: "{{ vault_postgres_app_password }}"
 pgbouncer_auth_password: "{{ vault_pgbouncer_auth_password }}"
 pgbouncer_admin_password: "{{ vault_pgbouncer_admin_password }}"
 patroni_restapi_password: "{{ vault_patroni_restapi_password }}"
 rabbitmq_admin_password: "{{ vault_rabbitmq_admin_password }}"
-rabbitmq_app_user_password: "{{ vault_rabbitmq_app_user_password }}"
 rabbitmq_erlang_cookie: "{{ vault_rabbitmq_erlang_cookie }}"
 keydb_password: "{{ vault_keydb_password }}"
 scylla_admin_password: "{{ vault_scylla_admin_password }}"
-scylla_app_password: "{{ vault_scylla_app_password }}"
+seaweedfs_pg_password: "{{ vault_seaweedfs_pg_password }}"
+seaweedfs_s3_admin_access_key: "{{ vault_seaweedfs_s3_admin_access_key }}"
+seaweedfs_s3_admin_secret_key: "{{ vault_seaweedfs_s3_admin_secret_key }}"
 vrrp_pass_svc: "{{ vault_vrrp_pass_svc }}"
 vrrp_pass_egress: "{{ vault_vrrp_pass_egress }}"
+vrrp_pass_kong: "{{ vault_vrrp_pass_kong }}"
 vrrp_pass_pg: "{{ vault_vrrp_pass_pg }}"
 vrrp_pass_mq: "{{ vault_vrrp_pass_mq }}"
-app_jwt_secret: "{{ vault_app_jwt_secret }}"
-app_encryption_key: "{{ vault_app_encryption_key }}"
-microsoft_client_secret: "{{ vault_microsoft_client_secret }}"
-sendgrid_api_key: "{{ vault_sendgrid_api_key }}"
+vrrp_pass_s3: "{{ vault_vrrp_pass_s3 }}"
 grafana_admin_password: "{{ vault_grafana_admin_password }}"
 pgbackrest_cipher_pass: "{{ vault_pgbackrest_cipher_pass }}"
 gitlab_root_password: "{{ vault_gitlab_root_password }}"
 
 # ---------- /etc/hosts 內容（manage_etc_hosts=true 時由 common role 寫入） ----------
-# 主機部分由 inventory 動態展開；這裡只列「非主機」的服務名稱（VIP 與別名）
+# 主機部分由 inventory 動態展開；這裡只列「非主機」的服務名稱（VIP 與別名）。
+# 專案新公開名（svc-<project>）上線時在此追加（CONVENTIONS §10.5-5）
 extra_hosts_entries:
   - { ip: "{{ service_vip }}", names: ["svc-api.{{ domain }}", "svc-api"] }
   - { ip: "{{ egress_vip }}", names: ["egress-proxy.{{ domain }}", "egress-proxy"] }
+  - { ip: "{{ kong_vip }}", names: ["kong-vip.{{ domain }}", "kong-vip"] }
   - { ip: "{{ pgbouncer_vip }}", names: ["pgbouncer-vip.{{ domain }}", "pgbouncer-vip"] }
   - { ip: "{{ rabbitmq_vip }}", names: ["rabbitmq-vip.{{ domain }}", "rabbitmq-vip"] }
+  - { ip: "{{ s3_vip }}", names: ["s3.{{ domain }}", "s3"] }
   - { ip: 10.20.50.11, names: ["gitlab.{{ domain }}", "registry.{{ domain }}"] }

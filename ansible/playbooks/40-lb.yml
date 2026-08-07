@@ -1,11 +1,14 @@
 ---
 # =============================================================================
-# 40-lb.yml — 邊界層（規劃書 §7.5：修正 config drift）
+# 40-lb.yml — 邊界層（修正 config drift）
 #
-# 同一份 haproxy role + 同一個模板套 lb-01/02，backend 由 groups['app'] 動態展開
-# ——「結構上不可能」出現多台設定不同步。serial: 1 滾動套用，VIP 全程有人接。
+# 同一份 haproxy role + 同一個模板套 lb-01/02：frontend/backend 由 projects
+# 登記簿的 edge 宣告渲染、後端節點由 groups[fe.backend_group] 動態展開
+# ——「結構上不可能」出現多台設定不同步，也不需要為新專案改模板。
+# 選了 Kong 組件時，宣告在 projects.*.kong 的公開名會先被 ACL 分流進 be_kong。
+# serial: 1 滾動套用，VIP 全程有人接。
 # =============================================================================
-- name: 邊界 HAProxy + Keepalived（443/465 → app）
+- name: 邊界 HAProxy + Keepalived（各專案 edge frontends）
   hosts: lb
   tags: [lb, edge]
   serial: 1

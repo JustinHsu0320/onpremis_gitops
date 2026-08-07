@@ -1,0 +1,61 @@
+---
+# =============================================================================
+# roles/compose_app/tasks/main.yml — 迭代「宣告落在本機」的專案逐一部署
+#
+# 前置依賴（由 site.yml 順序保證）：08-docker、10-pki、20-storage（NFS 掛載）、
+# 30..35（該專案宣告用到的資料層/閘道組件）、40-lb。
+# 滾動更新：50-apps.yml 用 serial: 1，一次只動一台，LB 健檢自動摘除/回掛。
+# =============================================================================
+
+# 本機要部署的專案清單：宣告了 compose_app 段、且 hosts_group 含本機。
+# groups[...] | default([])：組件選單下群組可能不存在（CONVENTIONS §8-9）
+- name: 計算本機承載的 compose 專案
+  ansible.builtin.set_fact:
+    compose_app_local_projects: >-
+      {{ projects | dict2items | sort(attribute='key')
+         | selectattr('value.compose_app', 'defined')
+         | selectattr('value.compose_app.hosts_group', 'in', group_names)
+         | list }}
+    # handler 的 recreate 佇列（見 handlers 檔頭）：每次執行重新起算
+    compose_app_deployed: []
+
+- name: 逐專案部署
+  ansible.builtin.include_tasks: one_project.yml
+  loop: "{{ compose_app_local_projects }}"
+  loop_control:
+    loop_var: compose_app_prj
+    label: "{{ compose_app_prj.key }}"
+
+# 把排隊中的 recreate 立刻執行掉再做自驗——否則 .env/憑證已變但容器
+# 還跑舊設定，下面的健檢會在「舊狀態」上假通過
+- name: 立即套用尚未生效的容器變更
+  ansible.builtin.meta: flush_handlers
+
+# ---------- 部署自驗：埠就緒 + /health ----------
+# 埠即契約（CONVENTIONS.md §3）：宣告的 wait_ports 必須在節點上聽起來，
+# LB 後端與 99-verify 都指著它們。serial: 1 滾動時，這裡擋住
+# 「本台還沒 ready 就去動下一台」的連鎖故障
+- name: 等待各專案宣告的監聽埠
+  ansible.builtin.wait_for:
+    host: 127.0.0.1
+    port: "{{ compose_app_port.1 | int }}"
+    timeout: "{{ compose_app_wait_timeout }}"
+  loop: "{{ compose_app_local_projects | subelements('value.compose_app.wait_ports', skip_missing=True) }}"
+  loop_control:
+    loop_var: compose_app_port
+    label: "{{ compose_app_port.0.key }}:{{ compose_app_port.1 }}"
+
+# 埠開了不代表 handler 就緒（真 app 可能還在跑 migration/暖機），
+# 輪詢到 200 才放行；這也是 99-verify 邊界健檢的前哨版
+- name: 部署自驗：各專案 /health 應回 200
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ compose_app_hc.value.compose_app.health.port }}{{ compose_app_hc.value.compose_app.health.path }}"
+    status_code: 200
+  register: compose_app_health_probe
+  until: compose_app_health_probe.status == 200
+  retries: "{{ compose_app_health_retries }}"
+  delay: "{{ compose_app_health_delay }}"
+  loop: "{{ compose_app_local_projects | selectattr('value.compose_app.health', 'defined') | list }}"
+  loop_control:
+    loop_var: compose_app_hc
+    label: "{{ compose_app_hc.key }}"

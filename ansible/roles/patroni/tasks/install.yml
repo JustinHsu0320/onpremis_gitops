@@ -46,6 +46,42 @@
     update_cache: true
     cache_valid_time: 3600
 
+# extension 的 .so 必須「全部節點」就位：CREATE EXTENSION 只在 leader 跑
+# （app_db.yml），但 catalog 經 WAL 複寫到副本後，副本查詢與 failover 後的
+# 新 leader 都要載得到 .so——缺套件的副本一碰到 extension 物件就報
+# could not access file "$libdir/..."。還原情境同理：pgbackrest restore 前
+# 套件要先就位（還原 runbook 的硬性順序，見 README 備份章）
+- name: 安裝 PG extension 套件（Ubuntu archive：pgvector 等）
+  ansible.builtin.apt:
+    name: "{{ patroni_extension_packages }}"
+    state: present
+  when: patroni_extension_packages | length > 0
+
+- name: 安裝 pg_search（ParadeDB GitHub release .deb）
+  when: patroni_pg_search_enabled
+  block:
+    # dest 檔名含版本與架構：換版 = 新檔名 = 重新下載；同版重跑 get_url
+    # 直接跳過（冪等，比照 rabbitmq delayed plugin 的下載慣例）
+    - name: 下載 pg_search .deb
+      ansible.builtin.get_url:
+        url: "{{ patroni_pg_search_deb_url }}"
+        dest: "/var/cache/apt/archives/pg_search_{{ patroni_pg_search_version }}_{{ patroni_pg_search_deb_arch }}.deb"
+        checksum: "{{ patroni_pg_search_deb_checksum | default(omit, true) }}"
+        owner: root
+        group: root
+        mode: "0644"
+      environment: "{{ patroni_proxy_env if use_egress_proxy else {} }}"
+      register: patroni_pg_search_download
+      retries: "{{ patroni_pg_search_download_retries }}"
+      delay: "{{ patroni_pg_search_download_delay }}"
+      until: patroni_pg_search_download is succeeded
+
+    # apt 模組對本地 .deb 依版本判斷冪等；升級 .so 不影響運行中 backend
+    # （backend 下次載入才吃到新版；catalog 版本由 ALTER EXTENSION 收斂）
+    - name: 安裝 pg_search .deb
+      ansible.builtin.apt:
+        deb: "/var/cache/apt/archives/pg_search_{{ patroni_pg_search_version }}_{{ patroni_pg_search_deb_arch }}.deb"
+
 # Debian 系套件 postinst 會自動 enable + start patroni——但此刻 config.yml
 # 還不存在（或不是我們的內容），讓它搶跑只會進入 fail/restart 循環，
 # 更糟的是若殘留了任何舊設定，可能以錯誤身分接觸 DCS。

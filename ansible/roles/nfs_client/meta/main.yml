@@ -4,7 +4,7 @@
 # =============================================================================
 galaxy_info:
   role_name: nfs_client
-  author: email_proxy_infra
+  author: platform-infra
   description: Mount NFSv4.1 shares (attachments on app nodes, pgBackRest repo on pg nodes)
   license: MIT
   min_ansible_version: "2.16"

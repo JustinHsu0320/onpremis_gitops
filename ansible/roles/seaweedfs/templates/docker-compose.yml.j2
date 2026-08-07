@@ -1,0 +1,52 @@
+{#
+  docker-compose.yml.j2 — SeaweedFS all-in-one（weed server：master+volume+filer+s3）
+
+  為什麼 network_mode: host：
+    1. 埠即契約（CONVENTIONS §3）：8333/9333/8380/8888/9327 直接綁節點 IP。
+    2. master raft peers 用「節點 IP」互指，免 NAT 位址錯亂。
+    3. HAProxy 綁 VIP:8333、weed 綁節點 IP:8333——埠共存原則。
+
+  旗標備註：★ 確切旗標名以鎖定版本 `weed server -h` 為準（lab 全鏈實測是
+  唯一可信驗證）。filer.toml 由 weed 自動從 /etc/seaweedfs/filer.toml 讀取。
+#}
+# ===== {{ ansible_managed }} =====
+services:
+  seaweedfs:
+    image: "{{ seaweedfs_image }}"
+    container_name: seaweedfs
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - {{ seaweedfs_data_root }}/data:/data
+      - {{ seaweedfs_home }}/conf/filer.toml:/etc/seaweedfs/filer.toml:ro
+      - {{ seaweedfs_home }}/conf/s3.json:/etc/seaweedfs/s3.json:ro
+      - {{ seaweedfs_home }}/tls:/tls:ro
+    command: >-
+      server
+      -dir=/data
+      -ip={{ ansible_host }}
+      -dataCenter={{ seaweedfs_dc }}
+      -rack={{ inventory_hostname }}
+      -master
+      -master.port={{ seaweedfs_master_port }}
+      -master.peers={% for h in groups['seaweedfs'] | default([]) | sort %}{{ hostvars[h].ansible_host }}:{{ seaweedfs_master_port }}{% if not loop.last %},{% endif %}{% endfor %}
+      -master.defaultReplication={{ seaweedfs_replication }}
+      -volume
+      -volume.port={{ seaweedfs_volume_port }}
+      -volume.max=0
+      -filer
+      -filer.port={{ seaweedfs_filer_port }}
+      -s3
+      -s3.port={{ seaweedfs_s3_port }}
+      -s3.cert.file=/tls/seaweedfs-server.crt
+      -s3.key.file=/tls/seaweedfs-server.key
+      -s3.config=/etc/seaweedfs/s3.json
+      -metricsPort={{ seaweedfs_metrics_port }}
+    healthcheck:
+      # master /cluster/status 有 leader 即視為健康（S3 口是 TLS，
+      # 容器內未必有 CA 可驗，master 明文口最適合當容器層健檢）
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:{{ seaweedfs_master_port }}/cluster/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s

@@ -1,9 +1,8 @@
 # =============================================================================
 # environments/prod/main.tf — prod 環境的機器清單與組裝
 #
-# 這個檔案是 Layer 1 的「事實陳述」：18 台 VM（16 台服務 + 2 台 DevOps）、
-# 6 個 VLAN port group、5 組反親和規則。每一台的規格逐台對照規劃書 §2.2
-# 資源配額表；每一個 IP 對照 CONVENTIONS.md §2 與
+# 這個檔案是 Layer 1 的「事實陳述」：23 台 VM（21 台服務 + 2 台 DevOps）、
+# 6 個 VLAN port group、7 組反親和規則。每一個 IP 對照 CONVENTIONS.md §2 與
 # ansible/inventories/prod/hosts.yml（一一對應，兩邊都改才算改完——ADR-1，
 # inventory 是主機清單的唯一事實來源，Terraform 照抄它，不反過來）。
 #
@@ -23,10 +22,17 @@ data "vsphere_compute_cluster" "cluster" {
 }
 
 # 收納 VM 的 inventory 資料夾（純視覺/權限歸類，不影響任何執行期行為）
-resource "vsphere_folder" "email_proxy" {
+resource "vsphere_folder" "platform" {
   path          = var.vm_folder
   type          = "vm"
   datacenter_id = data.vsphere_datacenter.dc.id
+}
+
+# 平台化改名（email_proxy → platform）：moved block 讓 Terraform 做 state 級
+# 更名，而不是 destroy/create（資料夾重建會把既有 VM 掃出資料夾）
+moved {
+  from = vsphere_folder.email_proxy
+  to   = vsphere_folder.platform
 }
 
 # ---- locals：VLAN 與 VM 的完整清單 ---------------------------------------------
@@ -38,9 +44,9 @@ locals {
   # ---------------------------------------------------------------------------
   vlans = {
     "${var.port_group_prefix}-vlan10" = { vlan_id = 10, description = "邊界層 10.20.10.0/24：服務 VIP .10 / egress VIP .20 / lb-01..02" }
-    "${var.port_group_prefix}-vlan20" = { vlan_id = 20, description = "應用層 10.20.20.0/24：app-01..03（含同居 KeyDB）" }
+    "${var.port_group_prefix}-vlan20" = { vlan_id = 20, description = "應用層 10.20.20.0/24：kong VIP .20 / kong-01..02 .21-.22 / app-01..03 .11-.13（含同居 KeyDB）" }
     "${var.port_group_prefix}-vlan30" = { vlan_id = 30, description = "資料層 10.20.30.0/24：PgBouncer VIP .10 / pg-01..03 / RabbitMQ VIP .20 / mq-01..03 / scylla-01..03 .31-.33" }
-    "${var.port_group_prefix}-vlan40" = { vlan_id = 40, description = "儲存層 10.20.40.0/24：nfs-01" }
+    "${var.port_group_prefix}-vlan40" = { vlan_id = 40, description = "儲存層 10.20.40.0/24：S3 VIP .10 / nfs-01 .11 / sw-01..03 .21-.23" }
     "${var.port_group_prefix}-vlan50" = { vlan_id = 50, description = "DevOps 10.20.50.0/24：gitlab-01 / runner-01" }
     "${var.port_group_prefix}-vlan99" = { vlan_id = 99, description = "管理層 10.20.99.0/24：mgmt-01（Ansible 控制 + PKI + 監控）" }
   }
@@ -83,6 +89,20 @@ locals {
   ]
 
   # ---------------------------------------------------------------------------
+  # SeaweedFS 節點的資料碟——抽成 local 讓 sw-01..03 完全一致。
+  # 單顆 1000 GB（volume 資料 + idx），獨立 PVSCSI 控制器（1 號）。
+  # thin=true 沿用 nfs-01 的理由：物件資料是逐步長大的冷資料，thick 一次吃掉
+  # 1TB×3 太浪費；配套是 datastore 容量告警。independent_persistent：
+  # 排除在 VM 快照外（有狀態資料，備援靠 replication=010 跨節點 2 副本）。
+  # 不佔 SSD datastore：EC/複寫是吞吐型負載，非 fsync 延遲敏感（對比 pg/scylla）。
+  # Guest 內 mkfs.xfs + UUID fstab 掛到 /var/lib/seaweedfs 由 block_storage
+  # role 處理（05 階段，依容量認碟）——與 pg/mq/scylla 完全同構。
+  # ---------------------------------------------------------------------------
+  sw_extra_disks = [
+    { label = "disk1-seaweedfs", size_gb = 1000, thin = true, independent_persistent = true, unit_number = 0, scsi_controller = 1 },
+  ]
+
+  # ---------------------------------------------------------------------------
   # VM 完整清單（規劃書 §2.2 資源配額表 + VLAN 50 的 2 台 DevOps 機）
   #
   # 欄位說明：
@@ -105,8 +125,21 @@ locals {
       datastore = var.datastore, extra_disks = []
     }
 
-    # ---- 應用層（VLAN 20）：api/worker/smtp compose + 同居 KeyDB ----
-    # KeyDB 是純快取（14 天 TTL）不切資料碟，用 OS 碟即可（規劃書 §2.3/§2.4）
+    # ---- 應用層（VLAN 20）：Kong API Gateway（DB-less，無狀態） ----
+    # 規格比照 lb（同為無狀態 L7 元件）；宣告式組態在 Git、容器由 Ansible 管
+    "kong-01" = {
+      cpu       = 2, memory_mb = 4096, os_disk_gb = 40
+      vlan      = 20, ipv4 = "10.20.20.21"
+      datastore = var.datastore, extra_disks = []
+    }
+    "kong-02" = {
+      cpu       = 2, memory_mb = 4096, os_disk_gb = 40
+      vlan      = 20, ipv4 = "10.20.20.22"
+      datastore = var.datastore, extra_disks = []
+    }
+
+    # ---- 應用層（VLAN 20）：email_proxy 專案 app（api/worker/smtp + 同居 KeyDB） ----
+    # KeyDB 是純快取（TTL 語意）不切資料碟，用 OS 碟即可
     "app-01" = {
       cpu       = 4, memory_mb = 8192, os_disk_gb = 60
       vlan      = 20, ipv4 = "10.20.20.11"
@@ -201,6 +234,24 @@ locals {
       ]
     }
 
+    # ---- 儲存層（VLAN 40）：SeaweedFS S3 物件儲存 ×3（master raft + volume + filer + s3） ----
+    # filer 元資料在 PG（不佔本地碟）；volume 資料碟規格見上面 sw_extra_disks
+    "sw-01" = {
+      cpu       = 4, memory_mb = 8192, os_disk_gb = 40
+      vlan      = 40, ipv4 = "10.20.40.21"
+      datastore = var.datastore, extra_disks = local.sw_extra_disks
+    }
+    "sw-02" = {
+      cpu       = 4, memory_mb = 8192, os_disk_gb = 40
+      vlan      = 40, ipv4 = "10.20.40.22"
+      datastore = var.datastore, extra_disks = local.sw_extra_disks
+    }
+    "sw-03" = {
+      cpu       = 4, memory_mb = 8192, os_disk_gb = 40
+      vlan      = 40, ipv4 = "10.20.40.23"
+      datastore = var.datastore, extra_disks = local.sw_extra_disks
+    }
+
     # ---- 管理層（VLAN 99）：Ansible 控制 + Issuing CA + Prometheus/Grafana ----
     # 200 GB 監控 TSDB 碟。TSDB 可重建（丟了只是少歷史曲線），但仍設
     # independent_persistent：TSDB 的持續寫入會讓 VM 快照 delta 暴長
@@ -243,7 +294,7 @@ module "network" {
   vlans      = local.vlans
 }
 
-# (2) VM：18 台全部走同一個泛用模組，差異收斂在 local.vms
+# (2) VM：23 台全部走同一個泛用模組，差異收斂在 local.vms
 module "vm" {
   source   = "../../modules/vm"
   for_each = local.vms
@@ -252,7 +303,7 @@ module "vm" {
   datacenter    = var.datacenter
   cluster       = var.cluster
   datastore     = each.value.datastore
-  folder        = vsphere_folder.email_proxy.path
+  folder        = vsphere_folder.platform.path
   template_name = var.template_name
 
   cpu         = each.value.cpu
@@ -275,7 +326,8 @@ module "vm" {
   dns_servers        = var.dns_servers
 }
 
-# (3) 反親和規則 ×5（規劃書 §2.1 表：AA-postgres / AA-rabbitmq / AA-scylladb / AA-app / AA-lb）
+# (3) 反親和規則 ×7（AA-postgres / AA-rabbitmq / AA-scylladb / AA-seaweedfs /
+#     AA-app / AA-lb / AA-kong）
 # mandatory 維持模組預設 false（should 規則）：3 台 ESXi 剛好等於叢集成員數，
 # must 規則會擋維護模式 vMotion 與 HA 故障重啟——取捨的完整說明見
 # modules/anti_affinity/variables.tf。
@@ -323,4 +375,23 @@ module "aa_lb" {
   compute_cluster_id = data.vsphere_compute_cluster.cluster.id
   # Keepalived VIP 主備不可同機，否則一台 ESXi 故障 = 服務入口全滅
   vm_ids = [for h in ["lb-01", "lb-02"] : module.vm[h].id]
+}
+
+module "aa_kong" {
+  source = "../../modules/anti_affinity"
+
+  name               = "AA-kong"
+  compute_cluster_id = data.vsphere_compute_cluster.cluster.id
+  # 理由同 AA-lb：VI_KONG 主備不可同機，否則一台 ESXi 故障 = 東西向 API 入口全滅
+  vm_ids = [for h in ["kong-01", "kong-02"] : module.vm[h].id]
+}
+
+module "aa_seaweedfs" {
+  source = "../../modules/anti_affinity"
+
+  name               = "AA-seaweedfs"
+  compute_cluster_id = data.vsphere_compute_cluster.cluster.id
+  # master raft 多數 + replication=010 的兩副本落點：3 台必須在 3 台 ESXi 上，
+  # 否則一台 ESXi 故障可能同時帶走某物件的兩份副本
+  vm_ids = [for h in ["sw-01", "sw-02", "sw-03"] : module.vm[h].id]
 }

@@ -1,3 +1,7 @@
+> **【歷史文件凍結註記，2026-08】**本文件為 email_proxy 單專案時代的規劃書，內容保留原貌不再更新。
+> 平台化改造（多專案組件選單、Kong、SeaweedFS、pgvector/pg_search）後，現行介面契約以
+> `ansible/CONVENTIONS.md` 為準、架構總覽以 `README.md` 為準。
+
 ---
 title: email_proxy 正式環境重建：地端基礎設施最佳實踐規劃書
 

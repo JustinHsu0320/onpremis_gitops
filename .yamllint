@@ -8,6 +8,7 @@ ignore: |
   ansible/collections/
   # vault 密文不是 YAML 文件（$ANSIBLE_VAULT 標頭），不適用 YAML 規則
   ansible/inventories/*/group_vars/all/vault.yml
+  ansible/inventories/*/group_vars/all/vault_prj_*.yml
 
 rules:
   # 行長放寬：Jinja 表達式與註解常超過 80

@@ -1,0 +1,21 @@
+---
+# =============================================================================
+# roles/seaweedfs/meta/main.yml
+# =============================================================================
+galaxy_info:
+  author: platform-infra
+  description: >-
+    SeaweedFS 3 節點 S3 物件儲存（Docker 容器、host network、S3 口 TLS）：
+    master raft ×3 + volume（本地 XFS 資料碟、replication 010 跨節點 2 副本）+
+    filer（元資料存 Patroni PG → filer/s3 無本地狀態、三台等價）+ S3 gateway。
+    bucket/identity 由 projects 宣告驅動（GitOps）。
+  license: MIT
+  min_ansible_version: "2.16"
+  platforms:
+    - name: Ubuntu
+      versions:
+        - all
+
+# 順序依賴（05/08/10/30）由 site.yml 保證，不用 meta dependencies 硬綁
+# （--tags seaweedfs 單跑不拖 bootstrap；同 keydb 的理由）
+dependencies: []

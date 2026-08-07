@@ -20,14 +20,14 @@ manage_etc_hosts: localhost
 # 少一個帳號 = 少一個攻擊面；個人帳號如有需要由 Ansible 統一開設。
 users:
   - name: ansible
-    gecos: "Ansible automation (email_proxy Layer 2)"
+    gecos: "Ansible automation (platform Layer 2)"
     shell: /bin/bash
     # 鎖住密碼欄位：這個帳號「只能」用金鑰登入，沒有密碼可以被猜
     lock_passwd: true
     # NOPASSWD：自動化帳號無密碼可輸入，Ansible 的 become 才跑得動。
     # 風險已收斂：金鑰只存在 mgmt-01（VLAN 99，防火牆僅維運跳板可達）
     sudo: "ALL=(ALL) NOPASSWD:ALL"
-    # 對應 mgmt-01 的 ~/.ssh/id_email_proxy.pub（inventory 的
+    # 對應 mgmt-01 的 ~/.ssh/id_platform.pub（inventory 的
     # ansible_ssh_private_key_file 指向其私鑰）——Layer 1 交棒 Layer 2 的唯一憑證
     ssh_authorized_keys:
       - ${ansible_public_key}
@@ -39,7 +39,7 @@ disable_root: true
 # ……但 cloud-init 各發行版落地方式不一，這裡再直接落一份 sshd 設定檔，
 # 把「金鑰 only」寫死成可稽核的檔案（之後 hardening role 會接手同一路徑）
 write_files:
-  - path: /etc/ssh/sshd_config.d/99-email-proxy-bootstrap.conf
+  - path: /etc/ssh/sshd_config.d/99-platform-bootstrap.conf
     owner: root:root
     permissions: "0644"
     content: |

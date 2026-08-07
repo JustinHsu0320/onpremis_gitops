@@ -10,7 +10,7 @@
 #}
 # ===== {{ ansible_managed }} =====
 groups:
-  - name: email-proxy-alerts
+  - name: platform-alerts
     rules:
       # ---------- InstanceDown：任何抓取目標失聯 ----------
       # up 是 Prometheus 對每個 target 的內建健康指標；for: 2m 濾掉重啟 /
@@ -156,6 +156,36 @@ groups:
         annotations:
           summary: "{% raw %}ScyllaDB 節點 {{ $labels.instance }} 不在 NORMAL 狀態{% endraw %}"
           description: "{% raw %}operation_mode = {{ $value }}（預期 3=NORMAL）持續 10 分鐘。此時再故障一台 QUORUM 即不足。Runbook：nodetool status 看叢集視圖，查 7001 mTLS 互通與該節點 docker logs。{% endraw %}"
+
+      # ---------- KongUpstreamTargetUnhealthy：Kong 視角的後端不健康 ----------
+      # kong_upstream_target_health 是 prometheus plugin 對每個 upstream target
+      # 的主動健檢結果。某 upstream「全部 target」都不健康 = 該專案的 API
+      # 已對外 5xx——比用戶報障早一步。單一 target 不健康（另一台還活著）
+      # 由 for: 5m 過濾滾動部署的預期窗口。
+      # Runbook：kong 節點 curl 127.0.0.1:8001/upstreams/<name>/health 看哪個
+      # target 掛了 → 查對應後端節點的服務與 InstanceDown 告警交叉定位。
+      - alert: KongUpstreamTargetUnhealthy
+        expr: kong_upstream_target_health{state="healthy"} == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{% raw %}Kong upstream {{ $labels.upstream }} 的 target {{ $labels.target }} 不健康{% endraw %}"
+          description: "{% raw %}Kong 主動健檢連續 5 分鐘判定 {{ $labels.target }} 不健康。Runbook：curl 127.0.0.1:8001/upstreams/{{ $labels.upstream }}/health 交叉比對後端服務狀態。{% endraw %}"
+
+      # ---------- KongHigh5xxRatio：API gateway 的 5xx 比率過高 ----------
+      # 5xx / 全部請求 > 5% 持續 5 分鐘：涵蓋「後端半死不活」（健檢還沒踢掉）
+      # 與「路由設定錯誤」兩類問題。分母 clamp_min 防除以零的 NaN。
+      - alert: KongHigh5xxRatio
+        expr: >-
+          sum(rate(kong_http_requests_total{code=~"5.."}[5m]))
+          / clamp_min(sum(rate(kong_http_requests_total[5m])), 1e-9) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Kong 的 5xx 比率超過 5%"
+          description: "{% raw %}過去 5 分鐘經 Kong 的請求有 {{ $value | humanizePercentage }} 回 5xx。Runbook：Grafana 看 kong_http_requests_total 按 service 分組找元兇專案，再查該後端。{% endraw %}"
 
       # ---------- NodeFilesystemAlmostFull：磁碟可用空間 < 15% ----------
       # avail（非 root 保留的 free）/ size < 0.15 持續 10 分鐘。

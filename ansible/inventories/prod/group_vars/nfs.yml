@@ -9,25 +9,28 @@
 storage_volumes:
   - { mountpoint: /export, size_gb: 1024 }
 
-# 匯出清單：clients 限定到「真正需要的網段」，這就是儲存層的防火牆第一道
+# 匯出清單 = 平台匯出 + 各專案宣告（CONVENTIONS §10）。
+# clients 限定到「真正需要的網段」，這就是儲存層的防火牆第一道。
 #
 # all_squash + anonuid/anongid=1000 的設計說明：
 #   不同節點上的服務帳號 UID 各不相同（root、postgres≈113、app 容器 1000…），
 #   NFSv3/4 的 AUTH_SYS 是「數字 UID 直通」——與其祈禱各機 UID 對齊，
-#   不如把所有客戶端身分統一映射成 1000:1000（附件/備份檔案的唯一擁有者）。
+#   不如把所有客戶端身分統一映射成 1000:1000（共享檔案的唯一擁有者）。
 #   安全上也更好：即使某台客戶端被入侵拿到 root，在 NFS 上也只是 1000。
-nfs_exports:
-  # 附件共享：只有應用層網段可掛（統一以 UID 1000 讀寫）
-  - path: "{{ nfs_attachments_export }}"
-    clients: "{{ nfs_attachments_clients }}"
-    options: "rw,sync,no_subtree_check,all_squash,anonuid=1000,anongid=1000"
-    owner: "1000"
-    group: "1000"
-    mode: "0770"
-  # PG 備份庫（pgBackRest repo）：只有資料層網段可掛
+#
+# 平台匯出：PG 備份庫（pgBackRest repo）是 postgres 組件的平台資源，不是專案資源
+nfs_platform_exports:
   - path: "{{ nfs_pgbackup_export }}"
     clients: "{{ nfs_pgbackup_clients }}"
     options: "rw,sync,no_subtree_check,all_squash,anonuid=1000,anongid=1000"
     owner: "1000"
     group: "1000"
     mode: "0770"
+
+# 專案匯出從 projects 推導（例：email_proxy 的 /export/email-proxy/attachments，
+# 宣告見 project_email_proxy.yml 的 nfs 段）
+nfs_exports: >-
+  {{ nfs_platform_exports
+     + (projects | dict2items | sort(attribute='key')
+        | selectattr('value.nfs', 'defined')
+        | map(attribute='value.nfs.exports') | flatten | list) }}

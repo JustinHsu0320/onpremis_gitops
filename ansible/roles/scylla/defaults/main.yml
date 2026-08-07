@@ -3,7 +3,7 @@
 # roles/scylla/defaults/main.yml — ScyllaDB 可調參數（單一服務的 knob）
 #
 # 跨 role 契約變數（scylla_cql_port、scylla_prometheus_port、scylla_admin_password、
-# scylla_app_password、pki_dir、is_container）定義於 inventories/*/group_vars/，
+# scylla_tenants、pki_dir、is_container）定義於 inventories/*/group_vars/，
 # 本檔只放「僅本 role 關心」的預設值與可獨立測試用的同值 fallback。
 #
 # 【本 role 與 MIS 正式環境（scylladb-1..3.ptc-nec.com.tw）的關係——junior 必讀】
@@ -89,17 +89,13 @@ scylla_api_port: 10000             # REST API（nodetool 的後端；只綁 127.
 # 「system_auth 是 SimpleStrategy RF=1」的單點問題，不需要 ALTER KEYSPACE + repair。
 scylla_admin_user: scylla_admin
 
-# 應用帳號（gocql 連線用；名稱沿用 MIS，密碼走 vault）。
-# 真正的定義在 group_vars/scylladb.yml（99-verify 與 app 別名都對照它），
-# 這裡保留同值 fallback 只為了讓本 role 可獨立測試。
-# 兩個 scylla 密碼都請避免含單引號與雙引號（單引號破壞 CQL 字串常值與
+# 租戶宣告（驅動變數）：真值由 group_vars/scylladb.yml 從 projects 推導，
+# 每個租戶 { keyspaces: [...], user, password }。空清單讓本 role 可獨立測試
+# （只建叢集與 admin、不建任何租戶資源）。
+# 所有 scylla 密碼都請避免含單引號與雙引號（單引號破壞 CQL 字串常值與
 # -p 參數、雙引號破壞 -e 的外層引號——command 模組是 shlex 解析，沒有
-# shell 幫你轉義）；建議純英數，vault.yml.example 有同樣警告。
-scylla_app_user: set_usc_admin
-# 應用 keyspace 清單的同值 fallback（真正定義同上在 group_vars/scylladb.yml）
-scylla_keyspaces:
-  - set_usc
-  - email_service
+# shell 幫你轉義）；建議純英數，vault 範本有同樣警告。
+scylla_tenants: []
 
 # 應用 keyspace 的複寫因子：3 節點全複寫（NetworkTopologyStrategy）
 # → 任一節點故障，QUORUM（2/3）讀寫不中斷

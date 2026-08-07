@@ -1,12 +1,14 @@
 ---
 # =============================================================================
-# 99-verify.yml — 全鏈健康檢查（規劃書 §6.1：取代散落各處的 check_*.sh）
+# 99-verify.yml — 全鏈健康檢查
 #
 # 設計理念：
 #   1. 每個子系統一個 play，可用 --tags 單獨驗證（如 --tags verify-pg）
 #   2. 驗的是「使用者視角的行為」而非「程序有沒有活著」——
 #      例如 NFS 驗的是「app-01 寫的檔案 app-02 讀得到」，這才是附件共享的本質
 #   3. 全部唯讀或自我清理（測試檔案會刪掉、測試訊息會消費掉），可安全重複執行
+#   4. 組件選單語意：群組留空的組件，其 play 自動 skip；專案資源的驗證
+#      迭代 projects 登記簿（零宣告 = 迭代 0 次），不寫死任何專案名
 # =============================================================================
 
 # ---------- 1. etcd：quorum 健康 ----------
@@ -59,44 +61,108 @@
         success_msg: "Patroni：1 leader + 2 replica，同步模式運作中"
       run_once: true
 
-# ---------- 3. PgBouncer VIP：RW 進 leader、RO 進 replica ----------
-- name: 驗證 PgBouncer VIP 讀寫分流
+# ---------- 3. PgBouncer VIP：每個資料庫的 RW 進 leader、RO 進 replica ----------
+- name: 驗證 PgBouncer VIP 讀寫分流（逐專案資料庫）
   hosts: postgres
   tags: [verify, verify-pgbouncer]
   tasks:
-    # pg_is_in_recovery()=false 代表連到的是 leader —— RW 口的正確行為
-    - name: RW 口（6432）應連到 leader
+    # pg_is_in_recovery()=false 代表連到的是 leader —— RW 口的正確行為。
+    # 迭代 pg_databases（平台 + 各專案）：以「各自的帳號」連線，一次驗完
+    # VIP 分流、TLS 鏈、auth_query 認證鏈、每個租戶的隔離帳密
+    - name: RW 口應連到 leader
       ansible.builtin.command: >
-        psql "host={{ pgbouncer_vip }} port={{ pgbouncer_port }} dbname={{ pg_app_db }}
-        user={{ pg_app_user }} sslmode=verify-full sslrootcert={{ pki_dir }}/ca.crt"
+        psql "host={{ pgbouncer_vip }} port={{ pgbouncer_port }} dbname={{ verify_db.db }}
+        user={{ verify_db.user }} sslmode=verify-full sslrootcert={{ pki_dir }}/ca.crt"
         -tAc "SELECT pg_is_in_recovery()"
       environment:
-        PGPASSWORD: "{{ postgres_app_password }}"
+        PGPASSWORD: "{{ verify_db.password }}"
+      loop: "{{ pg_databases }}"
+      loop_control:
+        loop_var: verify_db
+        label: "{{ verify_db.db }}"
       register: rw_check
       changed_when: false
+      failed_when: rw_check.stdout | trim != 'f'
+      no_log: true
       run_once: true
 
-    - name: RO 口（6433）應連到 replica
+    - name: RO 口應連到 replica
       ansible.builtin.command: >
-        psql "host={{ pgbouncer_vip }} port={{ pgbouncer_ro_port }} dbname={{ pg_app_db }}
-        user={{ pg_app_user }} sslmode=verify-full sslrootcert={{ pki_dir }}/ca.crt"
+        psql "host={{ pgbouncer_vip }} port={{ pgbouncer_ro_port }} dbname={{ verify_db.db }}
+        user={{ verify_db.user }} sslmode=verify-full sslrootcert={{ pki_dir }}/ca.crt"
         -tAc "SELECT pg_is_in_recovery()"
       environment:
-        PGPASSWORD: "{{ postgres_app_password }}"
+        PGPASSWORD: "{{ verify_db.password }}"
+      loop: "{{ pg_databases }}"
+      loop_control:
+        loop_var: verify_db
+        label: "{{ verify_db.db }}"
       register: ro_check
       changed_when: false
+      failed_when: ro_check.stdout | trim != 't'
+      no_log: true
       run_once: true
 
-    - name: 斷言：RW=leader（f）、RO=replica（t）
+    # 上兩個 task 的 failed_when 已逐庫把關；這裡只給人看的總結訊息
+    - name: 斷言：全部資料庫 RW→leader、RO→replica
       ansible.builtin.assert:
         that:
-          - rw_check.stdout | trim == 'f'
-          - ro_check.stdout | trim == 't'
-        fail_msg: "讀寫分流異常：RW recovery={{ rw_check.stdout }}, RO recovery={{ ro_check.stdout }}"
-        success_msg: "PgBouncer VIP：RW→leader、RO→replica，TLS 驗證通過"
+          - rw_check is succeeded
+          - ro_check is succeeded
+        success_msg: "PgBouncer VIP：{{ pg_databases | length }} 個資料庫 RW→leader、RO→replica，TLS + auth_query 全通"
       run_once: true
 
-# ---------- 4. RabbitMQ：叢集 + quorum queue + 實際收發 ----------
+# ---------- 3b. PG extensions：pgvector / pg_search 冒煙 ----------
+- name: 驗證 PG extensions（pgvector + BM25）
+  hosts: postgres
+  tags: [verify, verify-pg-ext]
+  tasks:
+    # 每台節點 .so 都要在（副本查詢與 failover 的前提），不是只驗 leader
+    - name: 全節點 extension .so 就位
+      ansible.builtin.stat:
+        path: "/usr/lib/postgresql/{{ pg_version }}/lib/{{ verify_ext }}.so"
+      register: pg_ext_so
+      failed_when: not pg_ext_so.stat.exists
+      loop: >-
+        {{ (['vector'] if (patroni_extension_packages | default([])
+              | select('search', 'pgvector') | list | length > 0) else [])
+           + (['pg_search'] if (patroni_pg_search_enabled | default(false)) else []) }}
+      loop_control:
+        loop_var: verify_ext
+
+    # 功能冒煙在 postgres 系統庫做（不依賴任何專案宣告）：leader 上以 superuser
+    # 建 extension + 測試表 + 查詢後自我清理。CREATE EXTENSION IF NOT EXISTS
+    # 冪等；經 WAL 複寫，之後任何專案宣告 extensions 時行為已被驗證過
+    - name: 功能冒煙：pgvector KNN + BM25（leader、postgres 庫、自我清理）
+      ansible.builtin.command: >-
+        psql -v ON_ERROR_STOP=1 -tAc "
+        CREATE EXTENSION IF NOT EXISTS vector;
+        CREATE EXTENSION IF NOT EXISTS pg_search;
+        DROP TABLE IF EXISTS verify_ext_smoke;
+        CREATE TABLE verify_ext_smoke (id bigint PRIMARY KEY, body text, emb vector(3));
+        INSERT INTO verify_ext_smoke VALUES
+          (1,'quick brown fox','[1,2,3]'), (2,'lazy dog sleeps','[3,2,1]');
+        CREATE INDEX ON verify_ext_smoke USING hnsw (emb vector_l2_ops);
+        CREATE INDEX ON verify_ext_smoke USING bm25 (id, body) WITH (key_field='id');
+        SELECT id FROM verify_ext_smoke ORDER BY emb <-> '[1,2,2]' LIMIT 1;
+        SELECT id FROM verify_ext_smoke WHERE body @@@ 'fox' LIMIT 1;
+        DROP TABLE verify_ext_smoke;" postgres
+      become: true
+      become_user: postgres
+      register: pg_ext_smoke
+      changed_when: false
+      failed_when: pg_ext_smoke.rc != 0 or (pg_ext_smoke.stdout_lines | select('equalto', '1') | list | length) < 2
+      when: patroni_pg_search_enabled | default(false)
+      run_once: true
+      delegate_to: "{{ groups['postgres'][0] }}"
+
+    - name: 斷言：向量 KNN 與 BM25 查詢皆通
+      ansible.builtin.assert:
+        that: pg_ext_smoke is skipped or pg_ext_smoke.rc == 0
+        success_msg: "PG extensions：pgvector HNSW KNN + pg_search BM25 冒煙通過"
+      run_once: true
+
+# ---------- 4. RabbitMQ：叢集 + 各租戶 quorum queue + 實際收發 ----------
 - name: 驗證 RabbitMQ 叢集
   hosts: rabbitmq
   tags: [verify, verify-mq]
@@ -114,26 +180,26 @@
         success_msg: "RabbitMQ：3/3 節點運行中"
       run_once: true
 
-    - name: 斷言：佇列存在且為 quorum 型
+    - name: 各租戶佇列存在且為 quorum 型
       ansible.builtin.command: >
-        rabbitmqctl list_queues -p {{ rabbitmq_vhost }} name type --formatter json
+        rabbitmqctl list_queues -p {{ verify_tenant.vhost }} name type --formatter json
+      loop: "{{ rabbitmq_tenants }}"
+      loop_control:
+        loop_var: verify_tenant
+        label: "{{ verify_tenant.vhost }}"
       register: mq_queues
       changed_when: false
+      failed_when: >-
+        (mq_queues.stdout | from_json)
+        | selectattr('type', 'equalto', 'quorum') | list | length
+        < (verify_tenant.queues | length)
       run_once: true
 
-    - name: 檢查佇列型別
-      ansible.builtin.assert:
-        that: >-
-          (mq_queues.stdout | from_json)
-          | selectattr('type', 'equalto', 'quorum') | list | length >= 3
-        fail_msg: "quorum queue 數量不足：{{ mq_queues.stdout }}"
-        success_msg: "RabbitMQ：quorum queues 就緒"
-      run_once: true
-
-    # 端到端：經 VIP 以 AMQPS 發佈一則測試訊息再取回（驗證 VIP + TLS + 佇列全鏈）
-    - name: 經管理 API 發佈測試訊息
+    # 端到端：對每個租戶以管理 API 發佈一則測試訊息到「第一個佇列」再取回
+    # （驗證 vhost 隔離 + 佇列路由全鏈；ackmode 取走不 requeue = 自我清理）
+    - name: 各租戶發佈測試訊息
       ansible.builtin.uri:
-        url: "http://{{ ansible_host }}:15672/api/exchanges/{{ rabbitmq_vhost | urlencode }}/amq.default/publish"
+        url: "http://{{ ansible_host }}:15672/api/exchanges/{{ verify_tenant.vhost | urlencode }}/amq.default/publish"
         method: POST
         user: admin
         password: "{{ rabbitmq_admin_password }}"
@@ -141,15 +207,21 @@
         body_format: json
         body:
           properties: {}
-          routing_key: email_proxy_queue
+          routing_key: "{{ (verify_tenant.queues | first).name }}"
           payload: "verify-ping"
           payload_encoding: string
+      loop: "{{ rabbitmq_tenants }}"
+      loop_control:
+        loop_var: verify_tenant
+        label: "{{ verify_tenant.vhost }}"
       register: publish_result
+      failed_when: not publish_result.json.routed
+      no_log: true
       run_once: true
 
-    - name: 取回測試訊息（自我清理）
+    - name: 各租戶取回測試訊息（自我清理）
       ansible.builtin.uri:
-        url: "http://{{ ansible_host }}:15672/api/queues/{{ rabbitmq_vhost | urlencode }}/email_proxy_queue/get"
+        url: "http://{{ ansible_host }}:15672/api/queues/{{ verify_tenant.vhost | urlencode }}/{{ (verify_tenant.queues | first).name }}/get"
         method: POST
         user: admin
         password: "{{ rabbitmq_admin_password }}"
@@ -157,15 +229,19 @@
         body_format: json
         body: { count: 1, ackmode: ack_requeue_false, encoding: auto }
         return_content: true
+      loop: "{{ rabbitmq_tenants }}"
+      loop_control:
+        loop_var: verify_tenant
+        label: "{{ verify_tenant.vhost }}"
       register: consume_result
+      failed_when: consume_result.json | length == 0
+      no_log: true
       run_once: true
 
-    - name: 斷言：訊息成功路由並取回
+    - name: 斷言：全部租戶訊息發佈/消費通過
       ansible.builtin.assert:
-        that:
-          - publish_result.json.routed
-          - consume_result.json | length > 0
-        success_msg: "RabbitMQ：訊息發佈/消費全鏈通過"
+        that: consume_result is succeeded
+        success_msg: "RabbitMQ：{{ rabbitmq_tenants | length }} 個租戶 vhost 的訊息發佈/消費全鏈通過"
       run_once: true
 
 # ---------- 5. KeyDB：cluster ok、跨節點讀寫 ----------
@@ -191,7 +267,7 @@
         success_msg: "KeyDB：3 master + 3 replica，cluster_state:ok"
       run_once: true
 
-    # -c 開 cluster 模式（自動跟隨 MOVED 轉向）：在 app-01 寫、在 app-03 讀
+    # -c 開 cluster 模式（自動跟隨 MOVED 轉向）：在第一台寫、在最後一台讀
     - name: 從第一台節點寫入測試鍵
       ansible.builtin.command: >
         docker exec keydb-master keydb-cli -c
@@ -218,7 +294,7 @@
         success_msg: "KeyDB：跨節點讀寫（cluster redirect）通過"
       run_once: true
 
-# ---------- 5b. ScyllaDB：全員 UN、TLS+認證下的跨節點 QUORUM 讀寫 ----------
+# ---------- 5b. ScyllaDB：全員 UN、各租戶 TLS+認證下的跨節點 QUORUM 讀寫 ----------
 - name: 驗證 ScyllaDB 叢集
   hosts: scylladb
   tags: [verify, verify-scylladb]
@@ -238,42 +314,51 @@
         success_msg: "ScyllaDB：{{ groups['scylladb'] | length }}/{{ groups['scylladb'] | length }} 節點 UN"
       run_once: true
 
-    # 以「應用帳號」走 TLS+密碼寫入（不是管理帳號）：一次驗完
-    # 憑證鏈、PasswordAuthenticator、keyspace 授權三件事。
+    # 以「各租戶帳號」走 TLS+密碼寫入（不是管理帳號）：一次驗完
+    # 憑證鏈、PasswordAuthenticator、keyspace 授權與租戶隔離。
     # 探測表用 IF NOT EXISTS 常駐（反覆 create/drop 會累積 schema 變更歷史）、
     # 資料列帶 TTL 自我清理。CONSISTENCY QUORUM 是 app 的實際讀寫等級。
-    - name: 從第一台節點以應用帳號寫入探測列（QUORUM）
+    - name: 各租戶從第一台節點寫入探測列（QUORUM）
       ansible.builtin.command: >-
         docker exec -e SSL_CERTFILE=/etc/scylla/certs/ca.crt scylladb
         cqlsh {{ ansible_host }} {{ scylla_cql_port }} --ssl
-        -u {{ scylla_app_user }} -p '{{ scylla_app_password }}'
+        -u {{ verify_tenant.user }} -p '{{ verify_tenant.password }}'
         -e "CONSISTENCY QUORUM;
-            CREATE TABLE IF NOT EXISTS {{ scylla_keyspaces | first }}.ansible_verify
+            CREATE TABLE IF NOT EXISTS {{ verify_tenant.keyspaces | first }}.ansible_verify
               (k text PRIMARY KEY, v text);
-            INSERT INTO {{ scylla_keyspaces | first }}.ansible_verify (k, v)
+            INSERT INTO {{ verify_tenant.keyspaces | first }}.ansible_verify (k, v)
               VALUES ('probe', 'pong') USING TTL 120"
+      loop: "{{ scylla_tenants }}"
+      loop_control:
+        loop_var: verify_tenant
+        label: "{{ verify_tenant.user }}"
       changed_when: true
       run_once: true
       no_log: true
 
-    - name: 從最後一台節點讀回（QUORUM）
+    - name: 各租戶從最後一台節點讀回（QUORUM）
       ansible.builtin.command: >-
         docker exec -e SSL_CERTFILE=/etc/scylla/certs/ca.crt scylladb
         cqlsh {{ hostvars[groups['scylladb'][-1]].ansible_host }} {{ scylla_cql_port }} --ssl
-        -u {{ scylla_app_user }} -p '{{ scylla_app_password }}'
+        -u {{ verify_tenant.user }} -p '{{ verify_tenant.password }}'
         -e "CONSISTENCY QUORUM;
-            SELECT v FROM {{ scylla_keyspaces | first }}.ansible_verify WHERE k = 'probe'"
+            SELECT v FROM {{ verify_tenant.keyspaces | first }}.ansible_verify WHERE k = 'probe'"
+      loop: "{{ scylla_tenants }}"
+      loop_control:
+        loop_var: verify_tenant
+        label: "{{ verify_tenant.user }}"
       register: scylla_read
       changed_when: false
+      failed_when: "'pong' not in scylla_read.stdout"
       delegate_to: "{{ groups['scylladb'][-1] }}"
       run_once: true
       no_log: true
 
-    - name: 斷言：跨節點 QUORUM 讀寫一致
+    - name: 斷言：全部租戶跨節點 QUORUM 讀寫一致
       ansible.builtin.assert:
-        that: "'pong' in scylla_read.stdout"
+        that: scylla_read is succeeded
         fail_msg: "ScyllaDB 跨節點讀寫失敗（QUORUM 湊不齊或授權異常）"
-        success_msg: "ScyllaDB：TLS + 應用帳號 + 跨節點 QUORUM 讀寫通過"
+        success_msg: "ScyllaDB：{{ scylla_tenants | length }} 個租戶 TLS + 跨節點 QUORUM 讀寫通過"
       run_once: true
 
     - name: 每台節點的原生 metrics 端點可抓
@@ -281,9 +366,120 @@
         url: "http://{{ ansible_host }}:{{ scylla_prometheus_port }}/metrics"
         return_content: false
 
-# ---------- 6. NFS：跨節點附件共享（規劃書修正的核心痛點） ----------
+# ---------- 5c. SeaweedFS：master 收斂、S3 VIP 端到端讀寫 ----------
+- name: 驗證 SeaweedFS S3 叢集
+  hosts: seaweedfs
+  tags: [verify, verify-seaweedfs]
+  tasks:
+    # until + retries：剛部署完 master raft 可能還在選主（README 暖機教訓）
+    - name: Master raft 叢集有 leader 且三成員到齊
+      ansible.builtin.uri:
+        url: "http://{{ ansible_host }}:{{ seaweedfs_master_port | default(9333) }}/cluster/status"
+        return_content: true
+      register: sw_cluster
+      until: >-
+        sw_cluster.status == 200 and
+        (sw_cluster.json.Leader | default('') | length) > 0
+      retries: 12
+      delay: 5
+      run_once: true
+
+    # 端到端讀寫：經 S3 VIP（s3.<domain>:8333，HAProxy 分流 + TLS）用 admin
+    # 身分以 AWS SigV4 上傳 → 從「另一台節點」直連下載 → 比對 → 刪除。
+    # 用 curl 的 --aws-sigv4（curl 8.x 內建）免裝 mc/awscli
+    - name: 建立驗證用 bucket（冪等：已存在回 409 亦視為成功） # noqa: command-instead-of-module
+      ansible.builtin.command: >-
+        curl -sS -o /dev/null -w "%{http_code}" --cacert {{ pki_dir }}/ca.crt
+        --aws-sigv4 "aws:amz:on-prem:s3"
+        --user "{{ seaweedfs_s3_admin_access_key }}:{{ seaweedfs_s3_admin_secret_key }}"
+        -X PUT
+        "https://s3.{{ domain }}:{{ seaweedfs_s3_port }}/verify-bucket"
+      register: sw_mkbucket
+      changed_when: sw_mkbucket.stdout == '200'
+      failed_when: sw_mkbucket.stdout not in ['200', '409']
+      run_once: true
+      no_log: true
+
+    - name: 經 S3 VIP 上傳測試物件（SigV4 + TLS） # noqa: command-instead-of-module
+      ansible.builtin.command: >-
+        curl -sS -o /dev/null -w "%{http_code}" --cacert {{ pki_dir }}/ca.crt
+        --aws-sigv4 "aws:amz:on-prem:s3"
+        --user "{{ seaweedfs_s3_admin_access_key }}:{{ seaweedfs_s3_admin_secret_key }}"
+        -X PUT --data "verify-ping"
+        "https://s3.{{ domain }}:{{ seaweedfs_s3_port }}/verify-bucket/probe.txt"
+      register: sw_put
+      changed_when: true
+      failed_when: sw_put.stdout not in ['200', '201']
+      run_once: true
+      no_log: true
+
+    - name: 從另一台節點讀回測試物件 # noqa: command-instead-of-module
+      ansible.builtin.command: >-
+        curl -sS --cacert {{ pki_dir }}/ca.crt
+        --aws-sigv4 "aws:amz:on-prem:s3"
+        --user "{{ seaweedfs_s3_admin_access_key }}:{{ seaweedfs_s3_admin_secret_key }}"
+        "https://{{ hostvars[groups['seaweedfs'][-1]].ansible_host }}:{{ seaweedfs_s3_port }}/verify-bucket/probe.txt"
+      register: sw_get
+      changed_when: false
+      delegate_to: "{{ groups['seaweedfs'][-1] }}"
+      run_once: true
+      no_log: true
+
+    - name: 清理測試物件 # noqa: command-instead-of-module
+      ansible.builtin.command: >-
+        curl -sS -o /dev/null --cacert {{ pki_dir }}/ca.crt
+        --aws-sigv4 "aws:amz:on-prem:s3"
+        --user "{{ seaweedfs_s3_admin_access_key }}:{{ seaweedfs_s3_admin_secret_key }}"
+        -X DELETE
+        "https://s3.{{ domain }}:{{ seaweedfs_s3_port }}/verify-bucket/probe.txt"
+      changed_when: true
+      run_once: true
+      no_log: true
+
+    - name: 斷言：S3 VIP 上傳 → 跨節點讀回一致
+      ansible.builtin.assert:
+        that: "'verify-ping' in sw_get.stdout"
+        fail_msg: "SeaweedFS 跨節點 S3 讀寫失敗"
+        success_msg: "SeaweedFS：VIP TLS 上傳 → 跨節點讀回通過（filer 元資料在 PG）"
+      run_once: true
+
+# ---------- 5d. Kong：status 健康、admin 不外露、宣告式組態已載入 ----------
+- name: 驗證 Kong API Gateway
+  hosts: kong
+  tags: [verify, verify-kong]
+  tasks:
+    - name: Status 口回報健康
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ kong_status_port }}/status"
+        return_content: true
+      register: kong_status_check
+
+    # 安全斷言：admin 口「不可」從節點 IP 可達（只綁 127.0.0.1 是 DB-less
+    # 唯讀語意的邊界，外露 = 有人改了 KONG_ADMIN_LISTEN）
+    - name: Admin 口不得綁節點 IP（預期連線失敗）
+      ansible.builtin.wait_for:
+        host: "{{ ansible_host }}"
+        port: "{{ kong_admin_port | int }}"
+        state: stopped
+        timeout: 3
+
+    # 東西向 VIP + TLS 鏈：從 kong 節點以 CA 驗證打 VIP 的 8443。
+    # Kong 對「無匹配 route」回 404 —— 404 = TLS 握手與路由引擎都正常
+    - name: 東西向 VIP TLS 可達（kong-vip:{{ kong_proxy_tls_port }}）
+      ansible.builtin.uri:
+        url: "https://kong-vip.{{ domain }}:{{ kong_proxy_tls_port }}/"
+        ca_path: "{{ pki_dir }}/ca.crt"
+        status_code: [200, 404]
+      run_once: true
+
+    - name: Metrics 端點可抓（prometheus plugin）
+      ansible.builtin.uri:
+        url: "http://{{ ansible_host }}:{{ kong_status_port }}/metrics"
+        return_content: false
+
+# ---------- 6. NFS：跨節點檔案共享（email_proxy 附件情境） ----------
 - name: 驗證 NFS 附件共享
-  hosts: app
+  hosts: app_email_proxy
   tags: [verify, verify-nfs]
   tasks:
     - name: 從第一台 app 節點寫入測試附件
@@ -310,25 +506,30 @@
         state: absent
       run_once: true
 
-# ---------- 7. 邊界 VIP：HTTPS 健檢 + SMTP banner ----------
+# ---------- 7. 邊界 VIP：各專案探測端點 + SMTP banner ----------
 - name: 驗證邊界服務 VIP
   hosts: lb
   tags: [verify, verify-edge]
   tasks:
-    - name: 經服務 VIP 打 HTTPS /health（驗 VIP + TLS 終止 + 後端分流）
+    # 探測清單 = projects 登記簿的 blackbox_probes（與監控同一份真值）：
+    # 一次驗完 VIP 漂移、TLS 終止、憑證鏈、後端分流
+    - name: 各專案的 HTTPS 探測端點經 VIP 回 200
       ansible.builtin.uri:
-        url: "https://svc-api.{{ domain }}/health"
+        url: "{{ verify_probe.target }}"
         ca_path: "{{ pki_dir }}/ca.crt"
-        return_content: true
-      register: health_via_vip
+        return_content: false
+      loop: >-
+        {{ projects | dict2items | sort(attribute='key')
+           | selectattr('value.monitoring.blackbox_probes', 'defined')
+           | map(attribute='value.monitoring.blackbox_probes') | flatten
+           | selectattr('module', 'equalto', 'http_2xx_internal_ca') | list }}
+      loop_control:
+        loop_var: verify_probe
+        label: "{{ verify_probe.target }}"
       run_once: true
 
-    - name: 斷言：/health 回 200
-      ansible.builtin.assert:
-        that: health_via_vip.status == 200
-        success_msg: "邊界：https://svc-api/health 經 VIP 回 200"
-      run_once: true
-
+    # email_proxy 的 SMTPS 口（TCP passthrough 的協定級驗證）：
+    # 465 → app:2525 的鏈路要回 SMTP 220 banner
     - name: SMTPS 口（465）TCP 可達且後端回 SMTP banner
       ansible.builtin.shell: |
         set -o pipefail
@@ -336,6 +537,7 @@
       args: { executable: /bin/bash }
       register: smtp_banner
       changed_when: false
+      when: "'email_proxy' in projects"
       run_once: true
 
     - name: 斷言：SMTP banner 以 220 開頭
@@ -343,11 +545,12 @@
         that: smtp_banner.stdout is search('^220')
         fail_msg: "SMTPS 後端無回應：{{ smtp_banner.stdout }}"
         success_msg: "邊界：465 → app:2525 鏈路通"
+      when: "'email_proxy' in projects"
       run_once: true
 
 # ---------- 8. Egress：白名單放行、非白名單拒絕 ----------
 - name: 驗證 Squid 顯式白名單
-  hosts: app
+  hosts: app_email_proxy
   tags: [verify, verify-egress]
   tasks:
     # curl 而非 uri 模組：uri 無法回報「代理對 CONNECT 的回應碼」（%{http_connect}），
@@ -450,6 +653,8 @@
     - name: 全鏈健檢通過
       ansible.builtin.debug:
         msg: >-
-          ✅ 全鏈驗證通過：etcd quorum / Patroni HA / PgBouncer RW-RO 分流 /
-          RabbitMQ quorum queue 收發 / KeyDB 3M+3R / ScyllaDB 3 節點 QUORUM 讀寫 /
-          NFS 跨節點共享 / 邊界 VIP TLS / Egress 白名單 / 監控 / 憑證效期。
+          ✅ 全鏈驗證通過：etcd quorum / Patroni HA / PgBouncer 逐專案 RW-RO 分流 /
+          PG extensions（pgvector+BM25）/ RabbitMQ 各租戶 quorum queue 收發 /
+          KeyDB 3M+3R / ScyllaDB 各租戶 QUORUM 讀寫 / SeaweedFS S3 VIP 跨節點讀寫 /
+          Kong status+admin 隔離 / NFS 跨節點共享 / 邊界 VIP TLS / Egress 白名單 /
+          監控 / 憑證效期。

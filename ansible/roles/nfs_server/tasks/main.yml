@@ -25,7 +25,7 @@
 # nfs-01 本機不存在 1000 這個帳號也完全沒關係。
 # 反面教材：兩邊各建同名帳號但 UID 不同，掛上來全是 permission denied，
 # 這是 NFS 最經典的地雷，所以契約（group_vars/nfs.yml）直接寫死數字。
-# 先建「中繼目錄」（pseudo-root 到葉目錄之間的路徑，如 /export/mail-proxy）：
+# 先建「中繼目錄」（pseudo-root 到葉目錄之間的路徑，如 /export/email-proxy）：
 # 必須是 root:root 0755 —— NFSv4 client 掛葉目錄時要以「fsid=0 根匯出的身分」
 # （squash 後=匿名者）一路遍歷到葉；中繼目錄若被建成葉目錄的 0770/1000:1000，
 # 匿名者沒有 +x 遍歷權限，client 端會吃 access denied（實驗室實測踩過的雷）
@@ -81,7 +81,7 @@
 # 所以 notify 的是 reload 而不是 restart
 - name: 佈署 exports 定義（/etc/exports.d 片段檔）
   ansible.builtin.template:
-    src: email-proxy.exports.j2
+    src: platform.exports.j2
     dest: "{{ nfs_server_exports_file }}"
     owner: root
     group: root
@@ -100,7 +100,7 @@
 # vers3=n / udp=n 是 nfsd 的「啟動參數」，reload 不會重讀，必須 restart 才生效
 - name: 佈署 NFSv4-only 設定（關閉 v3 與 UDP）
   ansible.builtin.template:
-    src: email-proxy-nfs.conf.j2
+    src: platform-nfs.conf.j2
     dest: "{{ nfs_server_conf_dropin }}"
     owner: root
     group: root

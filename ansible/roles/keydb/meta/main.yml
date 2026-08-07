@@ -3,7 +3,7 @@
 # roles/keydb/meta/main.yml
 # =============================================================================
 galaxy_info:
-  author: email-proxy-infra
+  author: platform-infra
   description: >-
     KeyDB 3 master + 3 replica 快取叢集（每台 app 節點 1M+1R，Docker 容器、
     host network、TLS-only + mTLS + requirepass，純快取不落地）。

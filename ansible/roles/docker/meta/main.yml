@@ -1,7 +1,7 @@
 ---
 galaxy_info:
   role_name: docker
-  namespace: email_proxy
+  namespace: platform
   author: justin.sc.hsu
   description: Docker Engine（官方 repo）＋日誌輪替/live-restore/egress proxy（app、monitoring、gitlab_runner 專用）
   company: PTC-NEC

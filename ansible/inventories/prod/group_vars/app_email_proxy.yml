@@ -1,0 +1,36 @@
+---
+# =============================================================================
+# group_vars/app_email_proxy.yml — email_proxy 專案的應用節點
+# （api / worker / smtp-receiver compose + 同居 KeyDB）
+#
+# 這是「專案群組」的 group_vars：只放本專案節點的主機級事實
+# （憑證、掛載、掛載點變數）；專案資源宣告在 project_email_proxy.yml。
+# =============================================================================
+
+# ---------- PKI ----------
+# keydb-server 用 peer profile：KeyDB cluster bus 是「彼此互連」的雙向 TLS，
+# 每個節點同時是 server（被連）也是 client（去連別人），EKU 必須兩者都有
+pki_certificates:
+  - name: keydb-server
+    profile: peer
+    owner: root
+    group: root
+    key_mode: "0640"
+    extra_sans: ["IP:127.0.0.1"]   # app 走 localhost 連本機 KeyDB，SAN 要涵蓋
+  - name: keydb-client
+    profile: client
+    owner: root
+    group: root
+    key_mode: "0640"
+
+# ---------- NFS 掛載（收信節點寫附件、寄送節點讀——跨節點共享的核心） ----------
+# 掛載點變數：project_email_proxy.yml 的 compose_app.mounts 與 99-verify
+# 的 NFS 驗證都引用它
+attachments_mount: /mnt/attachments
+
+# ★ 成對契約：src 的 v4 路徑（/email-proxy/attachments）＝
+# project_email_proxy.yml 的 nfs.exports path（/export/email-proxy/attachments）
+# 去掉 pseudo-root /export 前綴（NFSv4 掛載語意）。改任一邊必須同步另一邊。
+nfs_mounts:
+  - path: "{{ attachments_mount }}"
+    src: "{{ groups['nfs'][0] }}.{{ domain }}:/email-proxy/attachments"

@@ -1,0 +1,30 @@
+---
+# =============================================================================
+# roles/compose_app/handlers/main.yml
+#
+# 為什麼 recreate: always 而不是 restart？
+#   .env（env_file 只在容器「建立」時讀）與掛進去的憑證檔，內容變了
+#   docker compose 偵測不到，單純 restart 會讓容器帶著舊環境變數復活。
+#
+# 為什麼迭代 compose_app_deployed 而不是單一 project_src？
+#   Ansible handler 無法帶 per-loop 參數——多專案同機時，任一專案 notify
+#   都會 recreate 本機「全部」已部署專案（佇列由 one_project.yml 登記）。
+#   單專案時與舊 app_stack 行為完全等價；多專案時是可接受的保守行為
+#   （50-apps.yml 是 serial: 1，本機此刻已被 LB 摘除）。
+#
+# 滾動影響（junior 必讀）：本 handler 會讓本機專案容器瞬間離線。
+# 50-apps.yml 已用 serial: 1 一次只動一台，LB 健檢（fall 3）自動摘除/回掛
+# ——切勿改成全平行執行。
+# =============================================================================
+
+- name: Restart compose apps
+  community.docker.docker_compose_v2:
+    project_src: "{{ compose_app_item.home }}"
+    state: present
+    recreate: always
+    build: "{{ 'always' if compose_app_item.mock else 'policy' }}"
+  loop: "{{ compose_app_deployed | default([]) }}"
+  loop_control:
+    loop_var: compose_app_item
+    label: "{{ compose_app_item.name }}"
+  listen: restart compose apps

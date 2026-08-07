@@ -1,0 +1,58 @@
+---
+# =============================================================================
+# roles/kong/defaults/main.yml — Kong API Gateway（DB-less）可調參數
+#
+# 跨 role 契約變數（kong_vip、kong_proxy_port、kong_proxy_tls_port、
+# kong_admin_port、kong_status_port、pki_dir、vrrp_pass_kong）定義於
+# inventories/*/group_vars/all/vars.yml（CONVENTIONS.md §3/§7），本檔不重複定義。
+#
+# 【設計定位（junior 必讀）】
+#   DB-less：路由真值 = Git 內的 projects 宣告（CONVENTIONS §10.3 kong 段）→
+#   Jinja 渲染 kong.yml → kong reload。Admin API 在 DB-less 下天生唯讀
+#   （且只綁 127.0.0.1）——「禁止 SSH 手改」自動延伸為「禁止 Admin API 手改」，
+#   與 RabbitMQ「definitions 由 Ansible 冪等重建 = 設定即備份」同構。
+#   已知限制：oauth2 plugin 不支援 DB-less（JWT/key-auth/ACL/CORS/
+#   rate-limiting(local/redis) 都支援）——若未來專案必須用 oauth2 才重訪
+#   DB-backed（CONVENTIONS §10.6）。
+# =============================================================================
+
+# ---------- 容器映像 ----------
+# 官方映像、pin 版本（絕不用 :latest）；升級 = 改這行走 PR。
+# ADR-8 的容器分支：Kong 無 Ubuntu archive 套件，比照 KeyDB/Scylla 跑容器。
+# 部署前請查證當下最新 3.x patch 並鎖定到 patch 版。
+kong_image: "kong:3.9"
+
+# ---------- 佈署路徑（CONVENTIONS.md §4：kong compose 專案 = /opt/kong） ----------
+kong_home: /opt/kong
+
+# 官方映像內建 kong 使用者的 UID/GID：tls/config 目錄擁有者要對齊，容器才讀得到。
+# ★ 部署前以 `docker run --rm --entrypoint id {{ kong_image }}` 實測回填
+# （KeyDB 映像 UID=999 的教訓，README 踩雷 #17）
+kong_container_uid: "1000"
+kong_container_gid: "1000"
+
+# ---------- Kong 本體 knob ----------
+kong_log_level: notice
+# nginx worker 數：2 對 2 vCPU 節點剛好；lab 由 zz_lab_overrides 覆寫為 "1"
+kong_nginx_worker_processes: "2"
+
+# 全域插件：prometheus 是監控契約（monitoring 的 kong job 抓 8100 /metrics），必開
+kong_global_plugins:
+  - name: prometheus
+    config:
+      per_consumer: false
+
+# upstream 主動健檢（渲染進每個 service 的 upstream healthchecks.active）：
+# Kong 自己摘除壞後端，與邊界 HAProxy 對 be_* 的健檢哲學一致
+kong_upstream_hc_interval: 5
+kong_upstream_hc_fall: 3
+kong_upstream_hc_rise: 2
+
+# ---------- 部署後健檢 ----------
+# flush_handlers 之後 wait_for proxy/status 埠的等待上限（秒）
+kong_wait_timeout: 60
+
+# ---------- 專案宣告（驅動變數） ----------
+# 真值在 group_vars/all/projects.yml（登記簿）；空 dict 讓本 role 可獨立測試
+# ——零專案用 Kong 時 kong.yml 仍渲染出合法最小組態（只有全域插件）
+projects: {}  # noqa: var-naming[no-role-prefix] CONVENTIONS.md §10 契約變數，跨 role 介面不可加前綴

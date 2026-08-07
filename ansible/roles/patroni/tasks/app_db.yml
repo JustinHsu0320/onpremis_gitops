@@ -1,10 +1,15 @@
 ---
 # =============================================================================
-# roles/patroni/tasks/app_db.yml — 叢集就緒後的資料庫物件佈建
+# roles/patroni/tasks/app_db.yml — 叢集就緒後的資料庫物件佈建（多專案迭代版）
 #
 # 這些是「叢集級」物件（建一次、複寫到全叢集），所以全部 run_once 並且
 # 只對 leader 執行。連線方式刻意用 unix socket + become postgres（peer 認證）：
 # 密碼完全不經網路、也不依賴 pg_hba 的 TCP 規則——最小攻擊面的維運通道。
+#
+# 驅動變數 pg_databases（group_vars/postgres.yml 組裝）：
+#   平台資料庫（如 seaweedfs 的 filer store）+ 各專案宣告（projects.*.pg）。
+#   每個項目：{ db, user, password, extensions }。
+#   含密碼 → 全部迭代 task 都 loop label + 落密碼者 no_log（CONVENTIONS §8-5）。
 # =============================================================================
 
 # 為什麼要「定位 leader」而不是寫死 groups['postgres'][0]：
@@ -43,20 +48,28 @@
     # 先建 user 再建 db：db 的 owner 要指向它。
     # 密碼以 SCRAM 形式落庫（DCS 參數 password_encryption=scram-sha-256），
     # 模組會用既有 SCRAM 驗證子比對，密碼沒變就不會誤報 changed
-    - name: 建立應用使用者 {{ pg_app_user }}
+    - name: 建立各資料庫的擁有者帳號
       community.postgresql.postgresql_user:
-        name: "{{ pg_app_user }}"
-        password: "{{ postgres_app_password }}"
+        name: "{{ patroni_db.user }}"
+        password: "{{ patroni_db.password }}"
         login_unix_socket: /var/run/postgresql
+      loop: "{{ pg_databases }}"
+      loop_control:
+        loop_var: patroni_db
+        label: "{{ patroni_db.user }}"
       no_log: true
 
-    # owner 給 app 使用者 = 它在自己的 db 內有完整 DDL 權限（schema migration
-    # 工具需要建表/索引），但拿不到任何 superuser 能力——最小권限的實用折衷
-    - name: 建立應用資料庫（owner 為應用使用者）：{{ pg_app_db }}
+    # owner 給該帳號 = 它在自己的 db 內有完整 DDL 權限（schema migration
+    # 工具需要建表/索引），但拿不到任何 superuser 能力——最小權限的實用折衷
+    - name: 建立資料庫（owner 為對應帳號）
       community.postgresql.postgresql_db:
-        name: "{{ pg_app_db }}"
-        owner: "{{ pg_app_user }}"
+        name: "{{ patroni_db.db }}"
+        owner: "{{ patroni_db.user }}"
         login_unix_socket: /var/run/postgresql
+      loop: "{{ pg_databases }}"
+      loop_control:
+        loop_var: patroni_db
+        label: "{{ patroni_db.db }}"
 
     # pgbouncer_auth：PgBouncer auth_query 專用低權身分（pgbouncer role 的
     # userlist.txt 只放它，一般使用者密碼不落地）。只給 LOGIN，
@@ -70,29 +83,35 @@
       no_log: true
 
     # 明確授 CONNECT（而不是依賴 PUBLIC 的預設 CONNECT）：
-    # 日後有人對這個 db REVOKE CONNECT FROM PUBLIC 做硬化時，這兩個身分不會被誤傷
-    - name: 授予應用使用者與 pgbouncer_auth 的資料庫 CONNECT 權限：{{ pg_app_db }}
+    # 日後有人對某個 db REVOKE CONNECT FROM PUBLIC 做硬化時，這些身分不會被誤傷
+    - name: 授予各資料庫的 CONNECT 權限（擁有者 + pgbouncer_auth）
       community.postgresql.postgresql_privs:
-        login_db: "{{ pg_app_db }}"
+        login_db: "{{ patroni_db.db }}"
         type: database
-        objs: "{{ pg_app_db }}"
+        objs: "{{ patroni_db.db }}"
         privs: CONNECT
-        roles: "{{ pg_app_user }},{{ pgbouncer_auth_user | default('pgbouncer_auth') }}"
+        roles: "{{ patroni_db.user }},{{ pgbouncer_auth_user | default('pgbouncer_auth') }}"
         state: present
         login_unix_socket: /var/run/postgresql
+      loop: "{{ pg_databases }}"
+      loop_control:
+        loop_var: patroni_db
+        label: "{{ patroni_db.db }}"
 
-    # PgBouncer auth_query 的後端（pgbouncer.ini：SELECT username, password FROM
-    # pgbouncer.get_auth($1)）。為什麼用 auth_query 而不是把所有使用者密碼抄進
-    # userlist.txt：密碼只存 PG 一處（single source of truth），改密碼 / 加使用者
-    # 完全不用重佈 PgBouncer；userlist.txt 只剩 pgbouncer 自用的兩個內部帳號。
+    # PgBouncer auth_query 的後端（pgbouncer.ini：auth_dbname = postgres +
+    # SELECT username, password FROM pgbouncer.get_auth($1)）。
+    # 為什麼放「postgres 系統庫」而不是某個應用 db：多專案後 auth_query 需要
+    # 一個「永遠存在、不屬於任何專案」的落點——postgres 庫天然滿足；
+    # 專案 db 的增減完全不影響認證鏈。
+    # 為什麼用 auth_query 而不是把所有使用者密碼抄進 userlist.txt：密碼只存
+    # PG 一處（single source of truth），改密碼 / 加使用者完全不用重佈 PgBouncer。
     # SECURITY DEFINER 的意義：函數以「定義者」（postgres）權限讀 pg_shadow，
-    # 呼叫者 pgbouncer_auth 本身完全沒有讀密碼表的權限——它只被授權執行這一個
-    # 參數化查詢，權限面收到最小。
+    # 呼叫者 pgbouncer_auth 本身完全沒有讀密碼表的權限。
     # 冪等性：CREATE SCHEMA IF NOT EXISTS / CREATE OR REPLACE / REVOKE / GRANT
     # 天然收斂到同一終態，重跑無副作用 → changed_when: false 讓報表誠實呈現
-    - name: 佈建 pgbouncer.get_auth SECURITY DEFINER 函數（auth_query 後端）
+    - name: 佈建 pgbouncer.get_auth SECURITY DEFINER 函數（auth_query 後端，postgres 庫）
       community.postgresql.postgresql_query:
-        login_db: "{{ pg_app_db }}"
+        login_db: postgres
         login_unix_socket: /var/run/postgresql
         query: |
           CREATE SCHEMA IF NOT EXISTS pgbouncer;
@@ -106,3 +125,29 @@
           GRANT USAGE ON SCHEMA pgbouncer TO {{ pgbouncer_auth_user | default('pgbouncer_auth') }};
           GRANT EXECUTE ON FUNCTION pgbouncer.get_auth(TEXT) TO {{ pgbouncer_auth_user | default('pgbouncer_auth') }};
       changed_when: false
+
+    # 也要授 pgbouncer_auth 連 postgres 庫的權限（auth_dbname = postgres）
+    - name: 授予 pgbouncer_auth 對 postgres 庫的 CONNECT
+      community.postgresql.postgresql_privs:
+        login_db: postgres
+        type: database
+        objs: postgres
+        privs: CONNECT
+        roles: "{{ pgbouncer_auth_user | default('pgbouncer_auth') }}"
+        state: present
+        login_unix_socket: /var/run/postgresql
+
+    # extension 是 per-db 的 catalog 物件：leader 建、經 WAL 複寫到全叢集；
+    # .so 已由 install.yml 在「全部」pg 節點就位（副本查詢 / failover 的前提）。
+    # pg_search 非 trusted extension 需 superuser 身分建立；pgvector 雖 trusted
+    # 但統一由 postgres 身分建，語意一致
+    - name: 啟用各資料庫宣告的 PG extensions
+      community.postgresql.postgresql_ext:
+        name: "{{ patroni_db_ext.1 }}"
+        login_db: "{{ patroni_db_ext.0.db }}"
+        login_unix_socket: /var/run/postgresql
+        state: present
+      loop: "{{ pg_databases | subelements('extensions', skip_missing=True) }}"
+      loop_control:
+        loop_var: patroni_db_ext
+        label: "{{ patroni_db_ext.0.db }}:{{ patroni_db_ext.1 }}"

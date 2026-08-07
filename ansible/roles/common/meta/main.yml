@@ -1,7 +1,7 @@
 ---
 galaxy_info:
   role_name: common
-  namespace: email_proxy
+  namespace: platform
   author: justin.sc.hsu
   description: 所有主機的系統基線（時區/NTP/hosts/proxy/sysctl/swap/limits/journald/SSH 強化）
   company: PTC-NEC

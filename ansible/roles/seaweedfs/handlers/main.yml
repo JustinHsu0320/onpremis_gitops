@@ -1,0 +1,19 @@
+---
+# =============================================================================
+# roles/seaweedfs/handlers/main.yml
+#
+# recreate: always 的理由同 keydb/scylla：filer.toml / s3.json / 憑證是
+# 檔案掛載，compose 偵測不到內容變更，單純 restart 也不重讀——必須 recreate。
+#
+# ★ 滾動警語：三台同時 recreate = S3 全斷 + master raft quorum 失守。
+# 34-seaweedfs.yml 對「首次成形」刻意全並行（raft 要同時起互相選主），
+# 但對「已運行叢集」的計畫性變更（憑證輪替、改設定）請 --limit 逐台，
+# 每台之間確認 /cluster/status 的 Leader 存在再動下一台。
+# =============================================================================
+
+- name: Restart seaweedfs
+  community.docker.docker_compose_v2:
+    project_src: "{{ seaweedfs_home }}"
+    state: present
+    recreate: always
+  listen: restart seaweedfs

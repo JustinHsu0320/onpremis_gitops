@@ -234,21 +234,41 @@
   delegate_to: "{{ rabbitmq_seed_node }}"
 
 # ---------------------------------------------------------------------------
-# 10. vhost / user / queue 拓撲（叢集級定義，seed 上跑一次）
+# 10. vhost / user / queue 拓撲（叢集級定義，seed 上跑一次；多租戶迭代）
 # ---------------------------------------------------------------------------
 # community.rabbitmq 模組分兩類：vhost/user 底層呼叫本機 rabbitmqctl；
 # exchange/queue/binding 打本機 15672 management API（python3-requests）。
 # 全部是叢集級資料（存在 raft/metadata store），run_once + delegate seed 即可。
+#
+# 多租戶（CONVENTIONS §10）：rabbitmq_tenants 由 group_vars/rabbitmq.yml 從
+# projects 推導——每個租戶 { vhost, user, password, dlx_exchange, dlq_queue,
+# queues }。含密碼 → 全部迭代 loop label + no_log。零租戶時各 task 迭代 0 次。
 
-- name: 建立應用 vhost
+- name: 建立各租戶 vhost
   community.rabbitmq.rabbitmq_vhost:
-    name: "{{ rabbitmq_vhost }}"
+    name: "{{ rabbitmq_tenant.vhost }}"
     state: present
+  loop: "{{ rabbitmq_tenants }}"
+  loop_control:
+    loop_var: rabbitmq_tenant
+    label: "{{ rabbitmq_tenant.vhost }}"
   run_once: true
   delegate_to: "{{ rabbitmq_seed_node }}"
 
+# admin 的權限清單 = 全部租戶 vhost + 預設 "/"（管理 API 的部分端點預設打 "/"）。
+# Jinja 迴圈組裝 list-of-dict（rabbitmq_user 模組的 permissions 格式）
+- name: 組裝 admin 權限清單（全部租戶 vhost + "/"）
+  ansible.builtin.set_fact:
+    rabbitmq_admin_permissions: >-
+      {%- set rabbitmq_perms = [] -%}
+      {%- for rabbitmq_v in (rabbitmq_tenants | map(attribute='vhost') | list) + ['/'] -%}
+        {%- set _ = rabbitmq_perms.append({'vhost': rabbitmq_v,
+             'configure_priv': '.*', 'read_priv': '.*', 'write_priv': '.*'}) -%}
+      {%- endfor -%}
+      {{ rabbitmq_perms }}
+  run_once: true
+
 # admin 要先於 exchange/queue 建立：後面的 API 模組用 admin 帳密登入 15672。
-# 權限同時涵蓋應用 vhost 與預設 "/"（管理 API 的部分端點預設打 "/"）。
 # update_password: always 讓 vault 輪替密碼後重跑即生效（模組先以
 # authenticate_user 驗證舊密碼，通過就不動作，不破壞冪等）
 - name: 建立 admin 管理帳號（administrator）
@@ -256,33 +276,30 @@
     user: admin
     password: "{{ rabbitmq_admin_password }}"
     tags: administrator
-    permissions:
-      - vhost: "{{ rabbitmq_vhost }}"
-        configure_priv: .*
-        read_priv: .*
-        write_priv: .*
-      - vhost: /
-        configure_priv: .*
-        read_priv: .*
-        write_priv: .*
+    permissions: "{{ rabbitmq_admin_permissions }}"
     update_password: always
     state: present
   no_log: true
   run_once: true
   delegate_to: "{{ rabbitmq_seed_node }}"
 
-# 應用帳號走最小權限：只拿應用 vhost 的權限、不掛任何管理 tag
-- name: 建立應用帳號（僅應用 vhost 權限）
+# 租戶帳號走最小權限：只拿自己 vhost 的權限、不掛任何管理 tag——
+# 這就是 MQ 層的多專案租戶邊界（A 專案的帳號動不了 B 專案的佇列）
+- name: 建立各租戶應用帳號（僅自身 vhost 權限）
   community.rabbitmq.rabbitmq_user:
-    user: "{{ rabbitmq_app_user }}"
-    password: "{{ rabbitmq_app_user_password }}"
+    user: "{{ rabbitmq_tenant.user }}"
+    password: "{{ rabbitmq_tenant.password }}"
     permissions:
-      - vhost: "{{ rabbitmq_vhost }}"
+      - vhost: "{{ rabbitmq_tenant.vhost }}"
         configure_priv: .*
         read_priv: .*
         write_priv: .*
     update_password: always
     state: present
+  loop: "{{ rabbitmq_tenants }}"
+  loop_control:
+    loop_var: rabbitmq_tenant
+    label: "{{ rabbitmq_tenant.user }}"
   no_log: true
   run_once: true
   delegate_to: "{{ rabbitmq_seed_node }}"
@@ -297,57 +314,70 @@
   delegate_to: "{{ rabbitmq_seed_node }}"
 
 # 死信 exchange 用 fanout：所有過期/被拒的訊息不分 routing key 全部
-# 廣播到綁定的 DLQ，拓撲最簡單、不會漏訊息
-- name: 建立死信 exchange（fanout、durable）
+# 廣播到綁定的 DLQ，拓撲最簡單、不會漏訊息。dlx_exchange 未宣告的租戶跳過
+- name: 建立各租戶死信 exchange（fanout、durable）
   community.rabbitmq.rabbitmq_exchange:
-    name: "{{ rabbitmq_dlx_exchange }}"
+    name: "{{ rabbitmq_tenant.dlx_exchange }}"
     exchange_type: fanout
     durable: true
-    vhost: "{{ rabbitmq_vhost }}"
+    vhost: "{{ rabbitmq_tenant.vhost }}"
     login_user: admin
     login_password: "{{ rabbitmq_admin_password }}"
     login_host: "{{ ansible_host }}"  # management 綁節點 IP（見 rabbitmq.conf.j2），loopback 連不到
     login_port: "{{ rabbitmq_management_port }}"
     state: present
+  loop: "{{ rabbitmq_tenants | selectattr('dlx_exchange', 'defined') | list }}"
+  loop_control:
+    loop_var: rabbitmq_tenant
+    label: "{{ rabbitmq_tenant.vhost }}/{{ rabbitmq_tenant.dlx_exchange }}"
   no_log: true
   run_once: true
   delegate_to: "{{ rabbitmq_seed_node }}"
 
 # quorum queue（raft 多數複寫）是 4.x 的 HA 標準解，取代已淘汰的 classic
 # mirrored queue；x-queue-type 只能在「建立時」指定，事後不可改。
-# item.dlx 非空才附掛 x-dead-letter-exchange（dlq 自己不再掛 DLX，
-# 避免死信循環）。no_log 是因為 task 參數含 admin 密碼
-- name: 建立 quorum queues
+# queue.dlx 非空才附掛 x-dead-letter-exchange（dlq 自己不再掛 DLX，
+# 避免死信循環）。subelements 把租戶 × queues 攤平成 (tenant, queue) 對
+- name: 建立各租戶 quorum queues
   community.rabbitmq.rabbitmq_queue:
-    name: "{{ item.name }}"
+    name: "{{ rabbitmq_tq.1.name }}"
     durable: true
     arguments: >-
       {{ {'x-queue-type': 'quorum'}
-         | combine({'x-dead-letter-exchange': item.dlx}
-                   if (item.dlx | default('') | length > 0) else {}) }}
-    vhost: "{{ rabbitmq_vhost }}"
+         | combine({'x-dead-letter-exchange': rabbitmq_tq.1.dlx}
+                   if (rabbitmq_tq.1.dlx | default('') | length > 0) else {}) }}
+    vhost: "{{ rabbitmq_tq.0.vhost }}"
     login_user: admin
     login_password: "{{ rabbitmq_admin_password }}"
     login_host: "{{ ansible_host }}"  # management 綁節點 IP（見 rabbitmq.conf.j2），loopback 連不到
     login_port: "{{ rabbitmq_management_port }}"
     state: present
-  loop: "{{ rabbitmq_queues }}"
+  loop: "{{ rabbitmq_tenants | subelements('queues', skip_missing=True) }}"
+  loop_control:
+    loop_var: rabbitmq_tq
+    label: "{{ rabbitmq_tq.0.vhost }}/{{ rabbitmq_tq.1.name }}"
   no_log: true
   run_once: true
   delegate_to: "{{ rabbitmq_seed_node }}"
 
 # fanout exchange 忽略 routing key，routing_key 用模組預設值即可
-- name: 綁定死信 exchange 到 DLQ
+- name: 綁定各租戶死信 exchange 到 DLQ
   community.rabbitmq.rabbitmq_binding:
-    name: "{{ rabbitmq_dlx_exchange }}"
-    destination: "{{ rabbitmq_dlq_queue }}"
+    name: "{{ rabbitmq_tenant.dlx_exchange }}"
+    destination: "{{ rabbitmq_tenant.dlq_queue }}"
     destination_type: queue
-    vhost: "{{ rabbitmq_vhost }}"
+    vhost: "{{ rabbitmq_tenant.vhost }}"
     login_user: admin
     login_password: "{{ rabbitmq_admin_password }}"
     login_host: "{{ ansible_host }}"  # management 綁節點 IP（見 rabbitmq.conf.j2），loopback 連不到
     login_port: "{{ rabbitmq_management_port }}"
     state: present
+  loop: >-
+    {{ rabbitmq_tenants | selectattr('dlx_exchange', 'defined')
+       | selectattr('dlq_queue', 'defined') | list }}
+  loop_control:
+    loop_var: rabbitmq_tenant
+    label: "{{ rabbitmq_tenant.vhost }}: {{ rabbitmq_tenant.dlx_exchange }} → {{ rabbitmq_tenant.dlq_queue }}"
   no_log: true
   run_once: true
   delegate_to: "{{ rabbitmq_seed_node }}"

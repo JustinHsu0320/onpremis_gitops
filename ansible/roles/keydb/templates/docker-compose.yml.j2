@@ -74,7 +74,7 @@ services:
     volumes:
       - {{ keydb_home }}/tls:/tls:ro
     environment:
-      # rediss:// = 走 TLS 連本機 master（SAN 含 IP:127.0.0.1，見 group_vars/app.yml）
+      # rediss:// = 走 TLS 連本機 master（SAN 含 IP:127.0.0.1，見 group_vars/app_email_proxy.yml）
       REDIS_ADDR: "rediss://127.0.0.1:{{ keydb_port }}"
       REDIS_PASSWORD: "{{ keydb_password }}"
       # mTLS：KeyDB tls-auth-clients yes 要求客戶端出示內部 CA 簽的憑證

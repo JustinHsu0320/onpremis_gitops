@@ -15,7 +15,7 @@
 services:
   prometheus:
     image: "{{ monitoring_prometheus_image }}"
-    container_name: email-proxy-prometheus
+    container_name: platform-prometheus
     restart: unless-stopped
     networks: [monitoring]
     # 覆寫映像預設參數的原因：retention 要吃 group_vars 的環境差
@@ -38,7 +38,7 @@ services:
 
   grafana:
     image: "{{ monitoring_grafana_image }}"
-    container_name: email-proxy-grafana
+    container_name: platform-grafana
     restart: unless-stopped
     networks: [monitoring]
     environment:
@@ -59,7 +59,7 @@ services:
 
   alertmanager:
     image: "{{ monitoring_alertmanager_image }}"
-    container_name: email-proxy-alertmanager
+    container_name: platform-alertmanager
     restart: unless-stopped
     networks: [monitoring]
     command:
@@ -75,7 +75,7 @@ services:
 
   blackbox:
     image: "{{ monitoring_blackbox_image }}"
-    container_name: email-proxy-blackbox
+    container_name: platform-blackbox
     restart: unless-stopped
     networks: [monitoring]
     # 映像預設設定路徑是 /etc/blackbox_exporter/config.yml；

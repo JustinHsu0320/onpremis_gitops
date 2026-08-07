@@ -1,0 +1,120 @@
+---
+# =============================================================================
+# roles/compose_app/tasks/one_project.yml — 單一專案的 compose 佈署
+# 呼叫端以 loop_var=compose_app_prj 傳入 projects 的一個 entry（key/value）。
+# =============================================================================
+
+# 展開常用欄位成短名 fact，後續引用不用一長串 dict path。
+# cfg 內含機密（env 段的 vault 引用已被求值）→ no_log
+- name: 展開專案宣告（{{ compose_app_prj.key }}）
+  ansible.builtin.set_fact:
+    compose_app_name: "{{ compose_app_prj.key }}"
+    compose_app_cfg: "{{ compose_app_prj.value.compose_app }}"
+    compose_app_mock: "{{ compose_app_prj.key in compose_app_mock_projects }}"
+  no_log: true
+
+# handler 的 recreate 佇列：把本專案登記進 host fact，handler 迭代它。
+# （Ansible handler 無法帶 per-loop 參數，這是「多專案 × notify」的標準解法；
+# 代價：本機任一專案的變更會 recreate 本機「全部」專案——單專案時與舊
+# app_stack 行為完全相同；多專案同機時是可接受的保守行為，因為 50-apps
+# 是 serial: 1 滾動、LB 已摘除本機）
+- name: 登記專案到 recreate 佇列
+  ansible.builtin.set_fact:
+    compose_app_deployed: "{{ compose_app_deployed + [{'name': compose_app_name, 'home': compose_app_cfg.home, 'mock': compose_app_mock}] }}"
+  no_log: true
+
+# ---------- 1. compose 專案目錄 ----------
+# CONVENTIONS.md §4：專案 compose 目錄 = /opt/<project-kebab>。root:root 0755
+# ——目錄本身無機密（機密在 .env，該檔單獨 0600）
+- name: 建立 compose 專案目錄（{{ compose_app_name }}）
+  ansible.builtin.file:
+    path: "{{ compose_app_cfg.home }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+# ---------- 2. mock build context（僅 mock 模式） ----------
+- name: 佈署 mock 模擬器 build context（僅 mock 模式）——{{ compose_app_name }}
+  when: compose_app_mock
+  block:
+    - name: 建立 mock build context 目錄
+      ansible.builtin.file:
+        path: "{{ compose_app_cfg.home }}/mock"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    # mock 原始碼變更（copy 比對內容）→ notify recreate handler；
+    # handler 的 build: always 會先 rebuild 映像再重建容器，新程式碼才生效
+    - name: 複製 mock Dockerfile 與模擬器程式
+      ansible.builtin.copy:
+        src: "mock/{{ compose_app_mock_file }}"
+        dest: "{{ compose_app_cfg.home }}/mock/{{ compose_app_mock_file }}"
+        owner: root
+        group: root
+        mode: "0644"
+      loop:
+        - Dockerfile
+        - mock_service.py
+      loop_control:
+        loop_var: compose_app_mock_file
+      notify: restart compose apps
+
+# ---------- 3. .env（真實 app 的介面契約） ----------
+# 含 DB/MQ/快取密碼與 API key → 0600 + no_log（防 --diff 把機密印上終端）。
+# 內容變更必須 recreate 容器：env_file 只在容器「建立」時讀取 → notify handler
+- name: 佈署應用環境檔 .env（機密）——{{ compose_app_name }}
+  ansible.builtin.template:
+    src: env.j2
+    dest: "{{ compose_app_cfg.home }}/.env"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  notify: restart compose apps
+
+# ---------- 4. docker-compose.yml ----------
+# 機密都抽到 .env 了，本檔無機密 → 0644、不用 no_log（保留 --diff 可讀性）
+- name: 佈署 docker-compose.yml（{{ compose_app_name }}）
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ compose_app_cfg.home }}/docker-compose.yml"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart compose apps
+
+# ---------- 5. PKI 輪替橋接（CONVENTIONS.md §5 契約） ----------
+# 宣告的 mounts 常含 {{ pki_dir }} 唯讀掛載；檔案掛載的內容變更 compose
+# 偵測不到——pki_certs_changed 時 notify recreate 讓新憑證生效
+- name: 偵測 PKI 憑證輪替並排程容器重建（{{ compose_app_name }}）
+  ansible.builtin.command: /bin/true
+  changed_when: true
+  when: pki_certs_changed | default(false)
+  notify: restart compose apps
+
+# ---------- 6. registry 登入（prod、僅在提供帳密時） ----------
+# 憑證檔落在 root 的 ~/.docker/config.json（docker compose 以 root 跑）
+- name: 登入內部 container registry
+  community.docker.docker_login:
+    registry_url: "{{ registry_host }}"
+    username: "{{ compose_app_registry_username }}"
+    password: "{{ compose_app_registry_password }}"
+  no_log: true
+  when:
+    - not compose_app_mock
+    - compose_app_registry_username is defined
+    - compose_app_registry_password is defined
+
+# ---------- 7. compose up ----------
+# state=present ≒ docker compose up -d。build 策略：mock 用 always——
+# BuildKit cache 讓程式沒變時秒級命中（image id 不變、容器不動 = 冪等）；
+# prod 模式沒有 build 段，維持預設 policy。
+# 注意它「偵測不到」.env 與掛載憑證的內容變更——那由 notify → handler 補上
+- name: 啟動應用堆疊（{{ compose_app_name }}）
+  community.docker.docker_compose_v2:
+    project_src: "{{ compose_app_cfg.home }}"
+    state: present
+    build: "{{ 'always' if compose_app_mock else 'policy' }}"

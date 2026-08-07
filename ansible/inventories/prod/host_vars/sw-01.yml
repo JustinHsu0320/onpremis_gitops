@@ -1,0 +1,5 @@
+---
+# sw-01：S3 VIP（s3.<domain>:8333）的常態持有者。VIP 只決定「封包進哪台的
+# HAProxy」，HAProxy 再 roundrobin 到三台的 weed s3——VIP 漂移不影響資料面
+keepalived_state: MASTER
+keepalived_priority: 150

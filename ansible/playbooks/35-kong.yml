@@ -1,0 +1,21 @@
+---
+# =============================================================================
+# 35-kong.yml — API Gateway 層（Kong DB-less）
+#
+# 定位：多專案的 L7 應用路由。北向由邊界 HAProxy 443 依 host 分流進 be_kong、
+# 東西向走 kong-vip:8443（keepalived VI_KONG）。路由真值 = Git 的 projects 宣告
+# （改路由 = 發 PR 改 projects → 重跑本 playbook → kong reload 熱換零斷線）。
+#
+# 依賴：08-docker、10-pki（kong-server 憑證）。刻意不依賴任何資料層——
+# DB-less 讓「改路由」永遠不被資料庫故障綁架。
+#
+# serial: 1 滾動：一次只動一台，北向由邊界健檢自動摘掛、東西向 VIP 由
+# track_kong 漂移——Kong 兩台等價，逐台重建全程對外不中斷。
+# =============================================================================
+- name: API Gateway（Kong DB-less + Keepalived VIP）
+  hosts: kong
+  tags: [kong, gateway]
+  serial: 1
+  roles:
+    - role: kong
+    - role: keepalived

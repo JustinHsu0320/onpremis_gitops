@@ -1,0 +1,29 @@
+---
+# =============================================================================
+# roles/kong/handlers/main.yml
+#
+# reload vs restart 的分工（junior 必讀）：
+#   - kong.yml / TLS 憑證變更 → reload：DB-less 下 `kong reload` 以新 worker
+#     重讀 KONG_DECLARATIVE_CONFIG 與憑證，nginx 級熱換、零斷線
+#     （等同邊界 haproxy 的 -Ws reload 語意）。★ lab 全鏈實測「改 kong.yml →
+#     reload → 路由生效且零斷線」後，把實測結果回填到這行註解。
+#   - compose / KONG_* 環境變數變更 → restart（recreate）：reload 讀不到新 env，
+#     必須重建容器。
+#
+# 滾動影響：restart 會讓本機 Kong 瞬間離線。35-kong.yml 已用 serial: 1
+# 一次只動一台，北向由邊界 HAProxy 健檢自動摘除/回掛、東西向由 keepalived
+# track_kong 把 VIP 漂到健康節點——切勿改成全平行執行。
+# =============================================================================
+
+- name: Reload kong
+  community.docker.docker_container_exec:
+    container: kong
+    command: kong reload
+  listen: reload kong
+
+- name: Restart kong
+  community.docker.docker_compose_v2:
+    project_src: "{{ kong_home }}"
+    state: present
+    recreate: always
+  listen: restart kong

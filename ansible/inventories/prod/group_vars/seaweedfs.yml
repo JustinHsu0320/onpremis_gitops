@@ -1,0 +1,43 @@
+---
+# =============================================================================
+# group_vars/seaweedfs.yml — S3 物件儲存層（SeaweedFS + HAProxy VIP + Keepalived）
+# =============================================================================
+
+# ---------- PKI ----------
+# server profile：S3 8333 只當 server 被連（節點間 master/volume/filer 走
+# VLAN 40 內部明文，不吃這張）。CN/SAN 以 s3 服務名為主：client 連的是
+# s3.{{ domain }}（VIP），SAN 必須涵蓋服務名與 VIP IP 才過 verify。
+pki_certificates:
+  - name: seaweedfs-server
+    profile: server
+    owner: root
+    group: root
+    key_mode: "0640"
+    cn: "s3.{{ domain }}"
+    extra_sans:
+      - "DNS:s3.{{ domain }}"
+      - "DNS:s3"
+      - "IP:{{ s3_vip }}"
+      - "IP:127.0.0.1"
+
+# ---------- 資料碟（05-block-storage；lab 因 is_container 跳過） ----------
+# 對應 terraform 的 sw disk1-seaweedfs（1000G，thin）。volume 資料 + 3.x 的
+# idx 都在這；owner 不在這裡指定（root 容器，role 建子目錄時 chown）。
+# replication=010 → 可用容量 ≈ 3TB 原始 / 2 = 1.5TB
+storage_volumes:
+  - { mountpoint: /var/lib/seaweedfs, size_gb: 1000 }
+
+# ---------- HAProxy（S3 VIP 分流）+ Keepalived ----------
+# 與 pg/mq 同款模式：HAProxy 綁 VIP:8333 做 TCP passthrough（不重複終止 TLS，
+# 憑證管理單點留在 SeaweedFS）+ roundrobin 到三台節點的 8333
+haproxy_profile: seaweedfs
+
+keepalived_instances:
+  - name: VI_S3
+    vrid: 40
+    vip: "{{ s3_vip }}"
+    state: "{{ keepalived_state }}"          # host_vars：sw-01=MASTER / 其餘 BACKUP
+    priority: "{{ keepalived_priority }}"    # host_vars：150 / 120 / 100
+    auth_pass: "{{ vrrp_pass_s3 }}"
+    peers_group: seaweedfs
+    track_haproxy: true

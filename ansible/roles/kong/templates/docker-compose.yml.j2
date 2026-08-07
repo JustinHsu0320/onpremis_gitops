@@ -1,0 +1,55 @@
+{#
+  docker-compose.yml.j2 — Kong API Gateway（DB-less、host network）
+
+  為什麼 network_mode: host（junior 必讀）：
+    1. 埠即契約：{{ kong_proxy_port }}/{{ kong_proxy_tls_port }}/{{ kong_status_port }}
+       直接綁節點 IP 與 VIP，與 CONVENTIONS.md §3 一對一，沒有 NAT 心智負擔。
+    2. VIP 預綁：{{ kong_vip }}:{{ kong_proxy_tls_port }} 依賴全站已開的
+       net.ipv4.ip_nonlocal_bind=1（埠共存原則）——bridge 模式下容器綁不了宿主 VIP。
+    3. ★ host network 容器「不共享」宿主 /etc/hosts：ADR-5 的名稱解析進不了容器，
+       所以 kong.yml 的 upstream targets 一律渲染成節點 IP（見 kong.yml.j2 註解）。
+
+  機密不在本檔（consumer 憑證在 kong.yml，該檔 0600 + no_log），本檔 0644。
+#}
+# ===== {{ ansible_managed }} =====
+services:
+  kong:
+    image: "{{ kong_image }}"
+    container_name: kong
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - {{ kong_home }}/config:/etc/kong-conf:ro
+      - {{ kong_home }}/tls:/tls:ro
+    environment:
+      # DB-less：宣告式組態是唯一真值；Admin API 天生唯讀
+      KONG_DATABASE: "off"
+      KONG_DECLARATIVE_CONFIG: /etc/kong-conf/kong.yml
+      # 埠共存原則（CONVENTIONS §3）：服務綁節點 IP + 127.0.0.1；
+      # 東西向 TLS 口另綁 VIP（BACKUP 預綁靠 ip_nonlocal_bind，README §4.3）
+      KONG_PROXY_LISTEN: >-
+        {{ ansible_host }}:{{ kong_proxy_port }} reuseport,
+        127.0.0.1:{{ kong_proxy_port }},
+        {{ ansible_host }}:{{ kong_proxy_tls_port }} ssl,
+        {{ kong_vip }}:{{ kong_proxy_tls_port }} ssl,
+        127.0.0.1:{{ kong_proxy_tls_port }} ssl
+      # admin 絕不外露：DB-less 下唯讀，僅供本機維運除錯與 99-verify
+      KONG_ADMIN_LISTEN: "127.0.0.1:{{ kong_admin_port }}"
+      # status：邊界 HAProxy 健檢（check port {{ kong_status_port }}）+ Prometheus /metrics
+      KONG_STATUS_LISTEN: "{{ ansible_host }}:{{ kong_status_port }}, 127.0.0.1:{{ kong_status_port }}"
+      KONG_SSL_CERT: /tls/kong-server.crt
+      KONG_SSL_CERT_KEY: /tls/kong-server.key
+      # 日誌全走 stdout/stderr → docker → journald（與全站日誌動線一致）
+      KONG_PROXY_ACCESS_LOG: /dev/stdout
+      KONG_ADMIN_ACCESS_LOG: /dev/stdout
+      KONG_PROXY_ERROR_LOG: /dev/stderr
+      KONG_ADMIN_ERROR_LOG: /dev/stderr
+      KONG_LOG_LEVEL: "{{ kong_log_level }}"
+      KONG_NGINX_WORKER_PROCESSES: "{{ kong_nginx_worker_processes }}"
+    healthcheck:
+      # 容器層第二道防線（第一道是邊界 HAProxy 的 status 健檢）
+      test: ["CMD", "kong", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s

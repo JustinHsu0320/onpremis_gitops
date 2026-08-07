@@ -1,0 +1,26 @@
+---
+# =============================================================================
+# 34-seaweedfs.yml — S3 物件儲存層（SeaweedFS 3 節點）
+#
+# 依賴：05（資料碟）、08（Docker）、10（seaweedfs-server 憑證）、
+# ★ 30-postgres（filer 元資料庫 database=seaweedfs 由 patroni role 建立）
+# ——這是「組件依賴組件」的第一例（CONVENTIONS §1）：選 seaweedfs 必先選 postgres。
+#
+# serial 的取捨（比照 31-rabbitmq 檔頭）：
+#   - seaweedfs role 不用 serial：master raft 首次成形要三台「同時」啟動互相選主
+#   - haproxy/keepalived 滾動套用（serial: 1）→ S3 VIP 不中斷
+#   - 已運行叢集的計畫性變更（憑證輪替/改設定）請 --limit 逐台
+# =============================================================================
+- name: SeaweedFS 3 節點 S3 叢集（master raft + volume + filer + s3）
+  hosts: seaweedfs
+  tags: [seaweedfs, s3]
+  roles:
+    - role: seaweedfs
+
+- name: S3 節點本地 HAProxy + Keepalived（VIP:8333 分流、滾動不中斷）
+  hosts: seaweedfs
+  tags: [seaweedfs, s3-lb]
+  serial: 1
+  roles:
+    - role: haproxy
+    - role: keepalived

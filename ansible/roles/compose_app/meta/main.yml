@@ -1,0 +1,20 @@
+---
+# =============================================================================
+# roles/compose_app/meta/main.yml
+# =============================================================================
+galaxy_info:
+  author: platform-infra
+  description: >-
+    通用 compose 應用部署（宣告驅動）：迭代 projects 登記簿的 compose_app 段
+    （CONVENTIONS §10.3），對每個「宣告落在本機」的專案佈署
+    /opt/<project>/{.env,docker-compose.yml} 並滾動啟動。
+    app_stack（email_proxy 專屬）的泛化後繼者。
+  license: MIT
+  min_ansible_version: "2.16"
+  platforms:
+    - name: Ubuntu
+      versions:
+        - all
+
+# 順序依賴由 site.yml 保證（同 keydb 的理由）
+dependencies: []

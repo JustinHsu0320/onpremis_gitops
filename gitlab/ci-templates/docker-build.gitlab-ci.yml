@@ -14,15 +14,15 @@
 #
 # ── 用法（app repo 的 .gitlab-ci.yml）─────────────────────────────────────
 #   include:
-#     - project: "infra/email-proxy-infra"     # 本 infra monorepo
+#     - project: "infra/onpremis-gitops"     # 本 infra monorepo
 #       ref: main
 #       file: "gitlab/ci-templates/docker-build.gitlab-ci.yml"
 #   stages: [test, build, image, deploy]       # 必須含 image stage
 # 之後即獲得現成的 build-image job（單 image 專案直接可用）；
-# 多 image 專案（如 email_proxy 的 api/worker/smtp）：
+# 多 image 專案（如 compose 型專案的 api/worker/smtp）：
 #   1. 設全域變數 SKIP_DEFAULT_BUILD_IMAGE: "true" 關掉預設 job
 #   2. 每個 image 開一個 job extends .kaniko-build，覆寫 KANIKO_IMAGE 與
-#      KANIKO_DOCKERFILE（範例見 email-proxy-app.gitlab-ci.yml）
+#      KANIKO_DOCKERFILE（範例見 compose-app.gitlab-ci.yml）
 #
 # ── 產出 tag 策略 ──────────────────────────────────────────────────────────
 #   每次建置必打：<image>:$CI_COMMIT_SHORT_SHA   （不可變、可回溯到 commit）
@@ -71,7 +71,7 @@
     #      （type=File），內容 = mgmt-01 簽發的 ca.crt chain——集中管理、
     #      所有專案自動繼承，CA 輪替只改一個變數
     #   b) runner 側一勞永逸：runner-01 的 config.toml 掛
-    #      volumes = ["/usr/local/share/ca-certificates/email-proxy-internal-ca.crt:/kaniko/ssl/certs/internal-ca.crt:ro"]
+    #      volumes = ["/usr/local/share/ca-certificates/platform-internal-ca.crt:/kaniko/ssl/certs/internal-ca.crt:ro"]
     #      再於此 cat 進信任檔；適合不想在 GitLab 存 CA 的場景
     - |
       if [ -n "${INTERNAL_CA_PEM:-}" ]; then

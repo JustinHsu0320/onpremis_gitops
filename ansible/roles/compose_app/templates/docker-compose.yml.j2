@@ -1,0 +1,54 @@
+{#
+  docker-compose.yml.j2 — 由 projects.<name>.compose_app 宣告渲染的專案 compose
+
+  為什麼 network_mode: host（junior 必讀，承襲 app_stack 的三個理由）：
+    1. 同居服務（如 email_proxy 的 KeyDB）用 127.0.0.1 互連，bridge 模式斷頭。
+    2. 埠即契約：宣告的埠直接綁節點 IP，與 CONVENTIONS §3 / LB 後端一對一。
+    3. 效能：省 docker-proxy / NAT 一層。
+
+  模式切換：專案在 compose_app_mock_projects 內時 build 本地 mock
+  （實驗室沒有 registry）；否則 pull registry 的正式映像（ADR-6）。
+  機密不在本檔（全在 .env，0600 + no_log），本檔 0644 即可。
+#}
+# ===== {{ ansible_managed }} =====
+services:
+{% for svc_name, svc in compose_app_cfg.services.items() %}
+  {{ svc_name }}:
+{% if compose_app_mock %}
+    # mock 模式：本地 build 極簡模擬器。全部 service 共用同一個 build
+    # context 與 image tag——BuildKit cache 讓後續 build 直接命中；
+    # 一個映像多種角色：argv 決定行為（見 mock/mock_service.py 檔頭）
+    build: ./mock
+    image: {{ compose_app_name | replace('_', '-') }}-mock:local
+    command: ["python", "/app/mock_service.py", "{{ svc_name }}"]
+{% else %}
+    # prod 模式（ADR-6）：CI build 一次 → push registry → 這裡只 pull，
+    # 節點上絕不 build（build 環境差異 = 不可重現的部署）
+    image: "{{ svc.image }}"
+{% if svc.command is defined and svc.command | length > 0 %}
+    command: {{ svc.command | to_json }}
+{% endif %}
+{% endif %}
+    container_name: {{ compose_app_name | replace('_', '-') }}-{{ svc_name }}
+    network_mode: host
+    restart: unless-stopped
+    # 介面契約全部經 .env 注入：mock 與真 app 拿到一模一樣的環境
+    env_file: .env
+{% if compose_app_cfg.mounts | default([]) | length > 0 %}
+    volumes:
+{% for mount in compose_app_cfg.mounts %}
+      - {{ mount.src }}:{{ mount.dest }}{{ ':ro' if mount.readonly | default(false) else '' }}
+{% endfor %}
+{% endif %}
+{% if svc.health_port is defined %}
+    healthcheck:
+      # LB 打的是節點埠（外部視角），這是容器層的第二道防線：
+      # unhealthy 在 docker ps 一眼可見。用 wget：alpine（busybox）內建，
+      # 不假設映像裝了 curl；prod 映像契約上也必須提供 wget
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:{{ svc.health_port }}{{ compose_app_cfg.health.path | default('/health') }}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+{% endif %}
+{% endfor %}

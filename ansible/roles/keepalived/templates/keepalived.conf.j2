@@ -21,6 +21,7 @@ global_defs {
 {# 也會誤導 on-call 以為這台有在追蹤該行程                    #}
 {% set need_chk_haproxy = keepalived_instances | map(attribute='track_haproxy', default=false) | select | list | length > 0 %}
 {% set need_chk_squid = keepalived_instances | map(attribute='track_squid', default=false) | select | list | length > 0 %}
+{% set need_chk_kong = keepalived_instances | map(attribute='track_kong', default=false) | select | list | length > 0 %}
 {% if need_chk_haproxy %}
 
 # -----------------------------------------------------------------------------
@@ -55,6 +56,19 @@ vrrp_script chk_haproxy {
 # 兩個 VIP 各自跟隨自己的服務，HAProxy 掛了只漂服務 VIP、Squid 照常出網。
 vrrp_script chk_squid {
     script "/usr/bin/pgrep -x squid"
+    interval {{ keepalived_check_interval }}
+    weight {{ keepalived_check_weight }}
+    fall {{ keepalived_check_fall }}
+    rise {{ keepalived_check_rise }}
+}
+{% endif %}
+{% if need_chk_kong %}
+
+# Kong 的健檢用 status 口而非 pgrep：Kong 的行程名是 nginx（pgrep 太泛、
+# 容易誤中他人），而 curl /status 同時回答「入口行程收不收得了流量」——
+# 語意比存在性檢查更強。weight/fall/rise 推導同 chk_haproxy。
+vrrp_script chk_kong {
+    script "/usr/bin/curl -fsS -o /dev/null http://127.0.0.1:{{ kong_status_port }}/status"
     interval {{ keepalived_check_interval }}
     weight {{ keepalived_check_weight }}
     fall {{ keepalived_check_fall }}
@@ -101,7 +115,7 @@ vrrp_instance {{ inst.name }} {
     virtual_ipaddress {
         {{ inst.vip }}/32
     }
-{% if inst.track_haproxy | default(false) or inst.track_squid | default(false) %}
+{% if inst.track_haproxy | default(false) or inst.track_squid | default(false) or inst.track_kong | default(false) %}
 
     # 被追蹤行程死亡 → 本機扣 priority → 對端有效 priority 反超 → VIP 漂移。
     # 「主機活著但服務死了」是 VRRP 本身看不見的故障，全靠這裡補上
@@ -111,6 +125,9 @@ vrrp_instance {{ inst.name }} {
 {% endif %}
 {% if inst.track_squid | default(false) %}
         chk_squid
+{% endif %}
+{% if inst.track_kong | default(false) %}
+        chk_kong
 {% endif %}
     }
 {% endif %}

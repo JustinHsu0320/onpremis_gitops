@@ -24,6 +24,7 @@ haproxy_supported_profiles:
   - edge
   - postgres
   - rabbitmq
+  - seaweedfs
 
 # ---------- stats / metrics（三種 profile 共用；CONVENTIONS.md §3：8404） ----------
 haproxy_stats_port: 8404
@@ -77,3 +78,13 @@ haproxy_mq_check_rise: 2
 # RabbitMQ 管理 UI 埠（CONVENTIONS.md §3：15672，節點 IP 上由 RabbitMQ 自己聽，
 # VIP 上由 HAProxy 聽再分流——同埠不同 IP，不衝突）
 haproxy_mq_mgmt_port: 15672
+
+# ---------- profile=seaweedfs ----------
+haproxy_s3_maxconn: 2048
+haproxy_s3_timeout_connect: 5s
+# S3 大物件是長傳輸（單一 PUT/GET 數 GB），30m 是「還在傳只是慢」的保護值
+haproxy_s3_timeout_client: 30m
+haproxy_s3_timeout_server: 30m
+haproxy_s3_check_inter: 5s
+haproxy_s3_check_fall: 3
+haproxy_s3_check_rise: 2

@@ -1,0 +1,162 @@
+---
+# =============================================================================
+# project_email_proxy.yml — email_proxy 專案宣告（平台的第一個專案）
+#
+# 這是「專案層 = 純資料」的示範實例（schema 見 CONVENTIONS.md §10.3）：
+# 專案不擁有任何 play/role，只宣告「我要用哪些組件 + 我的資源」，
+# 平台 role 迭代 projects 消費這些宣告。
+#
+# 命名凍結說明：Scylla 的 keyspace（set_usc / email_service）與帳號沿用
+# MIS 既有叢集現況——keyspace 無法 rename，且日後要以「加 DC」方式從
+# MIS 線上遷移，值必須一致。RabbitMQ 佇列名 / PG db 名對齊 app 程式碼。
+#
+# 機密規約（CONVENTIONS.md §10.4）：本檔只引用 vault_prj_email_proxy_*
+# 別名，真值在 group_vars/all/vault_prj_email_proxy.yml（密文）。
+# =============================================================================
+project_email_proxy:
+  name: email_proxy
+  components: [pg, rabbitmq, keydb, scylla, nfs, edge, compose_app]
+
+  # ---------- PostgreSQL（消費者：roles/patroni/tasks/app_db.yml） ----------
+  pg:
+    db: email_proxy
+    user: email_proxy
+    password: "{{ vault_prj_email_proxy_pg_password }}"
+    extensions: []                  # email_proxy 不用向量/全文檢索；要用時填 [vector, pg_search]
+
+  # ---------- RabbitMQ（消費者：roles/rabbitmq/tasks/main.yml §10） ----------
+  rabbitmq:
+    vhost: email_proxy
+    user: email_proxy
+    password: "{{ vault_prj_email_proxy_mq_password }}"
+    dlx_exchange: email_proxy_dlx
+    dlq_queue: email_proxy_dlq
+    queues:
+      - { name: email_proxy_queue, dlx: email_proxy_dlx }
+      - { name: email_proxy_retry, dlx: email_proxy_dlx }
+      - { name: email_proxy_dlq, dlx: "" }
+
+  # ---------- ScyllaDB（消費者：roles/scylla/tasks/main.yml §6） ----------
+  scylla:
+    keyspaces: [set_usc, email_service]
+    user: set_usc_admin
+    password: "{{ vault_prj_email_proxy_scylla_password }}"
+
+  # ---------- NFS 檔案共享（消費者：group_vars/nfs.yml 組裝 nfs_exports） ----------
+  # clients 引用 vars.yml 的 nfs_attachments_clients：ACL 來源網段是「環境事實」
+  # （lab 多重掛網時由 zz_lab_overrides 覆寫成儲存網段），不是專案決策。
+  # client 端掛載（app 節點的 /mnt/attachments）宣告於 group_vars/app_email_proxy.yml
+  # ——兩邊是成對契約：改 path 必須同步改該檔的 src。
+  nfs:
+    exports:
+      - path: /export/email-proxy/attachments
+        clients: "{{ nfs_attachments_clients }}"
+        options: "rw,sync,no_subtree_check,all_squash,anonuid=1000,anongid=1000"
+        owner: "1000"
+        group: "1000"
+        mode: "0770"
+
+  # ---------- 邊界（消費者：group_vars/lb.yml 組裝 pki_certificates + haproxy edge 模板） ----------
+  edge:
+    cert:
+      name: svc-api                 # → /etc/platform/pki/svc-api.pem（bundle_pem）
+      profile: server
+      owner: root
+      group: root
+      key_mode: "0600"
+      cn: "svc-api.{{ domain }}"
+      extra_sans:
+        - "DNS:svc-api.{{ domain }}"
+        - "DNS:svc-api"
+        - "IP:{{ service_vip }}"
+      bundle_pem: true
+    frontends:
+      # 443：TLS 終止於邊界（mode http 才能做 L7 健檢與 X-Forwarded-*）
+      - name: https
+        port: 443
+        mode: http
+        cert: svc-api               # 引用上面 cert 的 name（<name>.pem）
+        backend_group: app_email_proxy
+        backend_port: "{{ app_http_port }}"
+        healthcheck: "GET /health"
+      # 465：TCP passthrough（SMTP 的 TLS 由後端 smtp 服務自持）
+      - name: smtps
+        port: 465
+        mode: tcp
+        backend_group: app_email_proxy
+        backend_port: "{{ app_smtp_port }}"
+        timeout: 30m
+
+  # ---------- Egress 白名單（消費者：group_vars/egress.yml 組裝） ----------
+  # email_proxy 的對外目的地：Microsoft Graph 寄信 + OAuth、SendGrid 備援通道
+  egress_allowlist:
+    - .login.microsoftonline.com
+    - .graph.microsoft.com
+    - .sendgrid.net
+    - api.sendgrid.com
+
+  # ---------- 應用堆疊（消費者：roles/compose_app，50-apps.yml） ----------
+  compose_app:
+    hosts_group: app_email_proxy
+    home: /opt/email-proxy          # CONVENTIONS §4：專案 compose 目錄 = /opt/<project-kebab>
+    services:                       # 每個 service 一個容器（host network）
+      api:
+        image: "{{ registry_host }}/email-proxy/api:{{ app_image_tag }}"
+        command: []                 # mock 模式時 role 會覆寫成 mock 參數
+        health_port: "{{ app_http_port }}"
+      worker:
+        image: "{{ registry_host }}/email-proxy/worker:{{ app_image_tag }}"
+        command: []
+      smtp:
+        image: "{{ registry_host }}/email-proxy/smtp:{{ app_image_tag }}"
+        command: []
+    mounts:
+      # 附件放 NFS（收信節點寫、寄送節點讀——與 nfs.exports 成對）
+      - { src: "{{ attachments_mount }}", dest: /data/attachments, readonly: false }
+      # 憑證唯讀掛入：容器內路徑與宿主 pki_dir 一致，env 的憑證路徑兩邊通用
+      - { src: "{{ pki_dir }}", dest: "{{ pki_dir }}", readonly: true }
+    # .env 內容（0600 + no_log 佈署）：這就是「真實 app 的介面契約」，
+    # mock 與正式映像拿到一模一樣的環境
+    env:
+      DATABASE_URL: >-
+        postgresql://email_proxy:{{ vault_prj_email_proxy_pg_password
+        }}@pgbouncer-vip.{{ domain }}:{{ pgbouncer_port
+        }}/email_proxy?sslmode=verify-full&sslrootcert={{ pki_dir }}/ca.crt
+      DATABASE_RO_URL: >-
+        postgresql://email_proxy:{{ vault_prj_email_proxy_pg_password
+        }}@pgbouncer-vip.{{ domain }}:{{ pgbouncer_ro_port
+        }}/email_proxy?sslmode=verify-full&sslrootcert={{ pki_dir }}/ca.crt
+      AMQP_URL: >-
+        amqps://email_proxy:{{ vault_prj_email_proxy_mq_password
+        }}@rabbitmq-vip.{{ domain }}:{{ rabbitmq_amqps_port }}/email_proxy
+      KEYDB_URL: "rediss://:{{ keydb_password }}@127.0.0.1:{{ keydb_port }}"
+      KEYDB_TLS_CERT: "{{ pki_dir }}/keydb-client.crt"
+      KEYDB_TLS_KEY: "{{ pki_dir }}/keydb-client.key"
+      KEYDB_TLS_CA: "{{ pki_dir }}/ca.crt"
+      SCYLLA_HOSTS: >-
+        {% for h in groups['scylladb'] | default([]) | sort -%}
+        {{ h }}.{{ domain }}:{{ scylla_cql_port }}{% if not loop.last %},{% endif %}
+        {%- endfor %}
+      SCYLLA_KEYSPACE: set_usc
+      SCYLLA_USER: set_usc_admin
+      SCYLLA_PASSWORD: "{{ vault_prj_email_proxy_scylla_password }}"
+      SCYLLA_TLS_ENABLED: "true"
+      SCYLLA_CA_CERT_PATH: "{{ pki_dir }}/ca.crt"
+      SCYLLA_TLS_INSECURE_SKIP_VERIFY: "false"
+      ATTACHMENT_VOLUME_PATH: /data/attachments
+      # app 層契約：對外一律經 egress proxy（與主機層開關 use_egress_proxy 無關，
+      # lab 也要驗「app → egress → 外部」這段鏈路）
+      HTTP_PROXY: "{{ egress_proxy_url }}"
+      HTTPS_PROXY: "{{ egress_proxy_url }}"
+      NO_PROXY: "{{ no_proxy_list }}"
+      MICROSOFT_CLIENT_SECRET: "{{ vault_prj_email_proxy_microsoft_client_secret }}"
+      SENDGRID_API_KEY: "{{ vault_prj_email_proxy_sendgrid_api_key }}"
+      JWT_SECRET: "{{ vault_prj_email_proxy_jwt_secret }}"
+      APP_ENCRYPTION_KEY: "{{ vault_prj_email_proxy_encryption_key }}"
+    health: { port: "{{ app_http_port }}", path: /health }
+    wait_ports: ["{{ app_http_port }}", "{{ app_smtp_port }}"]
+
+  # ---------- 監控（消費者：roles/monitoring 的 prometheus.yml.j2） ----------
+  monitoring:
+    blackbox_probes:
+      - { module: http_2xx_internal_ca, target: "https://svc-api.{{ domain }}/health" }

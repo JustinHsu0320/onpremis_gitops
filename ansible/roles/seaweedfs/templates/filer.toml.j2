@@ -1,0 +1,36 @@
+# ===== {{ ansible_managed }} =====
+# =============================================================================
+# filer.toml — SeaweedFS filer 元資料庫（PostgreSQL store）
+#
+# 【兩個架構約束（junior 必讀）】
+# 1. filer 走 PgBouncer VIP（transaction pooling）：postgres store 使用
+#    prepared statements，依賴 PgBouncer 的 max_prepared_statements 支援
+#    （pgbouncer role 已設定；PgBouncer >= 1.21 的協定級支援）。
+# 2. 元資料在 PG 內 → pgBackRest 的 S3 repo 永遠只能當「次要」備份庫
+#    （CONVENTIONS §10.6）：還原 PG 的主路徑必須是 NFS repo1。
+#
+# sslmode=require：PgBouncer 的 client TLS 是 require（契約 §3）。
+# ★ verify-full 需要 store 支援 sslrootcert 選項——部署前以鎖定版本查證後升級。
+# =============================================================================
+
+[postgres2]
+enabled = true
+createTable = """
+  CREATE TABLE IF NOT EXISTS "%s" (
+    dirhash   BIGINT,
+    name      VARCHAR(65535),
+    directory VARCHAR(65535),
+    meta      bytea,
+    PRIMARY KEY (dirhash, name)
+  );
+"""
+hostname = "pgbouncer-vip.{{ domain }}"
+port = {{ pgbouncer_port }}
+username = "{{ seaweedfs_pg_user }}"
+password = "{{ seaweedfs_pg_password }}"
+database = "{{ seaweedfs_pg_database }}"
+schema = ""
+sslmode = "require"
+connection_max_idle = {{ seaweedfs_pg_max_idle }}
+connection_max_open = {{ seaweedfs_pg_max_open }}
+connection_max_lifetime_seconds = 600

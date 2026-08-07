@@ -1,28 +1,35 @@
 ---
 # =============================================================================
-# group_vars/egress.yml — Squid 顯式白名單正向代理（規劃書 §4）
+# group_vars/egress.yml — Squid 顯式白名單正向代理
 #
 # 設計思想：地端環境的「唯一合法出網通道」。不在白名單上的網域一律 deny，
 # 讓「這台機器到底會連外去哪」變成一份可 review、可稽核的清單。
+#
+# 多專案化後拆兩層：平台基線（apt/docker/GitHub release/GitLab）+
+# 各專案 append（projects.<name>.egress_allowlist，CONVENTIONS §10）——
+# 專案下線 = 移除宣告，它的對外通道自動關閉。
 # =============================================================================
 
-# 顯式網域白名單（dstdomain ACL）：只放行 email_proxy 真正需要的對外目的地。
+# 平台基線：系統維運（套件、容器映像、GitHub release 資產）
 # 開頭帶「.」表示涵蓋所有子網域；不帶則為精確比對。
-egress_allowlist:
-  # -- Microsoft Graph 寄信 + OAuth token --
-  - .login.microsoftonline.com
-  - .graph.microsoft.com
-  # -- SendGrid 備援寄信通道 --
-  - .sendgrid.net
-  - api.sendgrid.com
-  # -- 系統維運：套件與容器映像 --
+egress_allowlist_base:
+  # -- 套件與容器映像 --
   - .docker.io
   - .docker.com
   - .ubuntu.com
-  # RabbitMQ delayed-message plugin 下載鏈是「兩段式」：
-  # github.com（302 轉址）→ release-assets.githubusercontent.com（實際資產）
-  # —— 兩個網域缺一不可（實測過，只放 githubusercontent 會在第一段就被擋）
+  # GitHub release 資產下載鏈是「兩段式」：github.com（302 轉址）→
+  # release-assets.githubusercontent.com（實際資產）——兩個網域缺一不可
+  # （實測過，只放 githubusercontent 會在第一段就被擋）。
+  # 使用者：rabbitmq delayed plugin、ParadeDB pg_search .deb
   - github.com
   - .githubusercontent.com
   - packages.gitlab.com           # GitLab omnibus / runner 套件
   - registry.gitlab.com
+
+# 完整白名單 = 基線 + 各專案宣告（email_proxy 的 Microsoft Graph / SendGrid
+# 見 project_email_proxy.yml 的 egress_allowlist 段）
+egress_allowlist: >-
+  {{ egress_allowlist_base
+     + (projects | dict2items | sort(attribute='key')
+        | selectattr('value.egress_allowlist', 'defined')
+        | map(attribute='value.egress_allowlist') | flatten | list) }}

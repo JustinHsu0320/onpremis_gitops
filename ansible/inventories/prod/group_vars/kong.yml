@@ -1,0 +1,38 @@
+---
+# =============================================================================
+# group_vars/kong.yml — API Gateway 層（Kong DB-less + Keepalived）
+# =============================================================================
+
+# ---------- PKI ----------
+# server profile：8443 只當 server 被連（北向 8000 是明文、邊界已終止 TLS）。
+# CN/SAN 以 VIP 名為主：東西向 client 連的是 kong-vip 不是節點本名
+# （同 svc-api 的邏輯）。不用 bundle_pem：Kong 吃分離的 cert/key
+# （KONG_SSL_CERT / KONG_SSL_CERT_KEY），全站信任庫已含 Issuing chain，
+# 葉憑證單獨出示即可通過驗證（scylla/pg 同款先例）。
+pki_certificates:
+  - name: kong-server
+    profile: server
+    owner: root
+    group: root
+    key_mode: "0640"
+    cn: "kong-vip.{{ domain }}"
+    extra_sans:
+      - "DNS:kong-vip.{{ domain }}"
+      - "DNS:kong-vip"
+      - "IP:{{ kong_vip }}"
+      - "IP:127.0.0.1"
+
+# ---------- Keepalived ----------
+# vrid 表（CONVENTIONS §7）：VI_SVC=10 / VI_EGRESS=12 / VI_KONG=20 / VI_PG=30 /
+# VI_MQ=31 / VI_S3=40。track_kong：以 status 口健檢（curl 127.0.0.1:8100/status）
+# 而非 pgrep——Kong 的行程名是 nginx，pgrep 太泛；status 探測同時回答
+# 「入口行程收不收得了流量」。
+keepalived_instances:
+  - name: VI_KONG
+    vrid: 20
+    vip: "{{ kong_vip }}"
+    state: "{{ keepalived_state }}"          # host_vars：kong-01=MASTER / kong-02=BACKUP
+    priority: "{{ keepalived_priority }}"    # host_vars：150 / 100
+    auth_pass: "{{ vrrp_pass_kong }}"
+    peers_group: kong                        # 單播 VRRP 的對象群組（ADR-7）
+    track_kong: true

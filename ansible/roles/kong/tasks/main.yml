@@ -1,0 +1,170 @@
+---
+# =============================================================================
+# roles/kong/tasks/main.yml — Kong API Gateway（DB-less、Docker、host network）
+#
+# 拓撲（junior 必讀）：
+#   北向：用戶端 → svc VIP:443（邊界 HAProxy TLS 終止）→ be_kong →
+#         kong-0x:{{ kong_proxy_port }}（明文，同 lb→app 模式）→ 各專案後端
+#   東西向：內部服務 → https://kong-vip.{{ domain }}:{{ kong_proxy_tls_port }}
+#         （TLS 由 Kong 以 kong-server 憑證自持；VIP 由 keepalived VI_KONG 漂移）
+#
+# 前置依賴（由 site.yml 順序保證）：08-docker、10-pki（kong-server 憑證）。
+# 刻意「不」依賴任何資料層——DB-less 的價值之一就是邊界路由不反向依賴資料庫。
+# =============================================================================
+
+# ---------- 0. VIP 預綁能力（Kong 直接綁 VIP，這是硬前提） ----------
+# 為什麼 Kong 需要這個而別的組件不用：pg/mq/seaweedfs 的 VIP 是「HAProxy 代綁」，
+# 服務本體只綁節點 IP，所以 sysctl 由 haproxy role 順帶設定；Kong 是唯一
+# 「自己在 KONG_PROXY_LISTEN 直接綁 {{ kong_vip }}:8443」的組件（東西向 TLS
+# 由 Kong 自持憑證，中間不插 LB），而 35-kong.yml 不跑 haproxy role。
+# 沒有這個參數：kernel 拒絕 bind 非本機持有的位址（EADDRNOTAVAIL），nginx
+# master 直接啟動失敗——連 8000/8100 都不會起來：
+#   - kong-01（MASTER）：role 順序是 kong 先於 keepalived，容器啟動當下 VIP
+#     還沒掛上網卡 → 首次部署就卡在 wait_for
+#   - kong-02（BACKUP）：常態不持有 VIP → 容器永久 crash-loop，VIP 漂過來
+#     也沒有服務可接手（HA 形同虛設）
+# net.* 是 network-namespace 級參數，lab 容器內可設定，不需 is_container guard
+# （對比 vm.*/kernel.* 那類要跳過的 kernel 級參數）。獨立 sysctl_file 讓
+# 「這個參數為誰而設」在稽核時一目了然（同 haproxy 的 99-haproxy.conf）。
+- name: 允許綁定非本機持有的 IP（Kong 預綁 VIP 的關鍵）
+  ansible.posix.sysctl:
+    name: net.ipv4.ip_nonlocal_bind
+    value: "1"
+    sysctl_file: /etc/sysctl.d/99-kong.conf
+    sysctl_set: true
+    reload: true
+    state: present
+
+# ---------- 1. 目錄結構 ----------
+# config/tls 擁有者 = 容器內 kong 使用者（唯讀掛載也要能 read）；
+# home 本身無機密，root:0755
+- name: 建立 Kong 目錄結構
+  ansible.builtin.file:
+    path: "{{ kong_item.path }}"
+    state: directory
+    owner: "{{ kong_item.owner }}"
+    group: "{{ kong_item.group }}"
+    mode: "{{ kong_item.mode }}"
+  loop:
+    - { path: "{{ kong_home }}", owner: root, group: root, mode: "0755" }
+    - { path: "{{ kong_home }}/config", owner: "{{ kong_container_uid }}", group: "{{ kong_container_gid }}", mode: "0750" }
+    - { path: "{{ kong_home }}/tls", owner: "{{ kong_container_uid }}", group: "{{ kong_container_gid }}", mode: "0750" }
+  loop_control:
+    loop_var: kong_item
+    label: "{{ kong_item.path }}"
+
+# ---------- 2. TLS 憑證 ----------
+# 為什麼 copy 一份而不直接掛 {{ pki_dir }}：pki_leaf 落地 root:root（契約 §5），
+# 容器內 kong 使用者讀不到私鑰；改 pki_dir 擁有者會影響同機其他讀憑證的程式。
+# 複製到 /opt/kong/tls 並 chown 容器 UID——容器專用、互不干擾（keydb/scylla 同款）。
+- name: 複製 TLS 憑證與私鑰到容器掛載目錄
+  ansible.builtin.copy:
+    src: "{{ pki_dir }}/{{ kong_item.name }}"
+    dest: "{{ kong_home }}/tls/{{ kong_item.name }}"
+    remote_src: true
+    owner: "{{ kong_container_uid }}"
+    group: "{{ kong_container_gid }}"
+    mode: "{{ kong_item.mode }}"
+  loop:
+    - { name: ca.crt, mode: "0644" }
+    - { name: kong-server.crt, mode: "0644" }
+    - { name: kong-server.key, mode: "0600" }
+  loop_control:
+    loop_var: kong_item
+    label: "{{ kong_item.name }}"
+  no_log: true
+  notify: reload kong
+
+# PKI 契約（CONVENTIONS.md §5）：10-pki 重簽時 pki_leaf 設 host fact
+# pki_certs_changed=true；上面的 copy 通常已比對出 changed，這是契約要求的
+# 保險絲。/bin/true 只是掛 notify 的載體，本身無副作用。
+- name: 偵測 PKI 憑證輪替並排程 reload
+  ansible.builtin.command: /bin/true
+  changed_when: true
+  when: pki_certs_changed | default(false)
+  notify: reload kong
+
+# ---------- 3. 宣告式組態（先 parse 再上線） ----------
+# kong.yml 可能含 consumer 憑證（key-auth key 等機密）→ 0600 + no_log。
+# 先渲染到暫存路徑，用官方映像的 `kong config parse` 驗證，通過才覆蓋正式檔
+# ——這是 DB-less 的 haproxy -c 等價物：壞設定永遠到不了正式路徑，
+# 容器重啟也不會吃到壞檔。
+- name: 渲染宣告式組態（暫存路徑）
+  ansible.builtin.template:
+    src: kong.yml.j2
+    dest: "{{ kong_home }}/config/kong.yml.staged"
+    owner: "{{ kong_container_uid }}"
+    group: "{{ kong_container_gid }}"
+    mode: "0600"
+  no_log: true
+  register: kong_config_staged
+
+# noqa 理由：這不是「該搬去 handler 的變更反應」，而是部署路徑上的「驗證閘門」
+# ——必須在下一個 copy task「之前」inline 執行（handler 跑在 play 尾端，太晚了）
+- name: 驗證宣告式組態語法（kong config parse） # noqa: no-handler
+  ansible.builtin.command: >-
+    docker run --rm
+    -v {{ kong_home }}/config/kong.yml.staged:/kong.yml:ro
+    {{ kong_image }} kong config parse /kong.yml
+  when: kong_config_staged is changed
+  changed_when: false
+
+- name: 套用宣告式組態（驗證通過才落正式路徑）
+  ansible.builtin.copy:
+    src: "{{ kong_home }}/config/kong.yml.staged"
+    dest: "{{ kong_home }}/config/kong.yml"
+    remote_src: true
+    owner: "{{ kong_container_uid }}"
+    group: "{{ kong_container_gid }}"
+    mode: "0600"
+  no_log: true
+  notify: reload kong
+
+# ---------- 4. docker compose 專案 ----------
+# KONG_* 環境變數是官方映像的正規組態方式（免 kong.conf 模板）。
+# compose/env 變更必須 recreate（reload 讀不到新 env）→ notify restart（非 reload）
+- name: 佈署 docker-compose.yml
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ kong_home }}/docker-compose.yml"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart kong
+
+# ---------- 5. 啟動 ----------
+# 先 flush：首次部署時 conf/certs 全 changed，讓 handler 以最終設定直接起容器
+# （語意同 scylla role 的順序註解——少一次 boot-kill-boot）
+- name: 立即套用尚未生效的容器變更
+  ansible.builtin.meta: flush_handlers
+
+# state=present ≒ docker compose up -d：容器不存在就建、存在就確保運行
+- name: 啟動 Kong 容器
+  community.docker.docker_compose_v2:
+    project_src: "{{ kong_home }}"
+    state: present
+
+# ---------- 6. 部署自驗 ----------
+# 埠即契約：proxy 與 status 口要在本機聽起來（邊界健檢與 Prometheus 都指著它們）
+- name: 等待 Kong 監聽 proxy / status 埠
+  ansible.builtin.wait_for:
+    host: 127.0.0.1
+    port: "{{ kong_item | int }}"
+    timeout: "{{ kong_wait_timeout }}"
+  loop:
+    - "{{ kong_proxy_port }}"
+    - "{{ kong_status_port }}"
+  loop_control:
+    loop_var: kong_item
+    label: "port {{ kong_item }}"
+
+# /status 回 200 = worker 已載入宣告式組態並可服務；
+# 同時斷言 DB-less 語意（database.reachable 欄位不存在於 DB-less 回應）
+- name: 部署自驗：admin /status 回 200
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ kong_admin_port }}/status"
+    return_content: true
+  register: kong_status_probe
+  until: kong_status_probe.status == 200
+  retries: 6
+  delay: 5

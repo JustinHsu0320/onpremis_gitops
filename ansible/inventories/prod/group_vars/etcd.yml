@@ -6,7 +6,7 @@
 # 掛獨立 SSD VMDK（由 Terraform 配置）；lab 容器內就直接用 OS 碟。
 # =============================================================================
 
-etcd_cluster_token: email-proxy-etcd
+etcd_cluster_token: platform-etcd
 # etcd 心跳/選舉參數：SSD 環境用預設值即可；若 datastore 延遲偏高才需要調
 etcd_heartbeat_interval: 100          # ms
 etcd_election_timeout: 1000           # ms

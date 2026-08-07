@@ -2,33 +2,34 @@
 # =============================================================================
 # haproxy-edge.cfg — 邊界層 HAProxy（profile=edge，lb-01/02）
 #
-# 流量拓撲（junior 請先看懂這張圖再動設定）：
+# 多專案化後的流量拓撲（junior 請先看懂再動設定）：
 #
 #   用戶端
-#     │  https://svc-api.{{ domain }}  →  服務 VIP {{ service_vip }}:443
+#     │  https://svc-<project>.{{ domain }}  →  服務 VIP {{ service_vip }}:<port>
 #     ▼
-#   fe_https（TLS 在這裡「終止」，憑證 svc-api.pem）
-#     │  mode http：解開 TLS 之後才能做 L7 的事（真健檢、X-Forwarded-*、日後的路由規則）
+#   fe_<project>_<name>（mode http = TLS 在這裡「終止」，憑證 = 專案宣告的 cert；
+#     │                  mode tcp  = passthrough，TLS 由後端自持）
+#     │  （若啟用 Kong：宣告在 projects.*.kong 的 host 先被 ACL 分流進 be_kong）
 #     ▼
-#   be_app  →  app-01..03:{{ app_http_port }}（roundrobin + GET /health 真健檢）
+#   be_<project>_<name>  →  groups[backend_group] 節點:<backend_port>
 #
-#   用戶端
-#     │  smtps://svc-api.{{ domain }}  →  服務 VIP {{ service_vip }}:465
-#     ▼
-#   fe_smtps（TCP passthrough：HAProxy「不解」TLS，只轉位元組）
-#     │  mode tcp：TLS 由後端 smtp 服務自持憑證處理
-#     ▼
-#   be_smtps  →  app-01..03:{{ app_smtp_port }}
+# frontends/backends 全部由 projects 登記簿的 edge 宣告渲染（CONVENTIONS §10.3）
+# ——加專案 = 改宣告，本模板永不再寫死任何專案。兩台 lb 用同一份模板產生設定，
+# backend 由 inventory 動態展開：想讓兩台設定不同步，你得先改壞 inventory。
 #
-# 為什麼兩個口的 TLS 策略不同：
-#   443 終止於邊界 → 後端 app 收純 HTTP，集中管理憑證、可觀測 L7；
-#   465 不終止 → SMTP 的 TLS 語意（客戶端驗的是郵件服務身分）由 smtp 服務
-#   自己維護，邊界少一段「解開再加密」的攻擊面與延遲。
-#
-# 兩台 lb 用「同一份模板」產生設定，backend 由 inventory 的 groups['app']
-# 動態展開——這就是規劃書 §7.5 對 config drift 的結構性修正：
-# 想讓兩台設定不同步，你得先改壞 inventory 才辦得到。
+# 為什麼 http/tcp 兩種 TLS 策略並存：
+#   http（如 443 API）終止於邊界 → 後端收純 HTTP，集中管理憑證、可觀測 L7；
+#   tcp（如 465 SMTPS）不終止 → 協定的 TLS 語意由後端服務自持，
+#   邊界少一段「解開再加密」的攻擊面與延遲。
 # =============================================================================
+{# --- 專案 edge 宣告與 Kong 分流資料（模板頂部集中推導，好讀好查） --- #}
+{% set edge_projects = projects | dict2items | sort(attribute='key')
+                       | selectattr('value.edge', 'defined') | list %}
+{% set kong_hosts = projects | dict2items | selectattr('value.kong', 'defined')
+                    | map(attribute='value.kong.services') | flatten
+                    | map(attribute='routes') | flatten
+                    | map(attribute='hosts') | flatten | unique | list %}
+{% set kong_enabled = (groups['kong'] | default([]) | length > 0) and (kong_hosts | length > 0) %}
 
 global
     # 全域同時連線上限：超過就讓新連線排隊，而不是耗盡記憶體把自己撐掛
@@ -36,12 +37,11 @@ global
     # 日誌走 stdout：haproxy.service 以 -Ws 前景執行，stdout 由 systemd-journald
     # 收容（journalctl -u haproxy），不需要另架 syslog
     log stdout local0 info
-    # 降權執行：只有綁 443/465 特權埠的瞬間需要 root，之後全程低權限身分
+    # 降權執行：只有綁特權埠的瞬間需要 root，之後全程低權限身分
     user haproxy
     group haproxy
     # 加固：行程視角的檔案系統只剩這個空目錄，就算被打穿也讀不到系統檔
     chroot /var/lib/haproxy
-    # Runtime API（維運用：echo "show stat" | socat 等）；
     # expose-fd listeners = 無縫 reload 的關鍵——舊行程把「監聽 socket 的 fd」
     # 經此 socket 交棒給新行程，reload 期間 0 個 SYN 掉包
     stats socket /run/haproxy/admin.sock mode 660 level admin expose-fd listeners
@@ -61,64 +61,85 @@ defaults
     timeout connect {{ haproxy_edge_timeout_connect }}
     timeout client {{ haproxy_edge_timeout_client }}
     timeout server {{ haproxy_edge_timeout_server }}
+{% for prj in edge_projects %}
+{% for fe in prj.value.edge.frontends %}
 
 # -----------------------------------------------------------------------------
-# 443：HTTPS 入口（TLS 終止）
+# 專案 {{ prj.key }} / {{ fe.name }}：*:{{ fe.port }}（{{ 'TLS 終止' if fe.mode == 'http' else 'TCP passthrough' }}）
 # -----------------------------------------------------------------------------
-frontend fe_https
-    # 綁 *（萬用位址）而非 VIP：MASTER/BACKUP 兩台都常態監聽 443，
-    # 「誰收到流量」由 keepalived 決定 VIP 在誰身上——HAProxy 不感知 VRRP 狀態。
-    # svc-api.pem 是 pki_leaf 以 bundle_pem 產出的 crt+chain+key 串接檔
-    # （HAProxy 的 crt 參數吃這種格式）；alpn 宣告支援 HTTP/2 與 HTTP/1.1，
-    # 由客戶端在 TLS 握手時協商
-    bind *:443 ssl crt {{ pki_dir }}/svc-api.pem alpn h2,http/1.1
+{% if fe.mode == 'http' %}
+frontend fe_{{ prj.key }}_{{ fe.name }}
+    # 綁 *（萬用位址）而非 VIP：MASTER/BACKUP 兩台都常態監聽，
+    # 「誰收到流量」由 keepalived 決定 VIP 在誰身上——HAProxy 不感知 VRRP。
+    # <cert>.pem 是 pki_leaf 以 bundle_pem 產出的 crt+chain+key 串接檔
+    bind *:{{ fe.port }} ssl crt {{ pki_dir }}/{{ fe.cert }}.pem alpn h2,http/1.1
     mode http
-    # TLS 終止後，後端看到的來源 IP 是 lb 自己——把真實客戶端 IP 塞進
+    # TLS 終止後，後端看到的來源 IP 是 lb 自己——真實客戶端 IP 塞進
     # X-Forwarded-For，app 的存取日誌 / 限流 / 稽核靠這個 header
     option forwardfor
-    # 告知後端原始協定是 https：app 產生絕對 URL、設定 secure cookie、
-    # 判斷是否強制導 https 時都依賴它
     http-request set-header X-Forwarded-Proto https
-    default_backend be_app
+{% if kong_enabled %}
+    # Kong 分流：projects.*.kong 宣告的公開名先進 API gateway（L7 路由/插件），
+    # 其餘照舊直達本專案後端。沒選 Kong 組件（群組空）時本段不渲染
+    acl is_kong_api hdr(host) -i {{ kong_hosts | join(' ') }}
+    use_backend be_kong if is_kong_api
+{% endif %}
+    default_backend be_{{ prj.key }}_{{ fe.name }}
 
-backend be_app
+backend be_{{ prj.key }}_{{ fe.name }}
     balance roundrobin
-    # 真 L7 健檢（規劃書 §10 修正）：舊架構只驗「TCP 埠有開」，但 app 行程
-    # 活著 ≠ 服務可用（DB 斷線、佇列滿載時埠照樣開）。GET /health 是 app
-    # 自己實作的深度健檢端點，回 200 才代表「真的能服務」
-    option httpchk GET /health
+    # 真 L7 健檢：app 行程活著 ≠ 服務可用（DB 斷線、佇列滿載時埠照樣開）。
+    # healthcheck 是專案宣告的深度健檢端點，回 200 才代表「真的能服務」
+    option httpchk {{ fe.healthcheck | default('GET /') }}
     http-check expect status 200
-    # inter=健檢間隔 / fall=連錯幾次判死 / rise=連對幾次復活：
-    # 5s×3=最慢 15s 內踢掉壞節點，2 次成功才放回來（防抖動震盪）
+    # inter=健檢間隔 / fall=連錯幾次判死 / rise=連對幾次復活
     default-server inter {{ haproxy_edge_check_inter }} fall {{ haproxy_edge_check_fall }} rise {{ haproxy_edge_check_rise }}
-{% for h in groups['app'] %}
-    server {{ h }} {{ hostvars[h].ansible_host }}:{{ app_http_port }} check
+{% for backend_host in groups[fe.backend_group] | default([]) | sort %}
+    server {{ backend_host }} {{ hostvars[backend_host].ansible_host }}:{{ fe.backend_port }} check
 {% endfor %}
-
-# -----------------------------------------------------------------------------
-# 465：SMTPS 入口（TCP passthrough，TLS 由後端 smtp 服務自持）
-# -----------------------------------------------------------------------------
-frontend fe_smtps
-    bind *:465
+{% else %}
+frontend fe_{{ prj.key }}_{{ fe.name }}
+    bind *:{{ fe.port }}
     mode tcp
     option tcplog
-    # SMTP 是長交談協定：客戶端傳大附件時，單一 DATA 階段可能持續數分鐘
-    # 無「來回」互動，預設 60s 逾時會誤斬，放寬到 30 分鐘
-    timeout client {{ haproxy_edge_smtp_timeout }}
-    default_backend be_smtps
+{% if fe.timeout is defined %}
+    # 長交談協定（如 SMTP DATA 傳大附件）：專案宣告的逾時覆寫 defaults
+    timeout client {{ fe.timeout }}
+{% endif %}
+    default_backend be_{{ prj.key }}_{{ fe.name }}
 
-backend be_smtps
+backend be_{{ prj.key }}_{{ fe.name }}
     mode tcp
     balance roundrobin
-    # tcp-check：純 TCP 握手健檢。這裡「只能」做 L4——TLS 是後端自持的，
-    # HAProxy 看不進加密內容；smtp 服務的深度健康由監控層（blackbox/app
-    # 自身指標）補位
+    # tcp-check：純 TCP 握手健檢——TLS 是後端自持的，HAProxy 看不進加密內容；
+    # 深度健康由監控層（blackbox / 服務自身指標）補位
     option tcp-check
-    timeout server {{ haproxy_edge_smtp_timeout }}
+{% if fe.timeout is defined %}
+    timeout server {{ fe.timeout }}
+{% endif %}
     default-server inter {{ haproxy_edge_check_inter }} fall {{ haproxy_edge_check_fall }} rise {{ haproxy_edge_check_rise }}
-{% for h in groups['app'] %}
-    server {{ h }} {{ hostvars[h].ansible_host }}:{{ app_smtp_port }} check
+{% for backend_host in groups[fe.backend_group] | default([]) | sort %}
+    server {{ backend_host }} {{ hostvars[backend_host].ansible_host }}:{{ fe.backend_port }} check
 {% endfor %}
+{% endif %}
+{% endfor %}
+{% endfor %}
+{% if kong_enabled %}
+
+# -----------------------------------------------------------------------------
+# be_kong：API gateway 後端（北向不經 kong VIP——經 VIP 會漏斗到單台、
+# 喪失負載分散；直接 roundrobin 兩台 Kong 的明文 proxy 口，
+# 健檢打 status 口的 /status）
+# -----------------------------------------------------------------------------
+backend be_kong
+    balance roundrobin
+    option httpchk GET /status
+    http-check expect status 200
+    default-server inter {{ haproxy_edge_check_inter }} fall {{ haproxy_edge_check_fall }} rise {{ haproxy_edge_check_rise }}
+{% for backend_host in groups['kong'] | default([]) | sort %}
+    server {{ backend_host }} {{ hostvars[backend_host].ansible_host }}:{{ kong_proxy_port }} check port {{ kong_status_port }}
+{% endfor %}
+{% endif %}
 
 # -----------------------------------------------------------------------------
 # stats / metrics（CONVENTIONS.md §3：節點 IP:{{ haproxy_stats_port }}）

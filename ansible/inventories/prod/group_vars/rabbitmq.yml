@@ -3,8 +3,15 @@
 # group_vars/rabbitmq.yml — 訊息佇列層（RabbitMQ 4.x quorum queue）
 # =============================================================================
 
-rabbitmq_vhost: email_proxy
-rabbitmq_app_user: email_proxy
+# ---------- 租戶清單（多專案平台的迭代點，CONVENTIONS §10） ----------
+# rabbitmq_tenants 從 projects 推導：每個宣告 rabbitmq 段的專案一個租戶
+#   { vhost, user, password, dlx_exchange, dlq_queue, queues: [{name, dlx}] }
+# 消費者：roles/rabbitmq/tasks/main.yml §10（vhost / user / DLX / queues /
+# binding 全部 per-tenant 迴圈）。含密碼引用 → 迭代方須 label + no_log。
+rabbitmq_tenants: >-
+  {{ projects | dict2items | sort(attribute='key')
+     | selectattr('value.rabbitmq', 'defined')
+     | map(attribute='value.rabbitmq') | list }}
 
 # ---------- 資料碟（block_storage role；lab 因 is_container 跳過） ----------
 # 對應 terraform 的 mq disk1-mqdata（100G）。RabbitMQ 的 mnesia / quorum queue
@@ -12,18 +19,7 @@ rabbitmq_app_user: email_proxy
 storage_volumes:
   - { mountpoint: /var/lib/rabbitmq, size_gb: 100, owner: rabbitmq, group: rabbitmq, mode: "0750" }
 
-# 佇列拓撲（對齊現有系統：主佇列 / 重試 / 死信）
-# quorum queue 靠 Raft 多數複寫，天生跨節點 HA —— 這是 RabbitMQ 4.x 的預設最佳實踐，
-# 取代已淘汰的 classic mirrored queue
-rabbitmq_queues:
-  - name: email_proxy_queue
-    dlx: email_proxy_dlx            # 失敗訊息經 DLX 轉到 dlq
-  - name: email_proxy_retry
-    dlx: email_proxy_dlx
-  - name: email_proxy_dlq
-    dlx: ""
-
-# 延遲訊息 plugin（現有系統的重試機制依賴它；下載走 egress proxy 白名單
+# 延遲訊息 plugin（email_proxy 的重試機制依賴它；下載走 egress proxy 白名單
 # 的 .githubusercontent.com，或先下載後放內部制品庫）
 rabbitmq_delayed_plugin_enabled: true
 
@@ -41,7 +37,7 @@ pki_certificates:
       - "IP:{{ rabbitmq_vip }}"
 
 # ---------- HAProxy（AMQPS VIP）+ Keepalived ----------
-# 修正規劃書 §10.4：app 一律經 VIP 5671，不再直連個別節點的 25671
+# app 一律經 VIP 5671，不直連個別節點
 haproxy_profile: rabbitmq
 
 keepalived_instances:
