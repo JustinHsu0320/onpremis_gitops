@@ -1,0 +1,29 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: go-api
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+spec:
+  project: container-lab
+  source:
+    repoURL: git://container-lab-git.git.svc.cluster.local:9418/repo.git
+    targetRevision: main
+    path: container-lab/k8s/go-api
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: go-api
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ApplyOutOfSyncOnly=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 1m

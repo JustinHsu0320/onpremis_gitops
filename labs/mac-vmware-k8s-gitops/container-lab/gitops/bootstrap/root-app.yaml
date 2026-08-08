@@ -1,0 +1,30 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: container-lab-root
+  namespace: argocd
+spec:
+  # The AppProject is created by the first child sync; the root must use the
+  # built-in project to avoid a chicken-and-egg InvalidSpecError.
+  project: default
+  source:
+    repoURL: git://container-lab-git.git.svc.cluster.local:9418/repo.git
+    targetRevision: main
+    path: container-lab/gitops/apps
+    directory:
+      recurse: false
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - ApplyOutOfSyncOnly=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 1m

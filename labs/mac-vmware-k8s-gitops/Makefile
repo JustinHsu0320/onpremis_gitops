@@ -10,7 +10,7 @@ METALLB_CHART_VERSION ?= 0.16.1
 ARGOCD_CHART_VERSION ?= 9.5.17
 GATEWAY_API_VERSION ?= v1.4.0
 
-.PHONY: help doctor tf-init tf-plan tf-apply ansible-check ansible-apply kube-status platform-bootstrap gitops-bootstrap verify destroy
+.PHONY: help doctor tf-init tf-plan tf-apply ansible-check ansible-apply kube-status platform-bootstrap gitops-bootstrap verify destroy container-up container-platform container-gitops container-verify container-down
 
 help:
 	@awk 'BEGIN {FS = ":.*## "; printf "\nMac → VMware → K8s GitOps Lab\n\n"} /^[a-zA-Z0-9_-]+:.*## / {printf "  %-20s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -63,3 +63,17 @@ verify: ## 驗收 Node、CNI、Argo CD、Go API 與 PostgreSQL
 destroy: ## 只顯示 Terraform destroy plan；實際刪除需手動確認
 	terraform -chdir=$(TF_DIR) plan -destroy
 
+container-up: ## 用 kind 建立 Docker 三節點測試環境
+	$(MAKE) -C $(LAB_DIR)/container-lab up
+
+container-platform: ## 在 kind 安裝 Cilium、MetalLB 與 Argo CD
+	$(MAKE) -C $(LAB_DIR)/container-lab platform
+
+container-gitops: ## 用 local registry 與 ephemeral Git daemon 啟動 App-of-Apps
+	$(MAKE) -C $(LAB_DIR)/container-lab gitops
+
+container-verify: ## 驗證 kind、Argo CD、Go API、CNPG 與 monitoring
+	$(MAKE) -C $(LAB_DIR)/container-lab verify
+
+container-down: ## 清理 kind、registry、Git daemon 與測試 artifacts
+	$(MAKE) -C $(LAB_DIR)/container-lab down

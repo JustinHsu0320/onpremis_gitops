@@ -1,0 +1,20 @@
+grafana:
+  adminPassword: container-lab
+  persistence:
+    enabled: false
+
+prometheus:
+  prometheusSpec:
+    replicas: 1
+    podAntiAffinity: soft
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    retention: 1d
+    resources:
+      requests:
+        cpu: 100m
+        memory: 384Mi
+
+alertmanager:
+  alertmanagerSpec:
+    replicas: 1

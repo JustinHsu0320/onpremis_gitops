@@ -1,0 +1,32 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../../k8s/data/postgres
+patches:
+  - target:
+      group: postgresql.cnpg.io
+      version: v1
+      kind: Cluster
+      name: app-postgres
+    patch: |-
+      - op: replace
+        path: /spec/instances
+        value: 1
+      - op: replace
+        path: /spec/storage/storageClass
+        value: standard
+      - op: replace
+        path: /spec/walStorage/storageClass
+        value: standard
+      - op: replace
+        path: /spec/affinity/enablePodAntiAffinity
+        value: false
+  - target:
+      group: postgresql.cnpg.io
+      version: v1
+      kind: Pooler
+      name: app-postgres-rw
+    patch: |-
+      - op: replace
+        path: /spec/instances
+        value: 1

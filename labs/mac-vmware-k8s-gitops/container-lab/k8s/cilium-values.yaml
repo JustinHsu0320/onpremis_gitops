@@ -1,0 +1,18 @@
+operator:
+  replicas: 1
+
+hubble:
+  relay:
+    enabled: true
+  ui:
+    enabled: false
+
+gatewayAPI:
+  enabled: true
+
+kubeProxyReplacement: true
+
+ipam:
+  mode: kubernetes
+
+rollOutCiliumPods: true
