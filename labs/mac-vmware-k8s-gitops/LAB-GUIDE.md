@@ -4,6 +4,94 @@
 > 裝起來」的清單，而是一條可以重建、可以審查、可以回復、最後由 Git 持續校正的
 > on-prem platform delivery chain。
 
+## 先建立正確的讀法：AI 是副駕，人是變更擁有者
+
+這份教學每一個 Day 都用同一個節奏：
+
+```text
+先選決策 → 請 AI 產生方案 → 人審查 diff / 風險 → 執行一個小步驟
+→ 用命令與觀測結果驗證 → 把決定記回 Git / 文件
+```
+
+AI 適合幫你整理官方文件、比較方案、產生 Terraform/Ansible/YAML 草稿、解讀
+log，以及設計驗證命令；AI 不應替你默默選資源、網段、資料保留期、刪除策略或
+production 權限。凡是會建立、刪除、暴露資料、改網路或消耗預算的動作，都要先
+由你選定選項，再讓 AI 產生可審查的變更。
+
+### 一個可重複使用的提示詞格式
+
+每次與 AI 協作，盡量把以下六項寫清楚：
+
+| 欄位 | 要寫什麼 | 例子 |
+|---|---|---|
+| 背景 | 目前在哪一層、已有什麼 | Mac、Apple Silicon、vCenter、Ubuntu 24.04 |
+| 目標 | 這一輪只完成什麼 | 只產生 Terraform plan，不 apply |
+| 約束 | 資源、版本、網路、合規限制 | 16 GB RAM、3 nodes、不能用 credit |
+| 證據 | 讓 AI 不要猜的檔案或輸出 | `terraform show`、`kubectl describe`、log |
+| 輸出格式 | 你要 diff、命令、表格或風險清單 | 先給方案比較，再給 patch |
+| 停止點 | 何時一定要回來問你 | 任何刪除、付費、對外暴露前停下 |
+
+可直接複製的基礎提示詞：
+
+```text
+你是 on-prem Kubernetes 平台工程師。背景：<Mac/VMware/Ubuntu/cluster 狀態>。
+這一輪目標只有：<單一目標>。
+約束：<CPU/RAM/IP/版本/安全/預算>。證據檔案或輸出：<貼上路徑與結果>。
+請先列出 2–3 個方案與 trade-off，再推薦一個；不要直接執行變更。
+輸出：1. 假設 2. 會修改的檔案 3. patch 或命令 4. 驗證命令 5. rollback。
+遇到資源、網路、資料刪除、權限或外部費用選擇時，先停下來讓我選。
+```
+
+### 人工核准界線
+
+| 等級 | AI 可先做 | 必須由人確認 |
+|---|---|---|
+| 綠 | 讀檔、lint、`plan`、`kustomize build`、唯讀查詢 | 只要結果與預期一致即可繼續 |
+| 黃 | 修改本地 manifest、建立暫存 kind 資源、重跑測試 | 先看 diff、資源用量與 rollback |
+| 紅 | `terraform apply/destroy`、VM/volume 刪除、對外 IP、secret、production kubeconfig | 必須明確選項並輸入核准，AI 不代選 |
+
+每個 checkpoint 都要留下簡短決策紀錄。可以放在 MR 描述、Issue 或本地
+`artifacts/decision-log.md`，格式如下：
+
+```yaml
+date: YYYY-MM-DD
+stage: terraform
+decision: core
+alternatives: [core, full]
+reason: "Mac 只有 16 GB RAM，先驗證 delivery chain"
+owner: human
+rollback: "不 apply，保留 plan artifact"
+```
+
+### 全局先選的七個決策
+
+先完成這張表，再開始 Day 0；不確定時先選低風險的 Core / 暫存方案。
+
+| 決策 | 選項 A | 選項 B | 選項 C | 預設建議 |
+|---|---|---|---|---|
+| VMware 路徑 | vSphere + Terraform | Fusion 手動 VM + Ansible | 只有 Docker/kind container-lab | 有 vCenter 選 A，先學流程選 C |
+| CPU 架構 | amd64 | arm64 | multi-arch image | Apple Silicon 選 arm64 + multi-arch |
+| 資源 | Core：16 GB Mac | Full：32 GB+ Mac | 遠端 ESXi 資源池 | 先 Core，再逐項升級 |
+| 網路 | 固定 LAN IP | DHCP reservation | kind 私有 Docker network | container-lab 選 C；VM 選 A/B |
+| 儲存 | local-path | Longhorn 3 replicas | vSphere CSI policy | 首輪 local-path；要 storage drill 才選 B |
+| Git / Registry | GitLab CE | GitHub/GitLab SaaS | 暫存 Git daemon + local registry | 正式交付選 A；container-lab 選 C |
+| 變更權限 | 全程人工核准 | protected branch/environment | 個人 Lab 自動 reconcile | production 選 B；學習環境可 C |
+
+把選項交給 AI 時，不要只問「哪個最好」，改問：「在我的約束下，哪個風險最低？」
+
+```text
+我選：VMware 路徑=<A/B/C>、架構=<amd64/arm64>、資源=<Core/Full>、
+網路=<固定/DHCP/kind>、儲存=<local-path/Longhorn/CSI>。
+請依這五個已決定的值產生本階段設定；不要替我改變選項。
+```
+
+### 建議閱讀路線
+
+- **第一次閱讀**：先看全局決策表、相容性邊界、目錄與 production gap，不急著下命令。
+- **實際建置**：依 Day 0 → Day 7 執行；每個 Checkpoint 先複製提示詞，再人工選值。
+- **驗收交付**：執行 Day 8 → Day 12，把輸出與決策紀錄留在 MR 或 `artifacts/`。
+- **遇到錯誤**：只看 Day 13 對應的 layer；先收集證據，再請 AI 提出最小修復。
+
 ---
 
 ## 先講結論：每一層只擁有一種狀態
@@ -77,6 +165,21 @@ MacBook
 HashiCorp 的官方 vSphere 教學本來就把「既有 vSphere environment」列為前置條件；
 provider 邊界可參考 [Manage VMs on vSphere](https://developer.hashicorp.com/terraform/tutorials/virtual-machine/vsphere-provider)。
 
+### Checkpoint 0：請 AI 幫你選路徑，但不要讓它假設有 vCenter
+
+先把這三個問題回答給 AI：
+
+```text
+我目前是 <有 vCenter / 只有 VMware Fusion / 只有 Docker Desktop>。
+Mac 是 <Intel / Apple Silicon>，可用 RAM <16/32/其他> GB。
+請把完整路徑、不可驗證的部分、最小可行下一步整理成表格；
+不要產生 Terraform apply 命令，先讓我確認路徑。
+```
+
+人工決定：若沒有 vCenter，不要把 VMware Fusion 當成 Terraform vSphere endpoint；
+可選 Fusion 手動 VM、或先使用本 repo 的 [`container-lab`](container-lab/README.md)
+驗證 Cilium → Argo CD → App → Monitoring，再回到真正的 VM 路徑。
+
 ---
 
 ## 1. 預算與拓撲：先選 profile
@@ -85,6 +188,23 @@ provider 邊界可參考 [Manage VMs on vSphere](https://developer.hashicorp.com
 |---|---:|---|---|
 | Core | 16 GB | CP 4 GB、Worker 各 6 GB | kubeadm、Cilium、MetalLB、Argo CD、Go API |
 | Full | 32 GB 以上 | 每台 4 vCPU / 8 GB，100–120 GB disk | Core + Longhorn + CNPG 3 instance + HA monitoring |
+
+### Checkpoint 1：資源先由人選，AI 只負責算容量與指出瓶頸
+
+| 你的情境 | 選項 | 人要確認的代價 |
+|---|---|---|
+| 只想跑通 delivery chain | Core | 不宣稱 storage / control-plane HA |
+| 要做故障演練 | Full | Mac RAM、磁碟與 CPU 會長時間被佔用 |
+| 有遠端 vSphere 資源池 | 遠端 profile | 需要確認 datastore、port group、quota |
+
+```text
+我可用 Mac RAM 是 <N> GB、Docker Desktop VM memory 是 <N> GB，
+想跑 <Core/Full>。請用表格計算 VM、Kubernetes system、monitoring、
+PostgreSQL 與 page cache 的預估用量，指出最可能 OOM 的元件。
+只給調整建議與驗證命令，不要自動改 Terraform。
+```
+
+如果預估總和超過可用記憶體的 75%，先選 Core；不要用「先啟動再看看」取代容量決策。
 
 Full profile 的 IP 規劃：
 
@@ -128,6 +248,19 @@ BuildKit。這是「執行容器」與「建置映像」兩種責任。Kubernete
 kubelet 的 cgroup driver 一致；Ubuntu/systemd 路線應使用 `systemd` driver，參考
 [Container runtimes](https://kubernetes.io/docs/setup/production-environment/container-runtimes/)。
 
+### Checkpoint 2：CLI 安裝後先請 AI 做唯讀盤點
+
+```text
+請幫我設計一個只讀的 control-station preflight。
+要檢查 terraform、ansible-playbook、kubectl、helm、git、docker、ssh、
+架構與版本；輸出每個工具的官方安裝來源、目前版本、相容性風險。
+不要用 sudo、不要修改檔案，缺少工具時只列出安裝命令。
+```
+
+人工決定：是否允許 Homebrew、是否固定版本、是否使用 Apple Silicon native binary，
+以及 CLI 是否只能在 Mac 執行。版本一旦寫進 Lab，後續就把版本與 lock file 一起 review，
+不要讓 AI 以「最新版本」取代已驗證版本。
+
 ---
 
 ## 3. 目錄就是交付流程
@@ -154,6 +287,18 @@ labs/mac-vmware-k8s-gitops/
 注入、網路用靜態 IP、template 只負責第一次交棒。這不是另外寫一套「教學玩具」，而是
 把現有 production module 收斂成三台節點。
 
+### Checkpoint 3：先讓 AI 畫出 ownership，再開始改檔
+
+```text
+請讀取 labs/mac-vmware-k8s-gitops 的目錄與 Makefile，
+畫出 Terraform → Ansible → kubeadm → Helm → Argo CD 的責任邊界。
+對每個要改的檔案列出 owner、輸入、輸出、rollback；
+若同一個設定有兩個 owner，先標記衝突，不要直接改檔。
+```
+
+人工決定：哪個設定是單一來源。例如 IP/CPU/RAM 由 Terraform，containerd 由 Ansible，
+Deployment replicas 由 GitOps。若 AI 提議在兩層同時寫同一個值，先拒絕該 patch。
+
 ---
 
 ## 4. Day 0：準備 Ubuntu template
@@ -171,6 +316,18 @@ Template 更新應有新名稱，例如 `ubuntu-24.04-202608`，不要在原 tem
 
 驗收：clone 一台暫存 VM，確認 `cloud-init status --wait`、`vmtoolsd -v` 與 SSH 後再轉成
 template。Template 沒驗證，Terraform 一次 clone 三台只會把同一個錯誤放大三倍。
+
+### Checkpoint 4：Template 是「輸入契約」，先請 AI 產生驗收表
+
+```text
+這是我的 Ubuntu template：<版本、架構、磁碟、網卡、cloud-init datasource>。
+請產生一份不修改系統的驗收 checklist，涵蓋 cloud-init、open-vm-tools、SSH key、
+DNS/NTP、磁碟可放大不可縮小、guestinfo 與重開機後狀態。
+每一項請附檢查命令、預期結果、失敗時應回到 template 修正的檔案。
+```
+
+人工決定：template 是否允許內建帳號、是否由 cloud-init 建 SSH 使用者、是否允許
+暫時停用 UFW。不要把 password 或私鑰交給 AI；只提供脫敏後的版本與錯誤輸出。
 
 ---
 
@@ -221,6 +378,20 @@ Lab 可先用 local state，但多人協作要搬到 GitLab-managed Terraform st
 backend。CI 只在 MR 做 `fmt/validate/plan`；`apply` 綁 protected branch、protected environment
 與人工核准。State、plan artifact 與 provider credential 都視為敏感資料。
 
+### Checkpoint 5：Terraform 先 plan，人工選 apply 邊界
+
+```text
+以下是 terraform plan（已遮掉 password、token、IP 敏感資訊）：
+<貼上 plan>
+請依 create/update/destroy 分組，指出會影響網路、磁碟、VM identity、SSH 的項目。
+先給風險與 rollback，不要執行 apply；只有沒有 destroy 且 inventory contract 正確時，
+才建議下一步。
+```
+
+人工要選：local state 或 remote locked state、是否允許 create 三台 VM、磁碟大小、
+固定 IP、datastore、port group、以及 `destroy` 是否完全禁止。`apply` 前至少核對
+node map、網段、SSH public key 與預估費用；AI 不替你輸入 vSphere password。
+
 ---
 
 ## 6. Day 2：Ansible 把「三台 Ubuntu」變成「三個 K8s node」
@@ -260,6 +431,19 @@ cgroupDriver: systemd
 這兩段必須成對。cgroup 不一致常見症狀不是「立刻報一個漂亮錯誤」，而是 kubelet 反覆
 重啟、Pod sandbox 建立失敗，或節點在壓力下變得不穩。
 
+### Checkpoint 6：Ansible 先 check，讓 AI 只處理一層錯誤
+
+```text
+這次 `ansible-playbook --syntax-check` 通過，但 `--check` 出現以下差異：
+<貼上 diff / task output>
+請把問題分成 baseline、containerd、kube package、kubeadm、inventory 五類，
+指出每類應檢查的檔案與唯讀命令。不要修改 playbook，也不要重跑 kubeadm。
+```
+
+人工要選：Kubernetes minor、Ubuntu repository、containerd 版本、是否停用 swap、
+是否允許 control-plane 排程 workload，以及 join token 的有效期限。Ansible apply 前
+先確認三台 VM hostname/IP 對應；任何 `no_log` 內容都不要貼給 AI。
+
 > 本 Lab 預設把 control-plane taint 移除，讓三副本真的能分散到三台 VM。這是 laptop
 > 資源折衷，不是 production HA control plane。正式叢集應是 3 control-plane + N workers，
 > API endpoint 再由 kube-vip 或外部 HAProxy/Keepalived 提供。
@@ -280,13 +464,28 @@ Bootstrap 順序：
 3. MetalLB：把家用/實驗室 LAN 的一段 IP 交給 `LoadBalancer` Service。
 4. Argo CD：安裝 reconciliation engine；server/repo-server 各 2 replicas。
 
-為何 Cilium 沒立刻取代 kube-proxy？第一輪 Lab 優先可回復性。Cilium 先只當 CNI 與
-Gateway controller，等你完成整條鏈並有 Hubble 觀測後，再依官方
-[kube-proxy replacement](https://docs.cilium.io/en/stable/network/kubernetes/kubeproxy-free/)
-實驗。一次改掉網路與 Service data path，出錯時很難分層。
+VMware profile 的預設值保留 kube-proxy，先降低第一次 bootstrap 的變數；本 repo 的
+`container-lab` 為了實測 Cilium Gateway API，另外開啟 kube-proxy replacement。兩者
+不要混用同一份 values。Cilium Gateway API 的 kube-proxy replacement、L7 proxy 與
+Gateway API 設定請依官方 [kube-proxy replacement](https://docs.cilium.io/en/stable/network/kubernetes/kubeproxy-free/)
+文件逐項驗證。
 
 MetalLB 的 `.240–.250` 必須先在路由器保留。若你的 LAN 不是 `192.168.68.0/24`，先改
-`k8s/platform/metallb-pool.yaml`；IP pool 選錯會造成 LAN 上的 ARP 衝突。
+`k8s/platform/metallb-pool.yaml`；IP pool 選錯會造成 LAN 上的 ARP 衝突。container-lab
+則使用 kind Docker network 的 `172.19.255.200–.207`，只可作為本機測試位址池。
+
+### Checkpoint 7：網路變更要先選可回復方案
+
+```text
+我的 profile 是 <VMware / container-lab>，目前 kube-proxy replacement=<true/false>，
+Gateway API 目標是 <只做 cluster 內路由 / 要拿 LoadBalancer IP / 要接實體 LAN>。
+請列出 Cilium、Gateway API、MetalLB 的依賴順序與每一步驗證命令；
+若 IP pool 可能與 DHCP 或 Docker network 衝突，先停下並列出需要我確認的值。
+```
+
+人工要選：CNI mode、是否啟用 kube-proxy replacement、MetalLB IP 範圍、Gateway 是否
+對外，以及是否接受一次暫時中斷。不要在沒有 backup kubeconfig 和 rollback plan 時同時
+改 CNI、kube-proxy 與 LoadBalancer。
 
 ---
 
@@ -312,6 +511,20 @@ Kubernetes 宣告不是只有 Deployment：
 | Gateway + HTTPRoute | Cilium north-south routing |
 | NetworkPolicy | default deny，只開 gateway、monitoring、DNS |
 | ServiceMonitor | 讓 Prometheus Operator 自動發現 `/metrics` |
+
+### Checkpoint 8：API 需求先由人選 SLO，再請 AI 寫 manifest
+
+```text
+這個 Go API 的流量模型是：<QPS、p95 latency、是否有長連線>；
+可接受中斷 <N> 秒，API 是否可水平擴展：<是/否>，依賴是 <列出>。
+請先把 replicas、requests/limits、startup/readiness/liveness、PDB、HPA、
+topology spread 與 NetworkPolicy 的建議做成決策表，再產生 Kustomize patch。
+不要自行增加資料庫或對外入口。
+```
+
+人工要選：replicas、CPU/RAM requests/limits、HPA 上限、PDB 可接受的維護容量、
+路由 hostname、是否允許 public LoadBalancer，以及 `/readyz` 是否要檢查資料庫。
+先選 SLO，才有理由決定 Kubernetes 數字。
 
 先把 `k8s/apps/go-api/overlays/lab/kustomization.yaml` 的 registry 改成你的 GitLab Registry，
 再讓 CI 推第一個 image。
@@ -345,6 +558,19 @@ commit
 - protected branch 只允許 bot token 對指定路徑 commit。
 - 下一階段加入 SBOM（Syft）、映像掃描（Trivy）與 Cosign keyless/key pair 簽章。
 
+### Checkpoint 9：CI 的輸出與部署權限分開
+
+```text
+請檢查這份 CI pipeline：<貼上 YAML 或路徑>。
+目標是 test → build → scan → push immutable image → 修改 GitOps image tag。
+請標出任何取得 kubeconfig、cluster-admin、可變 tag、未鎖版本或 race condition 的地方，
+並給出最小 patch 與每個 job 的驗證命令；不要直接 push 或觸發 production pipeline。
+```
+
+人工要選：registry、image retention、tag/digest promotion、是否允許 bot commit、
+protected branch/environment、scan fail 是否阻擋部署，以及 deploy approval 的人。CI
+只應產生 artifact 與 Git diff，不應持有 production cluster-admin。
+
 CI 若直接 `kubectl set image`，Git 還停在舊 tag；下次 Argo self-heal 會把「手動部署成功」
 改回舊版。這不是 Argo 壞掉，而是 GitOps 正在履行契約。
 
@@ -376,6 +602,19 @@ wave   1  CloudNativePG operator + Prometheus/Grafana/Alertmanager
 wave   2  PostgreSQL Cluster（1 primary + 2 replicas）
 wave   3  Go API（3 replicas）
 ```
+
+### Checkpoint 10：讓 AI 審查 App-of-Apps，不讓它替你放大權限
+
+```text
+請檢查這組 Argo CD Application / AppProject manifest：<路徑>。
+請回答：source repo 是否正確、sync wave 是否有依賴錯誤、prune/selfHeal 是否安全、
+destination 權限是否過寬、CRD 是否需要 server-side/skipCrds、刪除資料層會發生什麼。
+先輸出 rendered resource 清單與風險，不要執行 kubectl apply。
+```
+
+人工要選：root app 唯一手動入口、AppProject 可用 repo、namespace、cluster resource
+白名單、prune/selfHeal、sync window、CRD 策略與資料層刪除保護。Production 不要直接
+接受 `clusterResourceWhitelist: '*/*'`；container-lab 才可為了快速驗證暫時放寬。
 
 每個 Application 都開 `prune` 與 `selfHeal`：Git 刪掉物件，Argo 清掉它；有人手改，Argo
 改回來。危險之處也在這裡：合併前一定要看 rendered diff，資料層刪除要有 sync window、
@@ -416,6 +655,19 @@ KUBECONFIG=artifacts/kubeconfig kubectl -n go-api get servicemonitor go-api
 3. **Kubernetes**：Pod restart、unschedulable、node condition、PVC usage。
 4. **Data**：CNPG replication lag、primary switch、WAL growth、backup last success。
 
+### Checkpoint 11：監控問題先由人定義，再請 AI 寫 PromQL / Alert
+
+```text
+我要回答這四個問題：<API 是否變慢 / node 是否飽和 / PostgreSQL 是否落後 /
+告警是否真的送達>。目前 metrics 有：<貼上 ServiceMonitor、metric names、sample>。
+請為每個問題提出 signal、PromQL、threshold、for duration、runbook 與 false-positive
+風險；先不要改 Prometheus retention 或建立告警。
+```
+
+人工要選：retention、Prometheus replicas、告警門檻、通知目的地、維護時段、是否接受
+告警噪音，以及 backup/restore 的 RPO/RTO。Grafana dashboard 不是成功條件；每個 panel
+都要能對應到故障決策或 runbook。
+
 Prometheus 兩副本不是備份。正式長期 retention 應接 Thanos/Mimir；資料庫備份則接既有平台的
 SeaweedFS S3。`scheduled-backup.yaml` 刻意未加入 kustomization，因為沒先設定外部 object
 store 就產生一個「看起來有排程、其實不能還原」的假安全感。完成 Barman Cloud Plugin +
@@ -438,6 +690,19 @@ SeaweedFS bucket + restore drill 後再啟用。
 ## 12. 驗收與故障演練
 
 不要以「畫面看起來綠色」收工。照順序跑：
+
+### Checkpoint 12：故障演練先由人設定爆炸半徑
+
+```text
+這次只允許在 <container-lab / staging> 做故障演練，不能碰 production。
+目標是驗證 <Pod replacement / Argo self-heal / worker drain / CNPG switchover>。
+請列出前置 snapshot/backup、單一步驟命令、觀測點、成功條件、停止條件與 rollback。
+任何會刪 PVC、關 VM、改 primary 的命令都先停下讓我確認。
+```
+
+人工要選：演練環境、允許中斷時間、是否先做 VM snapshot、是否可刪 Pod/PVC、
+誰負責觀測、何時中止。演練後把實際結果與原本的成功條件寫回 runbook，不要只留下
+「執行成功」的截圖。
 
 ```bash
 make verify
@@ -481,9 +746,32 @@ Longhorn replica rebuild；執行 CNPG switchover；把 Git image tag rollback �
 除錯時一次只跨一層。Terraform 錯誤先不要改 Ansible；Node NotReady 先不要看 Argo；
 ImagePullBackOff 也不是 readiness probe 的問題。
 
+### Checkpoint 13：把 log 變成可驗證的假設
+
+```text
+症狀是：<一句話>。我目前的證據是：<命令輸出、event、log，已去除 secret>。
+請只提出三個最可能的 root cause，依 layer 排序；每個 root cause 給一個唯讀驗證命令、
+預期結果、下一步分支。不要先改設定，也不要把不同 layer 的修復混在同一個 patch。
+```
+
+人工要選：是否允許收集更多 log、log 是否含敏感資訊、是否可重啟 Pod/服務、以及
+哪一個假設先驗證。若證據不足，正確答案是「需要更多觀測」，不是猜一個 YAML 值。
+
 ---
 
 ## 14. Production gap：這份 Lab 刻意沒有假裝完成的部分
+
+### Checkpoint 14：讓 AI 做 gap analysis，不要讓它把 Lab 宣稱成 production
+
+```text
+請用以下 production 需求檢查本 Lab：RPO=<N>、RTO=<N>、可用性=<N>、
+合規/身份要求=<...>、failure domain=<...>。
+把差距分成「現在已驗證」「需要 staging drill」「需要外部平台」「明確不支援」四類，
+並為每項給 owner、依賴、成本級距與驗收證據；不要把建議直接當成已完成能力。
+```
+
+人工要選：哪些 gap 進下一個 sprint、哪些接受風險、哪些需要採購或外部協作、以及
+production readiness 的 sign-off 人。這張表是決策文件，不是讓 AI 自動勾綠的 checklist。
 
 - **Control-plane HA**：要 3 CP + load-balanced endpoint；本 Lab 只有 1 CP。
 - **vSphere CSI/CPI**：Lab 用 Longhorn；正式 vSphere 應評估官方 CPI/CSI 與 storage policy。
@@ -496,9 +784,40 @@ ImagePullBackOff 也不是 readiness probe 的問題。
 - **Network**：正式環境用 VLAN、防火牆矩陣、egress proxy、internal CA 與 DNS，不靠 `/etc/hosts`。
 - **Capacity**：requests/limits、storage IOPS、etcd latency、failure domain 都要量測，不用筆電數字外推。
 
+完成上述步驟後，可用一個 final review prompt 收斂學習成果：
+
+```text
+這是本次 Lab 的決策紀錄、測試結果與未完成清單：<貼上摘要>。
+請用「已驗證 / 未驗證 / 風險接受 / 下一步」四欄整理，
+並指出哪三個 evidence 最能證明 delivery chain 可重建。
+不要把沒有跑過的步驟標成完成，也不要建議未經我批准的 production 變更。
+```
+
 ---
 
 ## 15. 最短成功路徑
+
+### 沒有 vCenter 時：先跑 container-lab
+
+這條路徑用 Docker Desktop + kind 建立 1 control-plane + 2 worker containers，驗證
+Cilium、MetalLB、Argo CD、CloudNativePG、Prometheus/Grafana、GitOps 與 Go API；它
+不會假裝完成 VMware Terraform、Ubuntu SSH、真實 block device 或實體 LAN ARP。
+
+```bash
+make -C labs/mac-vmware-k8s-gitops/container-lab all
+# 分段除錯時：up → platform → gitops → verify
+make -C labs/mac-vmware-k8s-gitops/container-lab status
+```
+
+請先人工選 Docker Desktop VM memory、kind Docker network、MetalLB 測試 IP pool、
+是否保留 cluster 供故障演練。交給 AI 的提示詞可以是：
+
+```text
+我只要在本機 container-lab 驗證平台與 GitOps，不驗證 VMware/vCenter。
+Docker Desktop 可用 memory=<N> GB，架構=<arm64/amd64>，不能使用外部 credit。
+請先檢查 kind-config、Cilium values、MetalLB pool 與 Argo source path 的一致性，
+再給我分段命令與成功條件；不要刪 cluster，不要改成 LAN IP。
+```
 
 ```bash
 # 1. 改 terraform.tfvars、設定 password
@@ -547,4 +866,3 @@ declare → review → reconcile → observe → fail → recover → improve th
 - [CloudNativePG documentation](https://cloudnative-pg.io/documentation/current/)
 - [Longhorn documentation](https://longhorn.io/docs/)
 - [Prometheus Community：kube-prometheus-stack](https://github.com/prometheus-community/helm-charts/tree/main/charts/kube-prometheus-stack)
-
