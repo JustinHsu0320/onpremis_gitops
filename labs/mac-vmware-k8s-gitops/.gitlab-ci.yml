@@ -55,7 +55,7 @@ promote-gitops:
     - tar -xzf /tmp/kustomize.tgz -C /usr/local/bin
   script:
     - cd labs/mac-vmware-k8s-gitops/k8s/apps/go-api/overlays/lab
-    - kustomize edit set image "registry.lab.internal/platform/onprem-go-api=$GO_API_IMAGE:$CI_COMMIT_SHA"
+    - kustomize edit set image "ghcr.io/your-org/onprem-go-api=$GO_API_IMAGE:$CI_COMMIT_SHA"
     - git config user.name "gitops-bot"
     - git config user.email "gitops-bot@lab.internal"
     - git add kustomization.yaml
