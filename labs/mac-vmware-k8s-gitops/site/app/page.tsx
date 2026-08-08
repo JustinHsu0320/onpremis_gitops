@@ -142,24 +142,28 @@ const drills = [
   "關閉一台 VM，觀察 Longhorn replica rebuild",
 ];
 
+function initialDrillState(): boolean[] {
+  const fallback = Array(drills.length).fill(false) as boolean[];
+  if (typeof window === "undefined") return fallback;
+  try {
+    const saved = window.localStorage.getItem("onprem-lab-drills");
+    const parsed = saved ? JSON.parse(saved) : null;
+    return Array.isArray(parsed) && parsed.length === drills.length && parsed.every((item) => typeof item === "boolean") ? parsed : fallback;
+  } catch {
+    window.localStorage.removeItem("onprem-lab-drills");
+    return fallback;
+  }
+}
+
 export default function Home() {
   const [activeStage, setActiveStage] = useState("overview");
   const [flow, setFlow] = useState<Flow>("reconcile");
   const [codeKey, setCodeKey] = useState<CodeKey>("terraform");
   const [terminalLines, setTerminalLines] = useState<string[]>([]);
   const [running, setRunning] = useState(false);
-  const [checked, setChecked] = useState<boolean[]>(Array(drills.length).fill(false));
+  const [checked, setChecked] = useState<boolean[]>(initialDrillState);
 
   useEffect(() => {
-    const saved = window.localStorage.getItem("onprem-lab-drills");
-    if (saved) {
-      try {
-        setChecked(JSON.parse(saved));
-      } catch {
-        window.localStorage.removeItem("onprem-lab-drills");
-      }
-    }
-
     const observer = new IntersectionObserver(
       (entries) => {
         const visible = entries
@@ -206,7 +210,7 @@ export default function Home() {
     <main>
       <header className="topbar">
         <button className="brand" onClick={() => scrollTo("overview")} aria-label="回到頁首">
-          <span className="brand-mark">//</span>
+          <span className="brand-mark">{"//"}</span>
           <span>LOCAL / RECONCILED</span>
         </button>
         <div className="topbar-status"><span className="status-light" /> 3-NODE LAB · GUIDE v1.0</div>
@@ -479,4 +483,3 @@ function SectionHeading({ index, kicker, title, intro }: { index: string; kicker
     </div>
   );
 }
-
