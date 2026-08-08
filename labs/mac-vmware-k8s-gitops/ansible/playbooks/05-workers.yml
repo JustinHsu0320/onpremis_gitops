@@ -1,0 +1,8 @@
+---
+- name: Join the worker nodes
+  hosts: workers
+  become: true
+  serial: 1
+  roles:
+    - worker
+

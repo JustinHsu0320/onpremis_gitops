@@ -1,0 +1,16 @@
+# Cilium remains the CNI while kube-proxy handles Service translation in this lab.
+# That keeps the first bootstrap recoverable; kube-proxy replacement is a later exercise.
+operator:
+  replicas: 2
+
+hubble:
+  relay:
+    enabled: true
+  ui:
+    enabled: true
+
+gatewayAPI:
+  enabled: true
+
+rollOutCiliumPods: true
+

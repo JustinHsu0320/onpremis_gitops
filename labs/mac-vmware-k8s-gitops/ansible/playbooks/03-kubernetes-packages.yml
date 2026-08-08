@@ -1,0 +1,7 @@
+---
+- name: Install kubelet, kubeadm and kubectl from one minor repository
+  hosts: k8s_nodes
+  become: true
+  roles:
+    - kubernetes_packages
+

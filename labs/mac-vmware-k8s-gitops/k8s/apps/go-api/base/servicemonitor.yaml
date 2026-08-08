@@ -1,0 +1,16 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: go-api
+  namespace: go-api
+  labels:
+    app.kubernetes.io/name: go-api
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: go-api
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
+

@@ -1,0 +1,7 @@
+---
+- name: Join this node to the control plane once
+  ansible.builtin.command: "{{ hostvars[groups['control_plane'][0]].kubeadm_join_command }} --cri-socket unix:///run/containerd/containerd.sock"
+  args:
+    creates: /etc/kubernetes/kubelet.conf
+  no_log: true
+

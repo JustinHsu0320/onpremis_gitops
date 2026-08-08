@@ -1,0 +1,20 @@
+---
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: lab-lan
+  namespace: metallb-system
+spec:
+  # Reserve these addresses in the LAN router before applying this file.
+  addresses:
+    - 192.168.68.240-192.168.68.250
+---
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: lab-lan
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+    - lab-lan
+

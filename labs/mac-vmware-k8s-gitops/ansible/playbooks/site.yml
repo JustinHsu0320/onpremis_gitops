@@ -1,0 +1,8 @@
+---
+- import_playbook: 01-node-baseline.yml
+- import_playbook: 02-containerd.yml
+- import_playbook: 03-kubernetes-packages.yml
+- import_playbook: 04-control-plane.yml
+- import_playbook: 05-workers.yml
+- import_playbook: 06-kubeconfig.yml
+

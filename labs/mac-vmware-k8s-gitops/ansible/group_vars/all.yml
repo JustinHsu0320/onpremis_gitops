@@ -1,0 +1,9 @@
+---
+kubernetes_minor: v1.36
+kubernetes_service_subnet: 10.96.0.0/12
+kubernetes_pod_subnet: 10.244.0.0/16
+kubernetes_cluster_name: mac-vmware-lab
+containerd_pause_image: registry.k8s.io/pause:3.10.1
+lab_disable_ufw: true
+schedule_workloads_on_control_plane: true
+

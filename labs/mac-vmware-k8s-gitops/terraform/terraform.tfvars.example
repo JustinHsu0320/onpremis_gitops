@@ -1,0 +1,20 @@
+vsphere_server = "vcenter.lab.internal"
+vsphere_user   = "svc-terraform@vsphere.local"
+
+# Prefer: export TF_VAR_vsphere_password='...'
+# vsphere_password = "do-not-commit-this"
+
+datacenter     = "Lab-DC"
+cluster        = "Lab-Cluster"
+datastore      = "datastore1"
+network        = "VM Network"
+template_name  = "ubuntu-24.04-cloudinit-template"
+vm_folder      = "k8s-lab"
+
+gateway        = "192.168.68.1"
+netmask        = 24
+dns_servers    = ["192.168.68.1", "1.1.1.1"]
+
+# Laptop with less memory: keep only the core cluster and use 4/6/6 GiB.
+# Full GitOps + Longhorn + PostgreSQL + monitoring: 8 GiB per node is recommended.
+

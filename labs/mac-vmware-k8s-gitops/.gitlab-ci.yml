@@ -1,0 +1,66 @@
+stages:
+  - verify
+  - build
+  - promote
+
+variables:
+  GO_API_DIR: labs/mac-vmware-k8s-gitops/apps/go-api
+  GO_API_IMAGE: $CI_REGISTRY_IMAGE/onprem-go-api
+  GIT_DEPTH: "0"
+
+go-test:
+  stage: verify
+  image: golang:1.24-alpine
+  script:
+    - cd "$GO_API_DIR"
+    - go test -race ./...
+
+manifest-render:
+  stage: verify
+  image:
+    name: registry.k8s.io/kustomize/kustomize:v5.7.1
+    entrypoint: [""]
+  script:
+    - kustomize build labs/mac-vmware-k8s-gitops/k8s/apps/go-api/overlays/lab > /tmp/go-api.yaml
+
+build-image:
+  stage: build
+  image:
+    name: moby/buildkit:rootless
+    entrypoint: [""]
+  variables:
+    BUILDKITD_FLAGS: --oci-worker-no-process-sandbox
+  before_script:
+    - mkdir -p ~/.docker
+    - AUTH="$(printf '%s:%s' "$CI_REGISTRY_USER" "$CI_REGISTRY_PASSWORD" | base64 | tr -d '\n')"
+    - printf '{"auths":{"%s":{"auth":"%s"}}}\n' "$CI_REGISTRY" "$AUTH" > ~/.docker/config.json
+  script:
+    - >-
+      buildctl-daemonless.sh build
+      --frontend dockerfile.v0
+      --local context="$GO_API_DIR"
+      --local dockerfile="$GO_API_DIR"
+      --opt platform=linux/amd64,linux/arm64
+      --output "type=image,name=$GO_API_IMAGE:$CI_COMMIT_SHA,push=true"
+  rules:
+    - if: $CI_COMMIT_BRANCH
+
+promote-gitops:
+  stage: promote
+  image: alpine:3.22
+  resource_group: lab-gitops-promotion
+  before_script:
+    - apk add --no-cache curl git
+    - curl -fsSLo /tmp/kustomize.tgz https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.7.1/kustomize_v5.7.1_linux_amd64.tar.gz
+    - tar -xzf /tmp/kustomize.tgz -C /usr/local/bin
+  script:
+    - cd labs/mac-vmware-k8s-gitops/k8s/apps/go-api/overlays/lab
+    - kustomize edit set image "registry.lab.internal/platform/onprem-go-api=$GO_API_IMAGE:$CI_COMMIT_SHA"
+    - git config user.name "gitops-bot"
+    - git config user.email "gitops-bot@lab.internal"
+    - git add kustomization.yaml
+    - git diff --cached --quiet && exit 0
+    - git commit -m "chore(gitops): promote go-api $CI_COMMIT_SHORT_SHA [skip ci]"
+    - git push "https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git" HEAD:$CI_DEFAULT_BRANCH
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $GITLAB_USER_LOGIN != "gitops-bot"

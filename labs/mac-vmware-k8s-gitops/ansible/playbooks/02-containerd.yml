@@ -1,0 +1,7 @@
+---
+- name: Install the Kubernetes CRI runtime
+  hosts: k8s_nodes
+  become: true
+  roles:
+    - containerd
+

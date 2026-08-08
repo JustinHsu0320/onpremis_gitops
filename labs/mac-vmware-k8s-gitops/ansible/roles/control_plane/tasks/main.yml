@@ -1,0 +1,47 @@
+---
+- name: Render the kubeadm API configuration
+  ansible.builtin.template:
+    src: kubeadm-config.yaml.j2
+    dest: /root/kubeadm-config.yaml
+    mode: "0600"
+
+- name: Initialize the Kubernetes control plane once
+  ansible.builtin.command: kubeadm init --config /root/kubeadm-config.yaml --upload-certs
+  args:
+    creates: /etc/kubernetes/admin.conf
+
+- name: Make kubectl available to the automation user
+  ansible.builtin.file:
+    path: "/home/{{ ansible_user }}/.kube"
+    state: directory
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: "0700"
+
+- name: Install the automation user's kubeconfig
+  ansible.builtin.copy:
+    src: /etc/kubernetes/admin.conf
+    dest: "/home/{{ ansible_user }}/.kube/config"
+    remote_src: true
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: "0600"
+
+- name: Allow lab workloads to use the control-plane node
+  ansible.builtin.command: kubectl --kubeconfig /etc/kubernetes/admin.conf taint nodes {{ inventory_hostname }} node-role.kubernetes.io/control-plane-
+  register: untaint_result
+  changed_when: untaint_result.rc == 0
+  failed_when: untaint_result.rc != 0 and 'not found' not in untaint_result.stderr
+  when: schedule_workloads_on_control_plane | bool
+
+- name: Create a short-lived worker join command
+  ansible.builtin.command: kubeadm token create --ttl 30m --print-join-command
+  register: join_command_result
+  changed_when: false
+  no_log: true
+
+- name: Publish the worker join command for the next play
+  ansible.builtin.set_fact:
+    kubeadm_join_command: "{{ join_command_result.stdout }}"
+  no_log: true
+

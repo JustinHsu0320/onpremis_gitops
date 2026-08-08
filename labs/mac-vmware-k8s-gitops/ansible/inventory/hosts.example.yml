@@ -1,0 +1,23 @@
+---
+all:
+  vars:
+    ansible_user: ansible
+    ansible_become: true
+    ansible_python_interpreter: /usr/bin/python3
+    control_plane_endpoint: 192.168.68.211
+  children:
+    control_plane:
+      hosts:
+        k8s-cp-01:
+          ansible_host: 192.168.68.211
+    workers:
+      hosts:
+        k8s-worker-01:
+          ansible_host: 192.168.68.212
+        k8s-worker-02:
+          ansible_host: 192.168.68.213
+    k8s_nodes:
+      children:
+        control_plane: {}
+        workers: {}
+
