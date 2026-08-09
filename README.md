@@ -34,6 +34,7 @@
 16. [ADR 設計決策記錄](#16-adr-設計決策記錄)
 17. [實測踩雷實錄](#17-實測踩雷實錄除錯知識庫)
 18. [平台缺口與補齊路線圖](docs/PLATFORM-GAPS.md)（另開文件）
+19. [OpenWiki：讓程式碼庫變成可維護的學習 Wiki](#19-openwiki讓程式碼庫變成可維護的學習-wiki)
 
 ---
 
@@ -952,6 +953,167 @@ ansible-playbook playbooks/site.yml        # 冪等收斂：PG 使用者、Rabbi
 - **P2（成熟度）**：分散式追蹤、IPAM、跳板稽核、ACME 憑證自動化、狀態頁、帶外監控。
 
 ---
+
+## 19. OpenWiki：讓程式碼庫變成可維護的學習 Wiki
+
+OpenWiki 會讀取目前 repo 的程式碼、Terraform、Ansible、Kubernetes YAML、CI 與文件，
+產生一份由 Git 擁有的 Markdown wiki。對後端工程師來說，它適合把「為什麼要這樣分層」、
+「哪個服務依賴哪個服務」、「故障症狀如何定位」整理成可搜尋、可視覺化、可持續更新的
+學習入口。官方專案與完整功能說明見 [langchain-ai/openwiki](https://github.com/langchain-ai/openwiki)。
+
+### 19.1 Global 安裝與首次初始化
+
+官方推薦用 npm global 安裝：
+
+```bash
+npm install -g openwiki
+openwiki --help
+openwiki --init
+```
+
+`openwiki --init` 是 code mode，會把 Wiki 寫到目前 repo 的 `openwiki/`。首次 onboarding
+需要你選 provider、model、語言與要讀取的 source；API key／OAuth token 存在使用者家目錄
+的 `~/.openwiki/.env`，不應寫進 Git。若希望產生繁體中文內容，可選：
+
+```bash
+openwiki code --init --language zh-TW
+```
+
+初始化前的人為決策：
+
+| 決策 | 選項 | 建議 |
+|---|---|---|
+| 模式 | `code`／`personal` | 本 repo 選 `code`；個人筆記才選 `personal` |
+| Provider | OpenAI API、ChatGPT login、Copilot、OpenAI-compatible、其他 | 選你已有授權且符合資料政策的 provider |
+| Model | 速度／成本優先、品質優先、local model | 先用已驗證模型，不要讓工具自動切換未審核模型 |
+| 語言 | `zh-TW`／`en` | 文件給團隊閱讀可選 `zh-TW`；識別字仍保留原文 |
+| Sources | repo 全部、指定目錄、排除 secrets/artifacts | 先排除機密、產物與大型依賴目錄 |
+| Telemetry | 開啟／`OPENWIKI_TELEMETRY_DISABLED=1` | 依公司政策決定，CI 建議明確設定 |
+
+### 19.2 初始化後會開啟什麼功能
+
+完成 init 後，預期會看到：
+
+- `openwiki/`：由 agent 產生、可提交 Git 的 Markdown Wiki。
+- `openwiki/INSTRUCTIONS.md`：由人維護的範圍、優先順序與文件風格；OpenWiki 不會在一般執行中覆寫它。
+- 根目錄 `AGENTS.md`／`CLAUDE.md` 的 OpenWiki managed block：讓 coding agent 知道 Wiki 在哪裡。
+- Open Knowledge Format（OKF）metadata 與概念文件互相連結。
+- Mermaid 架構、依賴與流程圖；每次 run 會驗證 Mermaid fence。
+- `openwiki visualize`：在 `127.0.0.1:4321` 開啟互動節點圖與 Markdown reader。
+- `openwiki --update`：依 Git 變更更新既有文件，不必重新初始化。
+
+常用操作：
+
+```bash
+# 互動式詢問目前平台怎麼運作
+openwiki
+
+# 一次性輸出，不留在互動模式
+openwiki -p "先說明 Terraform、Ansible、containerd、kubeadm 的責任邊界"
+
+# 只更新 code wiki；可附帶本輪重點
+openwiki code --update --print "優先更新 VMware、containerd、Cilium 與 GitOps 的依賴與故障排查"
+
+# 開啟可視化 graph；不自動開瀏覽器
+openwiki visualize openwiki --port 4321 --no-open
+```
+
+### 19.3 `.openwikiignore`：先設讀取邊界
+
+在 repo 根目錄建立 `.openwikiignore`，把不應被 agent 讀取或描述的路徑排除：
+
+```gitignore
+# secrets / credentials
+.env
+.env.*
+**/vault.yml
+**/.vault_pass
+**/secrets/**
+**/*.pem
+**/*.key
+**/*.tfvars
+**/*.tfstate*
+**/kubeconfig*
+
+# generated / local artifacts
+artifacts/
+**/artifacts/
+**/node_modules/
+**/.terraform/
+```
+
+這是讀取邊界，不是秘密管理；真正的 secrets 仍要用 ansible-vault、SOPS 或 External
+Secrets。Code mode 會把未被這些規則排除的 repository 內容送到你選定的 provider
+產生文件；首次執行前要確認公司資料政策與專案內容允許這種處理。加入規則後先 review
+`git diff`，再執行 `openwiki --init` 或 `--update`。
+
+### 19.4 手動更新與 GitLab 自動更新
+
+日常開發在本機執行更新，審閱差異後再提交：
+
+```bash
+openwiki code --update --print
+git diff --check
+git diff -- openwiki AGENTS.md CLAUDE.md
+git add openwiki AGENTS.md CLAUDE.md
+git commit -m "docs: update OpenWiki"
+```
+
+若使用 GitLab，可以在排程或手動 pipeline 以 bot 分支產生 MR。官方範例的重點是
+完整 clone（`GIT_DEPTH: "0"`）、固定 Mermaid/jsdom 版本、使用 CI/CD secret 提供
+provider 憑證，以及讓 bot 只推送自己的分支；請依實際 provider 改寫 secret 名稱：
+[`examples/openwiki-update.gitlab-ci.yml`](https://github.com/langchain-ai/openwiki/blob/main/examples/openwiki-update.gitlab-ci.yml)。
+
+```yaml
+openwiki_update:
+  image: node:22
+  stage: docs
+  variables:
+    GIT_DEPTH: "0"
+    OPENWIKI_TELEMETRY_DISABLED: "1"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+  before_script:
+    - npm install --global openwiki mermaid@11.16.0 jsdom@29.1.1
+  script:
+    - openwiki code --update --print
+    - git diff --check
+    # 實際環境再接 GitLab API，建立 bot branch 與 merge request
+```
+
+CI 的 API key／OAuth token 必須放在 GitLab masked、protected variables 或外部 secret
+store，不能寫入 `.gitlab-ci.yml`、`openwiki/` 或 log。先在 MR 檢查產生內容，再讓受保護
+分支合併；不要讓排程 job 直接改 `main`。
+
+OpenWiki code mode 也會產生 `.github/workflows/openwiki-update.yml`。本機的 ChatGPT login
+OAuth 不等於可直接放進 CI；目前 scaffold 以 `OPENWIKI_PROVIDER: openrouter` 與
+`OPENROUTER_API_KEY` 示範。啟用前請改成公司核准的 CI provider、設定 protected secret，
+並先以手動 workflow 驗證，不要把本機 OAuth 檔案提交到 Git。
+
+### 19.5 OpenWiki 版本更新、驗證與回滾
+
+先查看目前與可用版本，再在維護窗口更新：
+
+```bash
+npm list -g --depth=0 openwiki
+npm view openwiki version
+npm install -g openwiki@<approved-version>
+openwiki --help
+openwiki code --update --print
+git diff --check
+```
+
+升級後檢查 `openwiki/`、`AGENTS.md`／`CLAUDE.md` managed block、Mermaid 圖與
+`openwiki visualize openwiki --port 4321 --no-open`；若內容或 CLI 行為不符合預期，
+可用上一個已驗證版本回滾：
+
+```bash
+npm install -g openwiki@<previous-approved-version>
+```
+
+升級前後都應閱讀官方 [CHANGELOG](https://github.com/langchain-ai/openwiki/blob/main/CHANGELOG.md)，
+並在 CI 固定已驗證版本（不要在生產 pipeline 直接使用 `openwiki@latest`）。
 
 *本 repo 全程遵循四原則：故障域隔離、狀態與無狀態分離、單一信任根、IaC 為唯一事實來源；*
 *平台化後追加第五原則：平台與專案分層——平台提供組件選單，專案只做資料宣告。*

@@ -1,0 +1,17 @@
+# secrets / credentials
+.env
+.env.*
+**/vault.yml
+**/.vault_pass
+**/secrets/**
+**/*.pem
+**/*.key
+**/*.tfvars
+**/*.tfstate*
+**/kubeconfig*
+
+# generated / local artifacts
+artifacts/
+**/artifacts/
+**/node_modules/
+**/.terraform/
