@@ -15,8 +15,15 @@ pgbackrest_stanza: pg-main
 # ---------- repo（備份存放處） ----------
 # NFS 掛載點下的子目錄；掛載本身由 20-storage（nfs_client role）完成
 pgbackrest_repo_path: "{{ pgbackup_mount }}/pgbackrest"
-# 保留 2 份全備：每週日全備 → 2 份全備 + 其間的 diff/WAL = 約兩週的 PITR 窗口
-pgbackrest_retention_full: 2
+# 時間型保留：備份工作執行 expire 時，保留至少 7 天的 full 備份鏈。
+# pgBackRest 會連同不再被保留的 diff/WAL 一起清理；實際檔案壽命可能略超過 7 天。
+pgbackrest_retention_full_type: time
+pgbackrest_retention_full: 7
+
+# ---------- 壓縮 ----------
+# zstd level 3：在 CPU、速度、儲存空間之間取平衡；repo 是 NFS，壓縮可降低網路/容量成本
+pgbackrest_compress_type: zst
+pgbackrest_compress_level: 3
 
 # ---------- 效能 / 日誌 ----------
 # 備份/還原的平行程序數：2 對 4 vCPU 的 pg 節點是「有感提速但不搶生產資源」的甜蜜點
@@ -30,7 +37,8 @@ pgbackrest_backup_oncalendar: "*-*-* 01:30:00"
 # 三台 pg 的 timer 同時醒來也只有 leader 真的會跑，但錯開一點可避免
 # 同秒打 Patroni REST + NFS 的毛刺
 pgbackrest_backup_random_delay: 300
-# date +%u 的星期值：7 = 週日 → 跑全備，其他日子跑差異備份
+# date +%u 的星期值：7 = 週日 → 跑全備，其他日子跑差異備份。
+# 這個週期仍是「每日有備份工作」，不是每天都做 full。
 pgbackrest_full_backup_weekday: 7
 
 # ---------- 部署期行為 ----------

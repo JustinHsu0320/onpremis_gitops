@@ -639,6 +639,18 @@ ansible \
 5. 三台 docker/version、service state、findmnt /data 結果
 ```
 
+### 停止點 B 實作紀錄（2026-08-28）
+
+本次 rehearsal 已完成停止點 B 的控制面與主機盤點，三台結果一致：
+
+- `db-01`、`db-02`、`db-03` 的 `ansible.builtin.setup` 成功，OS 是 Ubuntu 26.04（`resolute`），記憶體為 7376 MiB。
+- Ansible become 已通過，三台都能回傳 `uid=0(root)`；因 Ubuntu 26.04 的 `/usr/bin/sudo` 目前是 `sudo-rs`，rehearsal inventory 使用 `/usr/bin/sudo.ws` 作為 `ansible_become_exe`，不改 system alternatives，也不把 sudo 密碼寫入 inventory。
+- 三台 Docker 都是 `29.7.2`，systemd 狀態為 `active`。
+- 三台 `/data` 都是 `/dev/mapper/vg_data-lv_data` 上的 `ext4`，以 `rw,relatime` 掛載；`sdb` 是既有 50G LVM data disk，不是可交給 `05-block-storage.yml` 格式化的裸碟。
+- 本次 Docker/磁碟指令是唯讀盤點；ad-hoc `shell` 顯示 `CHANGED` 只代表 module 的狀態語意，不能解讀成已修改主機。
+
+本紀錄不代表已完成任何資料服務部署，也不代表已驗證 XFS、備份、teardown、還原或 production 容量。依第 13 章規則，現階段仍禁止執行 `05-block-storage.yml`；下一關進入唯讀 `playbooks/rehearsal/00-preflight.yml`，先做 syntax check、`--list-hosts`、canary 與 check mode。
+
 ## 10. 關卡 7：寫第一支「唯讀 preflight」playbook
 
 ### 10.1 建立檔案
@@ -938,7 +950,9 @@ inventory graph
 - PKI 強制輪替後，服務 reload 必須與憑證變更在可追蹤的同一流程完成。
 - `99-verify.yml` 並非完全唯讀，也不適合在故意停掉 inventory host 時期待全綠。
 - 現有完整 `site.yml --check` 並非每個 role 都可靠；check mode 不是安全證明。
-- PostgreSQL 的 pgBackRest 依賴 NFS 設計；不能跳過 storage 就宣稱備份完成。
+- PostgreSQL 的 pgBackRest 依賴 NFS 設計；role 已配置每日 full/diff、zstd 壓縮與
+  7 天 time retention，但不能跳過 storage 就宣稱備份完成。跳過 NFS 時只能驗證
+  本機備份機制，不能宣稱具備異地 DR 能力。
 - ScyllaDB 目前被 ext4 與資源規格阻擋。
 - SeaweedFS 需要 PostgreSQL 同時存在，並與其他資料 profile 共用 HAProxy/Keepalived 路徑。
 

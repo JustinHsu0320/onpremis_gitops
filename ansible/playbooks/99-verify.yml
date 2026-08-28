@@ -162,6 +162,61 @@
         success_msg: "PG extensions：pgvector HNSW KNN + pg_search BM25 冒煙通過"
       run_once: true
 
+# ---------- 3c. pgBackRest：每日 timer、壓縮、7 天 retention、至少一份 full ----------
+- name: 驗證 pgBackRest 備份政策
+  hosts: postgres
+  tags: [verify, verify-pgbackrest]
+  tasks:
+    - name: 讀取 pgBackRest 備份政策
+      ansible.builtin.slurp:
+        src: /etc/pgbackrest/pgbackrest.conf
+      register: pgbackrest_policy
+      become: true
+      no_log: true
+
+    - name: 斷言：zstd level 3、時間型保留 7 天
+      ansible.builtin.assert:
+        that:
+          - "'compress-type=zst' in (pgbackrest_policy.content | b64decode)"
+          - "'compress-level=3' in (pgbackrest_policy.content | b64decode)"
+          - "'repo1-retention-full-type=time' in (pgbackrest_policy.content | b64decode)"
+          - "'repo1-retention-full=7' in (pgbackrest_policy.content | b64decode)"
+        fail_msg: "pgBackRest 備份政策異常，請檢查 /etc/pgbackrest/pgbackrest.conf"
+        success_msg: "pgBackRest：zstd level 3、time retention 7 天"
+
+    - name: 取得 systemd timer 狀態
+      ansible.builtin.service_facts:
+      become: true
+
+    - name: 斷言：每日備份 timer 已啟用且正在運作
+      ansible.builtin.assert:
+        that:
+          - "'pgbackrest-backup.timer' in ansible_facts.services"
+          - ansible_facts.services['pgbackrest-backup.timer'].status == 'enabled'
+          - ansible_facts.services['pgbackrest-backup.timer'].state == 'running'
+        fail_msg: "pgBackRest timer 未啟用或未運作"
+        success_msg: "pgBackRest：每日 timer 已啟用且正在運作"
+
+    - name: 讀取 pgBackRest backup catalog（任一節點即可）
+      ansible.builtin.command: pgbackrest --stanza={{ pgbackrest_stanza }} --output=json info
+      become: true
+      become_user: postgres
+      register: pgbackrest_catalog
+      changed_when: false
+      run_once: true
+      delegate_to: "{{ groups['postgres'][0] }}"
+
+    - name: 斷言：repo 至少有一份 full backup
+      ansible.builtin.assert:
+        that:
+          - pgbackrest_catalog.rc == 0
+          - >-
+            (pgbackrest_catalog.stdout | from_json | first).backup
+            | selectattr('type', 'equalto', 'full') | list | length > 0
+        fail_msg: "pgBackRest repo 尚無可用 full backup：{{ pgbackrest_catalog.stdout }}"
+        success_msg: "pgBackRest：repo 至少有一份 full backup，timer 與保留政策有效"
+      run_once: true
+
 # ---------- 4. RabbitMQ：叢集 + 各租戶 quorum queue + 實際收發 ----------
 - name: 驗證 RabbitMQ 叢集
   hosts: rabbitmq

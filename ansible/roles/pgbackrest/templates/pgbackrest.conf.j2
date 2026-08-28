@@ -7,6 +7,8 @@
 # 【備份策略總覽】（規劃書 §9）
 #   repo：NFS（nfs-01 匯出 {{ nfs_pgbackup_export }}，pg 節點掛 {{ pgbackup_mount }}）
 #   全備：每週日 01:30；差異備：週一到週六 01:30（見 pgbackrest-backup.timer）
+#   壓縮：zstd（由 compress-type / compress-level 設定）
+#   保留：時間型 retention，至少 7 天（不是精準到秒的檔案 TTL）
 #   WAL：Patroni 設 archive_command=pgbackrest archive-push（持續歸檔）
 #   PITR：全備 + diff + WAL 可還原到窗口內「任意時間點」
 # =============================================================================
@@ -17,10 +19,17 @@
 # 對 pgBackRest 而言這就是一個 posix 路徑，NFS 的可用性/快照由儲存層負責。
 repo1-path={{ pgbackrest_repo_path }}
 
-# 保留 2 份全備：配合「每週日全備」= 任何時刻 repo 內都有涵蓋約兩週的
-# 全備+diff+WAL，即兩週的 PITR 窗口。第 3 份全備完成時，最舊的全備與其
-# 依附的 diff/WAL 會被自動 expire（不用另外寫清理 cron）。
+# 時間型 retention：保留至少 7 天的 full 備份鏈。
+# expire 在備份工作中自動執行，不需另外寫清理 cron；符合條件的舊 full
+# 及其依附的 diff/WAL 會一起清理。由於 retention 以 full backup 為邊界，
+# 實際保留時間可能略超過 7 天。
+repo1-retention-full-type={{ pgbackrest_retention_full_type }}
 repo1-retention-full={{ pgbackrest_retention_full }}
+
+# ---------- 備份壓縮 ----------
+# pgBackRest 的通用壓縮設定；不要寫成 repo1-compress-type。
+compress-type={{ pgbackrest_compress_type }}
+compress-level={{ pgbackrest_compress_level }}
 
 # ---------- repo 靜態加密 ----------
 # 備份落在 NFS 上，等於資料庫內容離開了 pg 節點的磁碟控制範圍：

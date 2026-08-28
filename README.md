@@ -742,7 +742,7 @@ make lab-destroy
 
 | 面向 | 做法 | 位置 |
 |---|---|---|
-| **PostgreSQL** | pgBackRest：WAL 連續歸檔（`archive_command`）+ 每週日全備 + 每日差異備，`repo1-retention-full=2` ≈ 兩週 PITR 窗口；repo **AES-256 加密**（NFS 上靜態加密）。S3（SeaweedFS）只能當 repo2 次要庫——filer 元資料在 PG 內，還原主路徑必須是 NFS（CONVENTIONS §10.6） | nfs-01 `/export/pgbackup` |
+| **PostgreSQL** | pgBackRest：WAL 連續歸檔（`archive_command`）+ 每日排程（週日 full、其餘日 diff）+ **zstd level 3 壓縮**；`repo1-retention-full-type=time`、`repo1-retention-full=7`，保留至少 7 天的 PITR 鏈（實際可能略超過 7 天）；repo **AES-256 加密**（NFS 上靜態加密）。S3（SeaweedFS）只能當 repo2 次要庫——filer 元資料在 PG 內，還原主路徑必須是 NFS（CONVENTIONS §10.6） | nfs-01 `/export/pgbackup` |
 | **RabbitMQ** | definitions（vhost/user/queue/policy）由 Ansible 冪等重建 = 設定即備份；quorum queue 資料靠叢集多數複寫 | Git（本 repo） |
 | **KeyDB** | 純快取（TTL 語意），不備份 | — |
 | **ScyllaDB** | RF=3 保「節點故障」不保「邏輯錯誤」（誤刪表全叢集同步刪）。**快照策略待決策**：`nodetool snapshot` + 異地拷貝的排程尚未實作（MIS 現況亦無備份——這是已知債，不是刻意設計）；上線承載正式資料前必須補上 | TODO |

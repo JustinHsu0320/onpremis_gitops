@@ -6,7 +6,7 @@ galaxy_info:
   author: platform-infra
   description: >-
     pgBackRest 備份體系（規劃書 §9）：WAL 歸檔 + 每週日全備/每日差異備份到
-    NFS（AES-256 靜態加密），保留 2 份全備 = 兩週 PITR 窗口。
+    NFS（AES-256 靜態加密、zstd 壓縮），時間型 retention 至少保留 7 天。
   license: MIT
   min_ansible_version: "2.16"
   platforms:

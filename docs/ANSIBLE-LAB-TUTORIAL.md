@@ -414,14 +414,14 @@ ansible-playbook playbooks/99-verify.yml --tags verify-nfs   # app-01 寫、其�
 ### 階段 30：PostgreSQL HA 資料層（一台 pg 節點五個角色）
 
 **目的**：etcd×3（Patroni 的 DCS）→ Patroni/PG18（同步複寫 RPO=0）→
-PgBouncer（transaction pooling）→ pgBackRest（WAL 歸檔 + 每日備份到
-NFS）→ 本地 HAProxy+Keepalived 提供 `pgbouncer-vip` 的 RW(6432)/RO(6433)
+PgBouncer（transaction pooling）→ pgBackRest（WAL 歸檔 + 每日 full/diff
+備份、zstd 壓縮、至少保留 7 天到 NFS）→ 本地 HAProxy+Keepalived 提供 `pgbouncer-vip` 的 RW(6432)/RO(6433)
 分流。app 一律走 VIP，絕不直連 5432。
 
 ```bash
 ansible-playbook playbooks/30-postgres.yml                   # 全套（首跑：三台同時，不要 --limit）
 ansible-playbook playbooks/30-postgres.yml --tags etcd       # 分層跑：etcd / patroni / pgbouncer / backup / pg-lb
-ansible-playbook playbooks/99-verify.yml --tags verify-etcd,verify-pg,verify-pgbouncer,verify-pg-ext
+ansible-playbook playbooks/99-verify.yml --tags verify-etcd,verify-pg,verify-pgbouncer,verify-pg-ext,verify-pgbackrest
 ```
 
 **網路/埠**：2379/2380（etcd, mTLS）、2381（etcd metrics 明文）、
@@ -441,7 +441,8 @@ ansible-playbook playbooks/99-verify.yml --tags verify-etcd,verify-pg,verify-pgb
 - `archive_command` 在 stanza 建好前會失敗、WAL 暫積——**預期行為**，
   stanza-create 後自動追上。
 - 首次部署尾聲會自動做第一次全備；之後每日 01:30 timer，備份腳本
-  執行當下自判 leader（failover 後零維運）。
+  執行當下自判 leader（failover 後零維運）。週日是 full、其餘日是 diff；
+  repo 使用 zstd level 3，時間型 retention 至少保留 7 天。
 
 **驗證**
 ```bash
@@ -450,6 +451,11 @@ curl -s http://10.20.30.11:8008/cluster | python3 -m json.tool        # 恰 1 le
 # RW/RO 分流（用某租戶 db 帳密；RW 應回 f、RO 應回 t）
 PGPASSWORD=<pw> psql "host=10.20.30.10 port=6432 dbname=<db> user=<user> sslmode=verify-full sslrootcert=/etc/platform/pki/ca.crt" -tAc 'SELECT pg_is_in_recovery()'
 ansible pg-01 -m ansible.builtin.command -a 'sudo -u postgres pgbackrest --stanza=pg-main info'   # 至少 1 份 full
+ansible pg-01 -m ansible.builtin.command -a 'systemctl list-timers pgbackrest-backup.timer --no-pager'
+ansible pg-01 -b -m ansible.builtin.command -a "grep -E '^(compress-type|compress-level|repo1-retention-full-type|repo1-retention-full)=' /etc/pgbackrest/pgbackrest.conf"
+# 手動觸發一次（只會由當下 leader 執行，replica 會正常 skip）
+ansible pg-01 -b -m ansible.builtin.systemd_service -a 'name=pgbackrest-backup.service state=started'
+ansible pg-01 -b -m ansible.builtin.command -a 'journalctl -u pgbackrest-backup.service -n 80 --no-pager'
 # HAProxy 語意：http://10.20.30.11:8404/stats → pg_rw 恰 1 台 UP；pg_ro 中 leader 顯示 DOWN 是「設計」不是故障
 ```
 
@@ -906,7 +912,7 @@ ansible-playbook $INV playbooks/08-docker.yml             # 本輪只有 mgmt-01
 # 2) PKI → 3) PG 全套 → 4) 驗收
 ansible-playbook $INV playbooks/10-pki.yml
 ansible-playbook $INV playbooks/30-postgres.yml
-ansible-playbook $INV playbooks/99-verify.yml --tags verify-etcd,verify-pg,verify-pgbouncer
+ansible-playbook $INV playbooks/99-verify.yml --tags verify-etcd,verify-pg,verify-pgbouncer,verify-pgbackrest
 
 # 5) 練維運（這才是實體機的價值）：
 #    - 滾動變更：--limit pg-03 → verify → pg-02 → switchover → pg-01（README §15.3）
@@ -916,7 +922,8 @@ ansible-playbook $INV playbooks/99-verify.yml --tags verify-etcd,verify-pg,verif
 
 > 20-storage 本輪跳過的代價：30 階段**不會失敗**，但 pgBackRest 的
 > `repo1-path=/mnt/pgbackup/pgbackrest` 會被建成 pg 節點的**本機目錄**，
-> 備份安靜地落在本機碟（無異地、失去備份意義）——教學環境可接受，
+> 備份安靜地落在本機碟（無異地、失去備份意義）；即使已設定 zstd 與 7 天
+> retention，也只是本機備份保留，並不等於 DR——教學環境可接受，
 > 知道就好。想連備份一起練，把 machine-3 加開 `nfs` 身分（`nfs-01:
 > {ansible_host: 192.168.50.13}`，nfs 群組只定義 `storage_volumes` 一個
 > 相撞變數，host_vars 覆寫掉即可與 pg-03 同機），順序改為 10 → 20 → 30。

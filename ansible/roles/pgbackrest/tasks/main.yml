@@ -6,7 +6,7 @@
 #   1. WAL 歸檔：Patroni 已把 archive_command 設成 pgbackrest archive-push
 #      （patroni role 的契約），PG 每產生一段 WAL 就推進 NFS repo
 #   2. 每日備份：systemd timer 01:30 喚醒腳本 → 只有 Patroni leader 執行
-#      → 週日全備、其他日差異備份
+#      → 週日全備、其他日差異備份；repo 以 zstd 壓縮、時間型 retention 7 天
 #   3. 還原（PITR）：任一份全備 + 之後的 diff + WAL = 可還原到任意時間點
 #
 # 三台 pg 都佈署相同的 conf/腳本/timer（對稱佈署），「誰真的跑備份」

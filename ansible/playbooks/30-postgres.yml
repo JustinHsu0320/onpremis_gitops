@@ -29,7 +29,7 @@
   roles:
     - role: pgbouncer
 
-- name: 佈署 pgBackRest 備份（每日全備/差異備 + WAL 歸檔到 NFS）
+- name: 佈署 pgBackRest 備份（每日 full/diff、zstd 壓縮、7 天保留 + WAL 歸檔到 NFS）
   hosts: postgres
   tags: [postgres, backup]
   roles:

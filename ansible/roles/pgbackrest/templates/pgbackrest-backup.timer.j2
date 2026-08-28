@@ -7,10 +7,11 @@
 #   3) systemctl list-timers 一眼看到下次觸發時間，運維透明
 # =============================================================================
 [Unit]
-Description=Daily pgBackRest backup trigger
+Description=Daily compressed pgBackRest backup trigger (7-day retention)
 
 [Timer]
-# 每日 01:30：避開日切批次/logrotate 尖峰；週日/平日的全備/差異判斷在腳本內
+# 每日 01:30：避開日切批次/logrotate 尖峰；週日/平日的全備/差異判斷在腳本內。
+# 壓縮與 7 天 retention 由 pgbackrest.conf 控制。
 OnCalendar={{ pgbackrest_backup_oncalendar }}
 # 隨機延遲最多 {{ pgbackrest_backup_random_delay }} 秒：三台 pg 的 timer 都會醒
 # （只有 leader 真的備份），錯開避免同秒齊打 Patroni REST 與 NFS

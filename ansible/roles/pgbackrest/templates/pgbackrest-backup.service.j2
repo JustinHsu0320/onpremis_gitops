@@ -6,7 +6,7 @@
 # 它唯一的入口就是 timer（以及人工 systemctl start 做手動備份演練）。
 # =============================================================================
 [Unit]
-Description=pgBackRest scheduled backup (full on Sunday, diff otherwise)
+Description=pgBackRest scheduled compressed backup (full on Sunday, diff otherwise, 7-day retention)
 # 備份需要網路（Patroni REST 判斷 leader）與 NFS 掛載（repo 所在）
 After=network-online.target remote-fs.target
 Wants=network-online.target
